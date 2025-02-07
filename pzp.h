@@ -34,7 +34,7 @@ extern "C"
 
 #define PPMREADBUFLEN 256
 
-#define PZP_VERBOSE 1
+#define PZP_VERBOSE 0
 #define PRINT_COMMENTS 0
 
 
@@ -68,47 +68,6 @@ static unsigned int simplePowPPM(unsigned int base,unsigned int exp)
     }
     return retres;
 }
-
-/*
-static int swapDepthEndianness(unsigned char * pixels,unsigned int width,unsigned int height,unsigned int bitsperpixel, unsigned int channels)
-{
-    if (pixels==0)
-    {
-        return 0;
-    }
-    if (bitsperpixel!=16)
-    {
-        fprintf(stderr,"Only 16bit PNM files need swapping ( we have a %u bit x %u channels file )..\n",bitsperpixel, channels);
-        return 0;
-    }
-
-    unsigned char * traverser=(unsigned char * ) pixels;
-    unsigned char * traverserSwap1;//=(unsigned char * ) pixels;
-    unsigned char * traverserSwap2;//=(unsigned char * ) pixels;
-
-    unsigned int bytesperpixel = (bitsperpixel/8);
-    unsigned char * endOfMem = traverser + width * height * channels * bytesperpixel;
-
-    while ( ( traverser < endOfMem)  )
-    {
-        traverserSwap1 = traverser;
-        traverserSwap2 = traverser+1;
-
-        unsigned char tmp = *traverserSwap1;
-        *traverserSwap1 = *traverserSwap2;
-        *traverserSwap2 = tmp;
-
-        traverser += bytesperpixel;
-    }
-
-    return 1;
-}
-
-static int swap_endianness(int value)
-{
-    return ((value >> 24) & 0xFF) | ((value >> 8) & 0xFF00) | ((value << 8) & 0xFF0000) | ((value << 24) & 0xFF000000);
-}
-*/
 
 static unsigned char * ReadPNM(unsigned char * buffer,const char * filename,unsigned int *width,unsigned int *height,unsigned long * timestamp, unsigned int * bytesPerPixel, unsigned int * channels)
 {
@@ -483,6 +442,37 @@ static void compress_combined(unsigned char **buffers,
     fclose(output);
 }
 
+
+static void extractCompressedBufferToFinalImage(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
+{
+    for (int i = 0; i < width * height; i++)
+    {
+        for (unsigned int ch = 0; ch < channels; ch++)
+        {
+            (*buffers)[ch][i] = decompressed_bytes[i * channels + ch];
+        }
+    }
+}
+
+static void extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, uint32_t width, uint32_t height)
+{
+    unsigned int pixel_count = width * height;
+
+    unsigned char *buf0 = (*buffers)[0];
+    unsigned char *buf1 = (*buffers)[1];
+    unsigned char *buf2 = (*buffers)[2];
+
+    for (unsigned int i = 0; i < pixel_count; i++)
+    {
+        buf0[i] = decompressed_bytes[idx];
+        buf1[i] = decompressed_bytes[idx + 1];
+        buf2[i] = decompressed_bytes[idx + 2];
+        idx+=3;
+    }
+}
+
+
+
 static void decompress_combined(const char *input_filename, unsigned char ***buffers,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
@@ -623,11 +613,13 @@ static void decompress_combined(const char *input_filename, unsigned char ***buf
         fail("Memory allocation failed");
     }
 
+    //Allocate all intermediate buffers
     for (unsigned int ch = 0; ch < channelsIn; ch++)
     {
         (*buffers)[ch] = (unsigned char *)malloc(dataSize);
         if (!(*buffers)[ch])
         {
+            //If we failed deallocate everything
             for (unsigned int i = 0; i < ch; i++)
             {
                 free((*buffers)[i]);  // Free previously allocated channels
@@ -640,13 +632,16 @@ static void decompress_combined(const char *input_filename, unsigned char ***buf
 
     // Copy decompressed data into the channel buffers
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
+    if (channelsIn==3) { extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);   } else
+                       { extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn); }
+    /*
     for (int i = 0; i < width * height; i++)
     {
         for (unsigned int ch = 0; ch < channelsIn; ch++)
         {
             (*buffers)[ch][i] = decompressed_bytes[i * channelsIn + ch];
         }
-    }
+    }*/
 
     free(decompressed_buffer);
 }

@@ -454,7 +454,7 @@ static void extractCompressedBufferToFinalImage(unsigned char *decompressed_byte
     }
 }
 
-static void extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, uint32_t width, uint32_t height)
+static void extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
 {
     unsigned int pixel_count = width * height;
 

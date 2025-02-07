@@ -337,7 +337,7 @@ static void split_channels_and_filter(const unsigned char *image, unsigned char 
     }
 }
 
-static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+static void restore_channels_n(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     for (int i = 1; i < total_size; i++)
@@ -347,6 +347,59 @@ static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH
             buffers[ch][i] += buffers[ch][i - 1];
         }
     }
+}
+
+static void restore_channels_1(unsigned char **buffers, int WIDTH, int HEIGHT)
+{
+    int total_size = WIDTH * HEIGHT;
+    unsigned char *buf0 = buffers[0];
+
+    for (int i = 1; i < total_size; i++)
+    {
+        buf0[i] += buf0[i - 1];
+    }
+}
+
+static void restore_channels_2(unsigned char **buffers, int WIDTH, int HEIGHT)
+{
+    int total_size = WIDTH * HEIGHT;
+    unsigned char *buf0 = buffers[0];
+    unsigned char *buf1 = buffers[1];
+
+    for (int i = 1; i < total_size; i++)
+    {
+        buf0[i] += buf0[i - 1];
+        buf1[i] += buf1[i - 1];
+    }
+}
+
+static void restore_channels_3(unsigned char **buffers, int WIDTH, int HEIGHT)
+{
+    int total_size = WIDTH * HEIGHT;
+    unsigned char *buf0 = buffers[0];
+    unsigned char *buf1 = buffers[1];
+    unsigned char *buf2 = buffers[2];
+
+    for (int i = 1; i < total_size; i++)
+    {
+        buf0[i] += buf0[i - 1];
+        buf1[i] += buf1[i - 1];
+        buf2[i] += buf2[i - 1];
+    }
+}
+
+
+static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+{
+    switch (num_buffers)
+        {
+          case 1: restore_channels_1(buffers,WIDTH,HEIGHT); break;
+          case 2: restore_channels_2(buffers,WIDTH,HEIGHT); break;
+          case 3: restore_channels_3(buffers,WIDTH,HEIGHT); break;
+
+          default:
+              restore_channels_n(buffers,num_buffers,WIDTH,HEIGHT);
+        };
 }
 
 static void compress_combined(unsigned char **buffers,

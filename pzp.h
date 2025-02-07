@@ -173,6 +173,24 @@ static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH
         };
 }
 
+
+
+
+
+
+static void reconstruct(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
+{
+ for (size_t i = 0; i < width * height; i++) //* (bitsperpixel/8)
+          {
+            for (unsigned int ch = 0; ch < channels; ch++)
+            {
+                reconstructed[i * channels + ch] = buffers[ch][i];
+            }
+          }
+}
+
+
+
 static void compress_combined(unsigned char **buffers,
                               unsigned int width,unsigned int height,
                               unsigned int bitsperpixelExternal, unsigned int channelsExternal,
@@ -475,7 +493,7 @@ static void decompress_combined(const char *input_filename, unsigned char ***buf
 
     // Copy decompressed data into the channel buffers
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
-    if (channelsIn==1) { extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);   } else
+    if (channelsIn==1) { extractCompressedBufferToFinalImage1Channel(decompressed_bytes,buffers,width,height);    } else
     if (channelsIn==2) { extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);   } else
     if (channelsIn==3) { extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);   } else
                        { extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn); }

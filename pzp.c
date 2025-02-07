@@ -321,13 +321,15 @@ int main(int argc, char *argv[])
          unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
          if (reconstructed!=NULL)
          {
-          for (size_t i = 0; i < width * height; i++) //* (bitsperpixel/8)
+          reconstruct(reconstructed, buffers, width, height, channelsInternal);
+             /*
+          for (size_t i = 0; i < width * height; i++) // * (bitsperpixel/8)
           {
             for (unsigned int ch = 0; ch < channelsInternal; ch++)
             {
                 reconstructed[i * channelsInternal + ch] = buffers[ch][i];
             }
-          }
+          }*/
 
           bitsperpixelExternal *= channelsExternal; //This is needed because of what writePNM expects..
           WritePNM(output_commandline_parameter, reconstructed, width, height, bitsperpixelExternal, channelsExternal);

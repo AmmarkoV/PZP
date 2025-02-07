@@ -225,9 +225,9 @@ static void reconstruct(unsigned char * reconstructed, unsigned char **buffers, 
 {
     switch (channels)
         {
-          case 1: reconstruct_1(reconstructed,buffers,width,height,channels); break;
-          case 2: reconstruct_2(reconstructed,buffers,width,height,channels); break;
-          case 3: reconstruct_3(reconstructed,buffers,width,height,channels); break;
+          case 1: reconstruct_1(reconstructed,buffers,width,height); break;
+          case 2: reconstruct_2(reconstructed,buffers,width,height); break;
+          case 3: reconstruct_3(reconstructed,buffers,width,height); break;
 
           default:
               reconstruct_n(reconstructed,buffers,width,height,channels);

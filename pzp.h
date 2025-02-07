@@ -174,11 +174,43 @@ static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH
 }
 
 
+static void reconstruct_1(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
+{
+    memcpy(reconstructed, buffers[0], width * height);
+}
+
+static void reconstruct_2(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
+{
+    unsigned int total_size = width * height;
+    unsigned char *buf0 = buffers[0];
+    unsigned char *buf1 = buffers[1];
+
+    for (unsigned int i = 0; i < total_size; i++)
+    {
+        unsigned int idx = i * 2;
+        reconstructed[idx] = buf0[i];
+        reconstructed[idx + 1] = buf1[i];
+    }
+}
+
+static void reconstruct_3(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
+{
+    unsigned int total_size = width * height;
+    unsigned char *buf0 = buffers[0];
+    unsigned char *buf1 = buffers[1];
+    unsigned char *buf2 = buffers[2];
+
+    for (unsigned int i = 0; i < total_size; i++)
+    {
+        unsigned int idx = i * 3;
+        reconstructed[idx] = buf0[i];
+        reconstructed[idx + 1] = buf1[i];
+        reconstructed[idx + 2] = buf2[i];
+    }
+}
 
 
-
-
-static void reconstruct(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
+static void reconstruct_n(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
 {
  for (size_t i = 0; i < width * height; i++) //* (bitsperpixel/8)
           {
@@ -187,6 +219,19 @@ static void reconstruct(unsigned char * reconstructed, unsigned char **buffers, 
                 reconstructed[i * channels + ch] = buffers[ch][i];
             }
           }
+}
+
+static void reconstruct(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
+{
+    switch (channels)
+        {
+          case 1: reconstruct_1(reconstructed,buffers,width,height,channels); break;
+          case 2: reconstruct_2(reconstructed,buffers,width,height,channels); break;
+          case 3: reconstruct_3(reconstructed,buffers,width,height,channels); break;
+
+          default:
+              reconstruct_n(reconstructed,buffers,width,height,channels);
+        };
 }
 
 

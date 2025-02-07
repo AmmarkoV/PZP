@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -lzstd -lm
 DEBUG_FLAGS = -D_GNU_SOURCE -O0 -g3 -fno-omit-frame-pointer -Wstrict-overflow -fPIE -fPIC
 
-SRC = pzp.c
+SRC = src/pzp.c
 OUTDIR = output
 PZP = pzp
 DPZP = dpzp
@@ -50,4 +50,3 @@ debug: all $(OUTDIR)
 
 	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --track-origins=yes --num-callers=20 --track-fds=yes ./$(DPZP) compress samples/segment.ppm $(OUTDIR)/segment.pzp 2>log7.txt
 	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --track-origins=yes --num-callers=20 --track-fds=yes ./$(DPZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm 2>log8.txt
-

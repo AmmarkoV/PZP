@@ -462,6 +462,7 @@ static void extractCompressedBufferToFinalImage3Channels(unsigned char *decompre
     unsigned char *buf1 = (*buffers)[1];
     unsigned char *buf2 = (*buffers)[2];
 
+    unsigned int idx = 0;
     for (unsigned int i = 0; i < pixel_count; i++)
     {
         buf0[i] = decompressed_bytes[idx];
@@ -471,7 +472,26 @@ static void extractCompressedBufferToFinalImage3Channels(unsigned char *decompre
     }
 }
 
+static void extractCompressedBufferToFinalImage2Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+{
+    unsigned int pixel_count = width * height;
 
+    unsigned char *buf0 = (*buffers)[0];
+    unsigned char *buf1 = (*buffers)[1];
+
+    unsigned int idx = 0;
+    for (unsigned int i = 0; i < pixel_count; i++)
+    {
+        buf0[i] = decompressed_bytes[idx];
+        buf1[i] = decompressed_bytes[idx + 1];
+        idx+=2;
+    }
+}
+
+static void extractCompressedBufferToFinalImage1Channel(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+{
+   memcpy((*buffers)[0], decompressed_bytes, width * height);
+}
 
 static void decompress_combined(const char *input_filename, unsigned char ***buffers,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
@@ -632,16 +652,10 @@ static void decompress_combined(const char *input_filename, unsigned char ***buf
 
     // Copy decompressed data into the channel buffers
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
+    if (channelsIn==1) { extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);   } else
+    if (channelsIn==2) { extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);   } else
     if (channelsIn==3) { extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);   } else
                        { extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn); }
-    /*
-    for (int i = 0; i < width * height; i++)
-    {
-        for (unsigned int ch = 0; ch < channelsIn; ch++)
-        {
-            (*buffers)[ch][i] = decompressed_bytes[i * channelsIn + ch];
-        }
-    }*/
 
     free(decompressed_buffer);
 }

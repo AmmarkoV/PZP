@@ -109,6 +109,9 @@ static void split_channels_and_filter(const unsigned char *image, unsigned char 
     }
 }
 
+//-----------------------------------------------------------------------------------------------
+// Channel Restoration
+//-----------------------------------------------------------------------------------------------
 static void restore_channels_n(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
@@ -172,8 +175,13 @@ static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH
               restore_channels_n(buffers,num_buffers,WIDTH,HEIGHT);
         };
 }
+//-----------------------------------------------------------------------------------------------
+//-----------------------------------------------------------------------------------------------
 
 
+//-----------------------------------------------------------------------------------------------
+// Buffer Reconstruction
+//-----------------------------------------------------------------------------------------------
 static void reconstruct_1(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
 {
     memcpy(reconstructed, buffers[0], width * height);
@@ -233,6 +241,8 @@ static void reconstruct(unsigned char * reconstructed, unsigned char **buffers, 
               reconstruct_n(reconstructed,buffers,width,height,channels);
         };
 }
+//-----------------------------------------------------------------------------------------------
+//-----------------------------------------------------------------------------------------------
 
 
 

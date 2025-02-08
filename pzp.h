@@ -253,7 +253,7 @@ static void pzp_reconstruct(unsigned char * reconstructed, unsigned char **buffe
 
 
 
-static void compress_combined(unsigned char **buffers,
+static void pzp_compress_combined(unsigned char **buffers,
                               unsigned int width,unsigned int height,
                               unsigned int bitsperpixelExternal, unsigned int channelsExternal,
                               unsigned int bitsperpixelInternal, unsigned int channelsInternal,
@@ -348,7 +348,7 @@ static void compress_combined(unsigned char **buffers,
     fclose(output);
 }
 
-static void extractCompressedBufferToFinalImage(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
+static void pzp_extractCompressedBufferToFinalImage(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
 {
     for (int i = 0; i < width * height; i++)
     {
@@ -359,7 +359,7 @@ static void extractCompressedBufferToFinalImage(unsigned char *decompressed_byte
     }
 }
 
-static void extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+static void pzp_extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
 {
     unsigned int pixel_count = width * height;
 
@@ -377,7 +377,7 @@ static void extractCompressedBufferToFinalImage3Channels(unsigned char *decompre
     }
 }
 
-static void extractCompressedBufferToFinalImage2Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+static void pzp_extractCompressedBufferToFinalImage2Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
 {
     unsigned int pixel_count = width * height;
 
@@ -393,12 +393,12 @@ static void extractCompressedBufferToFinalImage2Channels(unsigned char *decompre
     }
 }
 
-static void extractCompressedBufferToFinalImage1Channel(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+static void pzp_extractCompressedBufferToFinalImage1Channel(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
 {
    memcpy((*buffers)[0], decompressed_bytes, width * height);
 }
 
-static void decompress_combined(const char *input_filename, unsigned char ***buffers,
+static void pzp_decompress_combined(const char *input_filename, unsigned char ***buffers,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
                                 unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput)
@@ -560,10 +560,10 @@ static void decompress_combined(const char *input_filename, unsigned char ***buf
 
     // Copy decompressed data into the channel buffers
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
-    if (channelsIn==1) { extractCompressedBufferToFinalImage1Channel(decompressed_bytes,buffers,width,height);    } else
-    if (channelsIn==2) { extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);   } else
-    if (channelsIn==3) { extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);   } else
-                       { extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn); }
+    if (channelsIn==1) { pzp_extractCompressedBufferToFinalImage1Channel(decompressed_bytes,buffers,width,height);    } else
+    if (channelsIn==2) { pzp_extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);   } else
+    if (channelsIn==3) { pzp_extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);   } else
+                       { pzp_extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn); }
 
     free(decompressed_buffer);
 }

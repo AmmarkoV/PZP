@@ -290,7 +290,7 @@ int main(int argc, char *argv[])
 
            pzp_RLE_filter(buffers, channelsInternal, width, height);
 
-           compress_combined(buffers, width,height, bitsperpixel,channels, bitsperpixelInternal, channelsInternal, output_commandline_parameter );
+           pzp_compress_combined(buffers, width,height, bitsperpixel,channels, bitsperpixelInternal, channelsInternal, output_commandline_parameter );
 
          free(image);
 
@@ -313,7 +313,7 @@ int main(int argc, char *argv[])
         unsigned int bitsperpixelExternal = 0, channelsExternal = 3;
         unsigned int bitsperpixelInternal = 24, channelsInternal = 3;
 
-        decompress_combined(input_commandline_parameter, &buffers, &width, &height,
+        pzp_decompress_combined(input_commandline_parameter, &buffers, &width, &height,
                             &bitsperpixelExternal, &channelsExternal,
                             &bitsperpixelInternal, &channelsInternal);
         if (buffers!=NULL)

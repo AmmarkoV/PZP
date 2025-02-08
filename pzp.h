@@ -254,6 +254,7 @@ static void pzp_reconstruct_D(unsigned char * reconstructed, unsigned char **buf
 static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
+    unsigned int idx;
 
     if (restoreRLEChannels)
     {
@@ -269,23 +270,27 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
             case 2:
                 reconstructed[0] = buffers[0][0];
                 reconstructed[1] = buffers[1][0];
+                idx = 2;
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    unsigned int idx = i * 2;
+                    //idx = i * 2;
                     reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 2];
                     reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 1];
+                    idx+=2;
                 }
                 break;
             case 3:
                 reconstructed[0] = buffers[0][0];
                 reconstructed[1] = buffers[1][0];
                 reconstructed[2] = buffers[2][0];
+                idx = 3;
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    unsigned int idx = i * 3;
+                    //idx = i * 3;
                     reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 3];
                     reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 2];
                     reconstructed[idx + 2] = buffers[2][i] + reconstructed[idx - 1];
+                    idx+=3;
                 }
                 break;
             default:
@@ -311,20 +316,24 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
                 memcpy(reconstructed, buffers[0], total_size);
                 break;
             case 2:
+                idx = 2;
                 for (unsigned int i = 0; i < total_size; i++)
                 {
-                    unsigned int idx = i * 2;
+                    //idx = i * 2;
                     reconstructed[idx]     = buffers[0][i];
                     reconstructed[idx + 1] = buffers[1][i];
+                    idx+=2;
                 }
                 break;
             case 3:
+                idx = 3;
                 for (unsigned int i = 0; i < total_size; i++)
                 {
-                    unsigned int idx = i * 3;
+                    //idx = i * 3;
                     reconstructed[idx]     = buffers[0][i];
                     reconstructed[idx + 1] = buffers[1][i];
                     reconstructed[idx + 2] = buffers[2][i];
+                    idx+=3;
                 }
                 break;
             default:
@@ -462,9 +471,11 @@ static void pzp_extractCompressedBufferToFinalImage3Channels(unsigned char *deco
     for (unsigned int i = 0; i < pixel_count; i++)
     {
         buf0[i] = decompressed_bytes[idx];
-        buf1[i] = decompressed_bytes[idx + 1];
-        buf2[i] = decompressed_bytes[idx + 2];
-        idx+=3;
+        idx++;
+        buf1[i] = decompressed_bytes[idx];
+        idx++;
+        buf2[i] = decompressed_bytes[idx];
+        idx++;
     }
 }
 
@@ -479,8 +490,9 @@ static void pzp_extractCompressedBufferToFinalImage2Channels(unsigned char *deco
     for (unsigned int i = 0; i < pixel_count; i++)
     {
         buf0[i] = decompressed_bytes[idx];
-        buf1[i] = decompressed_bytes[idx + 1];
-        idx+=2;
+        idx++;
+        buf1[i] = decompressed_bytes[idx];
+        idx++;
     }
 }
 

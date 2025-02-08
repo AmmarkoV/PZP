@@ -1,5 +1,6 @@
 CC = gcc
 CFLAGS = -lzstd -lm
+RELEASE_FLAGS= -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
 DEBUG_FLAGS = -D_GNU_SOURCE -O0 -g3 -fno-omit-frame-pointer -Wstrict-overflow -fPIE -fPIC
 
 SRC = pzp.c
@@ -12,7 +13,7 @@ DPZP = dpzp
 all: $(PZP) $(DPZP)
 
 $(PZP): $(SRC)
-	$(CC) $(SRC) $(CFLAGS) -o $(PZP)
+	$(CC) $(SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(PZP)
 
 $(DPZP): $(SRC)
 	$(CC) $(SRC) $(DEBUG_FLAGS) $(CFLAGS) -o $(DPZP)

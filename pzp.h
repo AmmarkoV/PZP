@@ -470,6 +470,7 @@ static void pzp_extractCompressedBufferToFinalImage(unsigned char *decompressed_
     }
 }
 
+/*
 static void pzp_extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
 {
     unsigned int pixel_count = width * height;
@@ -504,6 +505,38 @@ static void pzp_extractCompressedBufferToFinalImage2Channels(unsigned char *deco
         idx++;
         buf1[i] = decompressed_bytes[idx];
         idx++;
+    }
+}*/
+
+static void pzp_extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+{
+    unsigned int pixel_count = width * height;
+
+    unsigned char *buf0 = (*buffers)[0];
+    unsigned char *buf1 = (*buffers)[1];
+    unsigned char *buf2 = (*buffers)[2];
+    unsigned char *src = decompressed_bytes;
+
+    for (unsigned int i = 0; i < pixel_count; i++)
+    {
+        *buf0++ = *src++;
+        *buf1++ = *src++;
+        *buf2++ = *src++;
+    }
+}
+
+static void pzp_extractCompressedBufferToFinalImage2Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+{
+    unsigned int pixel_count = width * height;
+
+    unsigned char *buf0 = (*buffers)[0];
+    unsigned char *buf1 = (*buffers)[1];
+    unsigned char *src = decompressed_bytes;
+
+    for (unsigned int i = 0; i < pixel_count; i++)
+    {
+        *buf0++ = *src++;
+        *buf1++ = *src++;
     }
 }
 

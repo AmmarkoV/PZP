@@ -258,6 +258,7 @@ int main(int argc, char *argv[])
         unsigned char *image = NULL;
         unsigned int width = 0, height = 0, bytesPerPixel = 0, channels = 0, bitsperpixelInternal = 0, channelsInternal=0;
         unsigned long timestamp = 0;
+        unsigned int configuration = 0;
 
         image = ReadPNM(0, input_commandline_parameter, &width, &height, &timestamp, &bytesPerPixel, &channels);
         unsigned int bitsperpixel = bytesPerPixel * 8;
@@ -290,7 +291,7 @@ int main(int argc, char *argv[])
 
            pzp_RLE_filter(buffers, channelsInternal, width, height);
 
-           pzp_compress_combined(buffers, width,height, bitsperpixel,channels, bitsperpixelInternal, channelsInternal, output_commandline_parameter );
+           pzp_compress_combined(buffers, width,height, bitsperpixel,channels, bitsperpixelInternal, channelsInternal, configuration, output_commandline_parameter);
 
          free(image);
 
@@ -312,13 +313,15 @@ int main(int argc, char *argv[])
         unsigned int width = 0, height = 0;
         unsigned int bitsperpixelExternal = 0, channelsExternal = 3;
         unsigned int bitsperpixelInternal = 24, channelsInternal = 3;
+        unsigned int configuration = 0;
 
         pzp_decompress_combined(input_commandline_parameter, &buffers, &width, &height,
-                            &bitsperpixelExternal, &channelsExternal,
-                            &bitsperpixelInternal, &channelsInternal);
+                               &bitsperpixelExternal, &channelsExternal,
+                               &bitsperpixelInternal, &channelsInternal, &configuration);
+
         if (buffers!=NULL)
         {
-         pzp_restore_channels(buffers, channelsInternal, width, height);
+         pzp_restore_RLE_channels(buffers, channelsInternal, width, height);
 
          unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
          if (reconstructed!=NULL)

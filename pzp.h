@@ -119,7 +119,7 @@ static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, 
 //-----------------------------------------------------------------------------------------------
 // Channel Restoration
 //-----------------------------------------------------------------------------------------------
-static void pzp_restore_channels_n(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_RLE_channels_n(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     for (int i = 1; i < total_size; i++)
@@ -131,7 +131,7 @@ static void pzp_restore_channels_n(unsigned char **buffers, int num_buffers, int
     }
 }
 
-static void pzp_restore_channels_1(unsigned char **buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_RLE_channels_1(unsigned char **buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     unsigned char *buf0 = buffers[0];
@@ -142,7 +142,7 @@ static void pzp_restore_channels_1(unsigned char **buffers, int WIDTH, int HEIGH
     }
 }
 
-static void pzp_restore_channels_2(unsigned char **buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_RLE_channels_2(unsigned char **buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     unsigned char *buf0 = buffers[0];
@@ -155,7 +155,7 @@ static void pzp_restore_channels_2(unsigned char **buffers, int WIDTH, int HEIGH
     }
 }
 
-static void pzp_restore_channels_3(unsigned char **buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_RLE_channels_3(unsigned char **buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     unsigned char *buf0 = buffers[0];
@@ -170,16 +170,16 @@ static void pzp_restore_channels_3(unsigned char **buffers, int WIDTH, int HEIGH
     }
 }
 
-static void pzp_restore_channels(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_RLE_channels(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     switch (num_buffers)
         {
-          case 1: pzp_restore_channels_1(buffers,WIDTH,HEIGHT); break;
-          case 2: pzp_restore_channels_2(buffers,WIDTH,HEIGHT); break;
-          case 3: pzp_restore_channels_3(buffers,WIDTH,HEIGHT); break;
+          case 1: pzp_restore_RLE_channels_1(buffers,WIDTH,HEIGHT); break;
+          case 2: pzp_restore_RLE_channels_2(buffers,WIDTH,HEIGHT); break;
+          case 3: pzp_restore_RLE_channels_3(buffers,WIDTH,HEIGHT); break;
 
           default:
-              pzp_restore_channels_n(buffers,num_buffers,WIDTH,HEIGHT);
+              pzp_restore_RLE_channels_n(buffers,num_buffers,WIDTH,HEIGHT);
         };
 }
 //-----------------------------------------------------------------------------------------------
@@ -256,7 +256,7 @@ static void pzp_reconstruct(unsigned char * reconstructed, unsigned char **buffe
 static void pzp_compress_combined(unsigned char **buffers,
                               unsigned int width,unsigned int height,
                               unsigned int bitsperpixelExternal, unsigned int channelsExternal,
-                              unsigned int bitsperpixelInternal, unsigned int channelsInternal,
+                              unsigned int bitsperpixelInternal, unsigned int channelsInternal, unsigned int configuration,
                               const char *output_filename)
 {
     FILE *output = fopen(output_filename, "wb");
@@ -401,7 +401,8 @@ static void pzp_extractCompressedBufferToFinalImage1Channel(unsigned char *decom
 static void pzp_decompress_combined(const char *input_filename, unsigned char ***buffers,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
-                                unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput)
+                                unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput,
+                                unsigned int *configuration)
 {
     FILE *input = fopen(input_filename, "rb");
     if (!input)

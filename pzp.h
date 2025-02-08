@@ -119,7 +119,7 @@ static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, 
 //-----------------------------------------------------------------------------------------------
 // Channel Restoration
 //-----------------------------------------------------------------------------------------------
-static void restore_channels_n(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_channels_n(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     for (int i = 1; i < total_size; i++)
@@ -131,7 +131,7 @@ static void restore_channels_n(unsigned char **buffers, int num_buffers, int WID
     }
 }
 
-static void restore_channels_1(unsigned char **buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_channels_1(unsigned char **buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     unsigned char *buf0 = buffers[0];
@@ -142,7 +142,7 @@ static void restore_channels_1(unsigned char **buffers, int WIDTH, int HEIGHT)
     }
 }
 
-static void restore_channels_2(unsigned char **buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_channels_2(unsigned char **buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     unsigned char *buf0 = buffers[0];
@@ -155,7 +155,7 @@ static void restore_channels_2(unsigned char **buffers, int WIDTH, int HEIGHT)
     }
 }
 
-static void restore_channels_3(unsigned char **buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_channels_3(unsigned char **buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
     unsigned char *buf0 = buffers[0];
@@ -170,16 +170,16 @@ static void restore_channels_3(unsigned char **buffers, int WIDTH, int HEIGHT)
     }
 }
 
-static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+static void pzp_restore_channels(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     switch (num_buffers)
         {
-          case 1: restore_channels_1(buffers,WIDTH,HEIGHT); break;
-          case 2: restore_channels_2(buffers,WIDTH,HEIGHT); break;
-          case 3: restore_channels_3(buffers,WIDTH,HEIGHT); break;
+          case 1: pzp_restore_channels_1(buffers,WIDTH,HEIGHT); break;
+          case 2: pzp_restore_channels_2(buffers,WIDTH,HEIGHT); break;
+          case 3: pzp_restore_channels_3(buffers,WIDTH,HEIGHT); break;
 
           default:
-              restore_channels_n(buffers,num_buffers,WIDTH,HEIGHT);
+              pzp_restore_channels_n(buffers,num_buffers,WIDTH,HEIGHT);
         };
 }
 //-----------------------------------------------------------------------------------------------
@@ -189,12 +189,12 @@ static void restore_channels(unsigned char **buffers, int num_buffers, int WIDTH
 //-----------------------------------------------------------------------------------------------
 // Buffer Reconstruction
 //-----------------------------------------------------------------------------------------------
-static void reconstruct_1(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
+static void pzp_reconstruct_1(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
 {
     memcpy(reconstructed, buffers[0], width * height);
 }
 
-static void reconstruct_2(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
+static void pzp_reconstruct_2(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
 {
     unsigned int total_size = width * height;
     unsigned char *buf0 = buffers[0];
@@ -208,7 +208,7 @@ static void reconstruct_2(unsigned char *reconstructed, unsigned char **buffers,
     }
 }
 
-static void reconstruct_3(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
+static void pzp_reconstruct_3(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height)
 {
     unsigned int total_size = width * height;
     unsigned char *buf0 = buffers[0];
@@ -225,7 +225,7 @@ static void reconstruct_3(unsigned char *reconstructed, unsigned char **buffers,
 }
 
 
-static void reconstruct_n(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
+static void pzp_reconstruct_n(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
 {
  for (size_t i = 0; i < width * height; i++) //* (bitsperpixel/8)
           {
@@ -236,16 +236,16 @@ static void reconstruct_n(unsigned char * reconstructed, unsigned char **buffers
           }
 }
 
-static void reconstruct(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
+static void pzp_reconstruct(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
 {
     switch (channels)
         {
-          case 1: reconstruct_1(reconstructed,buffers,width,height); break;
-          case 2: reconstruct_2(reconstructed,buffers,width,height); break;
-          case 3: reconstruct_3(reconstructed,buffers,width,height); break;
+          case 1: pzp_reconstruct_1(reconstructed,buffers,width,height); break;
+          case 2: pzp_reconstruct_2(reconstructed,buffers,width,height); break;
+          case 3: pzp_reconstruct_3(reconstructed,buffers,width,height); break;
 
           default:
-              reconstruct_n(reconstructed,buffers,width,height,channels);
+              pzp_reconstruct_n(reconstructed,buffers,width,height,channels);
         };
 }
 //-----------------------------------------------------------------------------------------------

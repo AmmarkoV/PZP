@@ -318,20 +318,12 @@ int main(int argc, char *argv[])
                             &bitsperpixelInternal, &channelsInternal);
         if (buffers!=NULL)
         {
-         restore_channels(buffers, channelsInternal, width, height);
+         pzp_restore_channels(buffers, channelsInternal, width, height);
 
          unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
          if (reconstructed!=NULL)
          {
-          reconstruct(reconstructed, buffers, width, height, channelsInternal);
-             /*
-          for (size_t i = 0; i < width * height; i++) // * (bitsperpixel/8)
-          {
-            for (unsigned int ch = 0; ch < channelsInternal; ch++)
-            {
-                reconstructed[i * channelsInternal + ch] = buffers[ch][i];
-            }
-          }*/
+          pzp_reconstruct(reconstructed, buffers, width, height, channelsInternal);
 
           bitsperpixelExternal *= channelsExternal; //This is needed because of what writePNM expects..
           WritePNM(output_commandline_parameter, reconstructed, width, height, bitsperpixelExternal, channelsExternal);

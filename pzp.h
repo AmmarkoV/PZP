@@ -273,7 +273,6 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
                 idx = 2;
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    //idx = i * 2;
                     reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 2];
                     reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 1];
                     idx+=2;
@@ -286,7 +285,6 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
                 idx = 3;
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    //idx = i * 3;
                     reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 3];
                     reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 2];
                     reconstructed[idx + 2] = buffers[2][i] + reconstructed[idx - 1];
@@ -319,7 +317,6 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
                 idx = 2;
                 for (unsigned int i = 0; i < total_size; i++)
                 {
-                    //idx = i * 2;
                     reconstructed[idx]     = buffers[0][i];
                     reconstructed[idx + 1] = buffers[1][i];
                     idx+=2;
@@ -329,7 +326,6 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
                 idx = 3;
                 for (unsigned int i = 0; i < total_size; i++)
                 {
-                    //idx = i * 3;
                     reconstructed[idx]     = buffers[0][i];
                     reconstructed[idx + 1] = buffers[1][i];
                     reconstructed[idx + 2] = buffers[2][i];

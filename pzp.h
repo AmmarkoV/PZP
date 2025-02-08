@@ -309,6 +309,7 @@ static void pzp_compress_combined(unsigned char **buffers,
     *heightTarget               = height;
     *bitsperpixelInternalTarget = bitsperpixelInternal;
     *channelsInternalTarget     = channelsInternal;
+    *compressionModeTarget      = configuration;
 
     // Store separate image planes so that they get better compressed :P
     unsigned char *combined_buffer = combined_buffer_raw + headerSize;
@@ -326,7 +327,7 @@ static void pzp_compress_combined(unsigned char **buffers,
     #if PZP_VERBOSE
     fprintf(stderr, "Storing %ux%ux%u@%ubit/",width,height,channelsExternal,bitsperpixelExternal);
     fprintf(stderr, "%u@%ubit",channelsInternal,bitsperpixelInternal);
-    fprintf(stderr, " | CRC:0x%X\n",*checksumTarget);
+    fprintf(stderr, " | mode %u | CRC:0x%X\n", configuration, *checksumTarget);
     #endif // PZP_VERBOSE
 
 
@@ -516,7 +517,7 @@ static void pzp_decompress_combined(const char *input_filename, unsigned char **
 #if PZP_VERBOSE
     fprintf(stderr, "Detected %ux%ux%u@%ubit/", width, height, channelsExt, bitsperpixelExt);
     fprintf(stderr, "%u@%ubit", channelsIn, bitsperpixelIn);
-    fprintf(stderr, " | CRC:0x%X\n", *checksumSource);
+    fprintf(stderr, " | mode %u | CRC:0x%X\n", compressionCfg, *checksumSource);
 #endif
 
     unsigned int runtimeVersion = convert_header(pzp_header);
@@ -533,6 +534,7 @@ static void pzp_decompress_combined(const char *input_filename, unsigned char **
     *heightOutput               = height;
     *bitsperpixelInternalOutput = bitsperpixelIn;
     *channelsInternalOutput     = channelsIn;
+    *configuration              = compressionCfg;
 
     // Allocate memory for all channels
     *buffers = (unsigned char **)malloc(channelsIn * sizeof(unsigned char *));

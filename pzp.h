@@ -256,6 +256,8 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
     unsigned int total_size = width * height;
     unsigned int idx;
 
+    unsigned char *r = reconstructed, *b0 = 0, *b1 = 0, *b2 = 0;
+
     if (restoreRLEChannels)
     {
         switch (channels)
@@ -268,27 +270,40 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
                 }
                 break;
             case 2:
+                b0 = buffers[0];
+                b1 = buffers[1];
+                r[0] = b0[0];
+                r[1] = b1[0];
+
                 reconstructed[0] = buffers[0][0];
                 reconstructed[1] = buffers[1][0];
-                idx = 2;
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 2];
-                    reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 1];
-                    idx+=2;
+                 r += 2;  // Move to the next set of three channels
+                 b0++;
+                 b1++;
+
+                 r[0] = *b0 + r[-2];
+                 r[1] = *b1 + r[-1];
                 }
                 break;
             case 3:
-                reconstructed[0] = buffers[0][0];
-                reconstructed[1] = buffers[1][0];
-                reconstructed[2] = buffers[2][0];
-                idx = 3;
+                b0 = buffers[0];
+                b1 = buffers[1];
+                b2 = buffers[2];
+                r[0] = b0[0];
+                r[1] = b1[0];
+                r[2] = b2[0];
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 3];
-                    reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 2];
-                    reconstructed[idx + 2] = buffers[2][i] + reconstructed[idx - 1];
-                    idx+=3;
+                 r += 3;  // Move to the next set of three channels
+                 b0++;
+                 b1++;
+                 b2++;
+
+                 r[0] = *b0 + r[-3];
+                 r[1] = *b1 + r[-2];
+                 r[2] = *b2 + r[-1];
                 }
                 break;
             default:
@@ -307,7 +322,7 @@ static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffer
         }
     }
     else
-    {
+    { //Non RLE path
         switch (channels)
         {
             case 1:

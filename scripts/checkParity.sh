@@ -1,7 +1,11 @@
 #!/bin/bash
 
+
+#scripts/convertAllFilesInDirectoryToPZP.sh test/segment_val2017 test/segment_val2017PZP/
+#scripts/convertAllDepthFilesInDirectoryToPZP.sh test/depth_val2017 test/depth_val2017PZP/
+
 #scripts/checkParity.sh test/segment_val2017 test/segment_val2017PZP/
-#
+#scripts/checkParity.sh test/depth_val2017 test/depth_val2017PZP/
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"

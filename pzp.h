@@ -36,7 +36,9 @@ extern "C"
 
 static const char pzp_version[]="v0.0";
 static const char pzp_header[4]={"PZP0"};
-static const int headerSize =  sizeof(unsigned int) * 8; //header, width,height,bitsperpixel,channels, internalbitsperpixel, internalchannels, checksum
+
+static const int headerSize =  sizeof(unsigned int) * 10;
+//header, width, height, bitsperpixel, channels, internalbitsperpixel, internalchannels, checksum, compression_mode, unused
 
 
 // Define flags using bitwise shift for clarity
@@ -86,7 +88,7 @@ static unsigned int hash_checksum(const void *data, size_t dataSize)
     return (h1 ^ (h2 >> 3)) + (h3 ^ (h4 << 5));
 }
 
-static void split_channels_and_filter(const unsigned char *image, unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+static void pzp_split_channels(const unsigned char *image, unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
 
@@ -99,6 +101,12 @@ static void split_channels_and_filter(const unsigned char *image, unsigned char 
         }
     }
 
+}
+
+static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
+{
+    int total_size = WIDTH * HEIGHT;
+
     // Apply left-pixel delta filtering
     for (int i = total_size - 1; i > 0; i--)
     {
@@ -108,7 +116,6 @@ static void split_channels_and_filter(const unsigned char *image, unsigned char 
         }
     }
 }
-
 //-----------------------------------------------------------------------------------------------
 // Channel Restoration
 //-----------------------------------------------------------------------------------------------
@@ -290,14 +297,16 @@ static void compress_combined(unsigned char **buffers,
     unsigned int *bitsperpixelInternalTarget = memStartAsUINT + 5; // Move by 1, not sizeof(unsigned int)
     unsigned int *channelsInternalTarget     = memStartAsUINT + 6; // Move by 1, not sizeof(unsigned int)
     unsigned int *checksumTarget             = memStartAsUINT + 7; // Move by 1, not sizeof(unsigned int)
+    unsigned int *compressionModeTarget      = memStartAsUINT + 8; // Move by 1, not sizeof(unsigned int)
+    //unsigned int *unusedTarget               = memStartAsUINT + 9; // Move by 1, not sizeof(unsigned int)
     //---------------------------------------------------------------------------------------------------
 
     //Store data to their target location
-    *headerTarget       = convert_header(pzp_header);
-    *bitsperpixelTarget = bitsperpixelExternal;
-    *channelsTarget     = channelsExternal;
-    *widthTarget        = width;
-    *heightTarget       = height;
+    *headerTarget               = convert_header(pzp_header);
+    *bitsperpixelTarget         = bitsperpixelExternal;
+    *channelsTarget             = channelsExternal;
+    *widthTarget                = width;
+    *heightTarget               = height;
     *bitsperpixelInternalTarget = bitsperpixelInternal;
     *channelsInternalTarget     = channelsInternal;
 
@@ -483,14 +492,16 @@ static void decompress_combined(const char *input_filename, unsigned char ***buf
     // Read header information
     unsigned int *memStartAsUINT = (unsigned int *)decompressed_buffer;
 
-    unsigned int *headerSource          = memStartAsUINT + 0;
-    unsigned int *bitsperpixelExtSource = memStartAsUINT + 1;
-    unsigned int *channelsExtSource     = memStartAsUINT + 2;
-    unsigned int *widthSource           = memStartAsUINT + 3;
-    unsigned int *heightSource          = memStartAsUINT + 4;
-    unsigned int *bitsperpixelInSource  = memStartAsUINT + 5;
-    unsigned int *channelsInSource      = memStartAsUINT + 6;
-    unsigned int *checksumSource        = memStartAsUINT + 7;
+    unsigned int *headerSource            = memStartAsUINT + 0;
+    unsigned int *bitsperpixelExtSource   = memStartAsUINT + 1;
+    unsigned int *channelsExtSource       = memStartAsUINT + 2;
+    unsigned int *widthSource             = memStartAsUINT + 3;
+    unsigned int *heightSource            = memStartAsUINT + 4;
+    unsigned int *bitsperpixelInSource    = memStartAsUINT + 5;
+    unsigned int *channelsInSource        = memStartAsUINT + 6;
+    unsigned int *checksumSource          = memStartAsUINT + 7;
+    unsigned int *compressionConfigSource = memStartAsUINT + 8;
+    //unsigned int *unusedSource            = memStartAsUINT + 9;
 
     // Move from mapped header memory to our local variables
     unsigned int bitsperpixelExt = *bitsperpixelExtSource;
@@ -499,6 +510,7 @@ static void decompress_combined(const char *input_filename, unsigned char ***buf
     unsigned int height          = *heightSource;
     unsigned int bitsperpixelIn  = *bitsperpixelInSource;
     unsigned int channelsIn      = *channelsInSource;
+    unsigned int compressionCfg  = *compressionConfigSource;
 
 #if PZP_VERBOSE
     fprintf(stderr, "Detected %ux%ux%u@%ubit/", width, height, channelsExt, bitsperpixelExt);

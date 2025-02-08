@@ -286,7 +286,9 @@ int main(int argc, char *argv[])
              //{ memset(buffers[ch],0,width * height * sizeof(unsigned char)); }
            }
 
-           split_channels_and_filter(image, buffers, channelsInternal, width, height);
+           pzp_split_channels(image, buffers, channelsInternal, width, height);
+
+           pzp_RLE_filter(buffers, channelsInternal, width, height);
 
            compress_combined(buffers, width,height, bitsperpixel,channels, bitsperpixelInternal, channelsInternal, output_commandline_parameter );
 

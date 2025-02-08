@@ -327,7 +327,7 @@ int main(int argc, char *argv[])
         {
 
          unsigned int restoreRLEChannels = configuration && USE_RLE;
-         /*
+          /*
          if (configuration && USE_RLE)
            {
             fprintf(stderr,"Using RLE for decompression\n");

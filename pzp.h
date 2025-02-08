@@ -40,7 +40,6 @@ static const char pzp_header[4]={"PZP0"};
 static const int headerSize =  sizeof(unsigned int) * 10;
 //header, width, height, bitsperpixel, channels, internalbitsperpixel, internalchannels, checksum, compression_mode, unused
 
-
 // Define flags using bitwise shift for clarity
 typedef enum
 {
@@ -119,6 +118,7 @@ static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, 
 //-----------------------------------------------------------------------------------------------
 // Channel Restoration
 //-----------------------------------------------------------------------------------------------
+/*
 static void pzp_restore_RLE_channels_n(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
@@ -227,7 +227,7 @@ static void pzp_reconstruct_3(unsigned char *reconstructed, unsigned char **buff
 
 static void pzp_reconstruct_n(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
 {
- for (size_t i = 0; i < width * height; i++) //* (bitsperpixel/8)
+ for (size_t i = 0; i < width * height; i++) // * (bitsperpixel/8)
           {
             for (unsigned int ch = 0; ch < channels; ch++)
             {
@@ -248,6 +248,7 @@ static void pzp_reconstruct_D(unsigned char * reconstructed, unsigned char **buf
               pzp_reconstruct_n(reconstructed,buffers,width,height,channels);
         };
 }
+*/
 //-----------------------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------------------
 static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
@@ -386,7 +387,7 @@ static void pzp_compress_combined(unsigned char **buffers,
     unsigned int *channelsInternalTarget     = memStartAsUINT + 6; // Move by 1, not sizeof(unsigned int)
     unsigned int *checksumTarget             = memStartAsUINT + 7; // Move by 1, not sizeof(unsigned int)
     unsigned int *compressionModeTarget      = memStartAsUINT + 8; // Move by 1, not sizeof(unsigned int)
-    //unsigned int *unusedTarget               = memStartAsUINT + 9; // Move by 1, not sizeof(unsigned int)
+    unsigned int *unusedTarget               = memStartAsUINT + 9; // Move by 1, not sizeof(unsigned int)
     //---------------------------------------------------------------------------------------------------
 
     //Store data to their target location
@@ -398,6 +399,7 @@ static void pzp_compress_combined(unsigned char **buffers,
     *bitsperpixelInternalTarget = bitsperpixelInternal;
     *channelsInternalTarget     = channelsInternal;
     *compressionModeTarget      = configuration;
+    *unusedTarget               = 0; //<- Just so that it is not random
 
     // Store separate image planes so that they get better compressed :P
     unsigned char *combined_buffer = combined_buffer_raw + headerSize;

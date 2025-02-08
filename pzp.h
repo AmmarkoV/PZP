@@ -236,7 +236,7 @@ static void pzp_reconstruct_n(unsigned char * reconstructed, unsigned char **buf
           }
 }
 
-static void pzp_reconstruct(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
+static void pzp_reconstruct_D(unsigned char * reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels)
 {
     switch (channels)
         {
@@ -250,6 +250,94 @@ static void pzp_reconstruct(unsigned char * reconstructed, unsigned char **buffe
 }
 //-----------------------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------------------
+static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+{
+    unsigned int total_size = width * height;
+
+    if (restoreRLEChannels)
+    {
+        switch (channels)
+        {
+            case 1:
+                reconstructed[0] = buffers[0][0];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    reconstructed[i] = buffers[0][i] + reconstructed[i - 1];
+                }
+                break;
+            case 2:
+                reconstructed[0] = buffers[0][0];
+                reconstructed[1] = buffers[1][0];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    unsigned int idx = i * 2;
+                    reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 2];
+                    reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 1];
+                }
+                break;
+            case 3:
+                reconstructed[0] = buffers[0][0];
+                reconstructed[1] = buffers[1][0];
+                reconstructed[2] = buffers[2][0];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    unsigned int idx = i * 3;
+                    reconstructed[idx]     = buffers[0][i] + reconstructed[idx - 3];
+                    reconstructed[idx + 1] = buffers[1][i] + reconstructed[idx - 2];
+                    reconstructed[idx + 2] = buffers[2][i] + reconstructed[idx - 1];
+                }
+                break;
+            default:
+                for (unsigned int ch = 0; ch < channels; ch++)
+                {
+                    reconstructed[ch] = buffers[ch][0];
+                }
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        reconstructed[i * channels + ch] = buffers[ch][i] + reconstructed[(i - 1) * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+    else
+    {
+        switch (channels)
+        {
+            case 1:
+                memcpy(reconstructed, buffers[0], total_size);
+                break;
+            case 2:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    unsigned int idx = i * 2;
+                    reconstructed[idx]     = buffers[0][i];
+                    reconstructed[idx + 1] = buffers[1][i];
+                }
+                break;
+            case 3:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    unsigned int idx = i * 3;
+                    reconstructed[idx]     = buffers[0][i];
+                    reconstructed[idx + 1] = buffers[1][i];
+                    reconstructed[idx + 2] = buffers[2][i];
+                }
+                break;
+            default:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        reconstructed[i * channels + ch] = buffers[ch][i];
+                    }
+                }
+                break;
+        }
+    }
+}
 
 
 

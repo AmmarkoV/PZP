@@ -326,16 +326,18 @@ int main(int argc, char *argv[])
         if (buffers!=NULL)
         {
 
+         unsigned int restoreRLEChannels = configuration && USE_RLE;
+         /*
          if (configuration && USE_RLE)
            {
             fprintf(stderr,"Using RLE for decompression\n");
             pzp_restore_RLE_channels(buffers, channelsInternal, width, height);
-           }
+           }*/
 
          unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
          if (reconstructed!=NULL)
          {
-          pzp_reconstruct(reconstructed, buffers, width, height, channelsInternal);
+          pzp_reconstruct(reconstructed, buffers, width, height, channelsInternal, restoreRLEChannels);
 
           bitsperpixelExternal *= channelsExternal; //This is needed because of what writePNM expects..
           WritePNM(output_commandline_parameter, reconstructed, width, height, bitsperpixelExternal, channelsExternal);

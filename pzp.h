@@ -222,7 +222,7 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
-#if INTEL_OPTIMIZATION
+#if INTEL_OPTIMIZATIONS
 static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
@@ -320,7 +320,8 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
         }
     }
 }
-#else
+#endif // INTEL_OPTIMIZATIONS
+
 static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
@@ -412,15 +413,18 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
         }
     }
 }
-#endif // INTEL_OPTIMIZATION
 //-----------------------------------------------------------------------------------------------
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
-    #if INTEL_OPTIMIZATION
+   // Force Naive implementation since AVX2 does not produce accurate results (yet)
+   pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+   return;
+
+   #if INTEL_OPTIMIZATIONS
      pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-    #else
+   #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-    #endif // INTEL_OPTIMIZATION
+   #endif // INTEL_OPTIMIZATIONS
 }
 //-----------------------------------------------------------------------------------------------
 static unsigned char* pzp_decompress_combined(const char *input_filename,

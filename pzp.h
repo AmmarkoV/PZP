@@ -221,7 +221,7 @@ static void pzp_compress_combined(unsigned char **buffers,
 }
 //-----------------------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------------------
-static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
@@ -281,6 +281,7 @@ static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigne
     {
         switch (channels)
         {
+            //This path can be optimized to reduce multiplications ( with i )
             case 1:
                 memcpy(reconstructed, src, total_size);
                 break;
@@ -312,6 +313,114 @@ static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigne
     }
 }
 //-----------------------------------------------------------------------------------------------
+#if INTEL_OPTIMIZATION
+static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+{
+    unsigned int total_size = width * height;
+    unsigned char *src = decompressed_bytes;
+    unsigned char *r = reconstructed;
+
+    if (restoreRLEChannels)
+    {
+        switch (channels)
+        {
+            case 1:
+                r[0] = src[0];
+                for (unsigned int i = 1; i < total_size; i += 32)
+                {
+                    __m256i prev = _mm256_set1_epi8(r[i - 1]);
+                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i]);
+                    __m256i result = _mm256_add_epi8(data, prev);
+                    _mm256_storeu_si256((__m256i*)&r[i], result);
+                }
+                break;
+
+            case 2:
+                r[0] = src[0];
+                r[1] = src[1];
+                for (unsigned int i = 1; i < total_size; i += 16)
+                {
+                    __m256i prev = _mm256_loadu_si256((__m256i*)&r[(i - 1) * 2]);
+                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 2]);
+                    __m256i result = _mm256_add_epi8(data, prev);
+                    _mm256_storeu_si256((__m256i*)&r[i * 2], result);
+                }
+                break;
+
+            case 3:
+                r[0] = src[0];
+                r[1] = src[1];
+                r[2] = src[2];
+                for (unsigned int i = 1; i < total_size; i += 10)
+                {
+                    __m256i prev = _mm256_loadu_si256((__m256i*)&r[(i - 1) * 3]);
+                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 3]);
+                    __m256i result = _mm256_add_epi8(data, prev);
+                    _mm256_storeu_si256((__m256i*)&r[i * 3], result);
+                }
+                break;
+
+            default:
+                for (unsigned int ch = 0; ch < channels; ch++)
+                {
+                    r[ch] = src[ch];
+                }
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+    else // Non-RLE path
+    {
+        switch (channels)
+        {
+            case 1:
+                memcpy(reconstructed, src, total_size);
+                break;
+
+            case 2:
+                for (unsigned int i = 0; i < total_size; i += 16)
+                {
+                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 2]);
+                    _mm256_storeu_si256((__m256i*)&r[i * 2], data);
+                }
+                break;
+
+            case 3:
+                for (unsigned int i = 0; i < total_size; i += 10)
+                {
+                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 3]);
+                    _mm256_storeu_si256((__m256i*)&r[i * 3], data);
+                }
+                break;
+
+            default:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        r[i * channels + ch] = src[i * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+}
+#endif // INTEL_OPTIMIZATION
+//-----------------------------------------------------------------------------------------------
+static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+{
+    #if INTEL_OPTIMIZATION
+     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+    #else
+     pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+    #endif // INTEL_OPTIMIZATION
+}
 //-----------------------------------------------------------------------------------------------
 static unsigned char* pzp_decompress_combined(const char *input_filename,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
@@ -322,7 +431,8 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     FILE *input = fopen(input_filename, "rb");
     if (!input)
     {
-        fail("File error");
+        //fail("File error");
+        return 0;
     }
 
     // Read stored size
@@ -330,14 +440,16 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     if (fread(&dataSize, sizeof(unsigned int), 1, input) != 1)
     {
         fclose(input);
-        fail("Failed to read data size");
+        //fail("Failed to read data size");
+        return 0;
     }
 
     if (dataSize == 0 || dataSize > 100000000)   // Sanity check
     {
         fclose(input);
         fprintf(stderr, "Error: Invalid size read from file (%d)\n", dataSize);
-        fail("Error: Invalid size read from file");
+        //fail("Error: Invalid size read from file");
+        return 0;
     }
     //printf("Read size: %d bytes\n", dataSize);
 
@@ -345,14 +457,16 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     if (fseek(input, 0, SEEK_END) != 0)
     {
         fclose(input);
-        fail("Failed to seek file end");
+        //fail("Failed to seek file end");
+        return 0;
     }
 
     long fileSize = ftell(input);
     if (fileSize < 0)
     {
         fclose(input);
-        fail("Failed to determine file size");
+        //fail("Failed to determine file size");
+        return 0;
     }
 
     size_t compressed_size = fileSize - sizeof(unsigned int);
@@ -360,21 +474,24 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     if (fseek(input, sizeof(unsigned int), SEEK_SET) != 0)
     {
         fclose(input);
-        fail("Failed to seek to compressed data");
+        //fail("Failed to seek to compressed data");
+        return 0;
     }
 
     void *compressed_buffer = malloc(compressed_size);
     if (!compressed_buffer)
     {
         fclose(input);
-        fail("Memory allocation #1 failed");
+        //fail("Memory allocation #1 failed");
+        return 0;
     }
 
     if (fread(compressed_buffer, 1, compressed_size, input) != compressed_size)
     {
         free(compressed_buffer);
         fclose(input);
-        fail("Failed to read compressed data");
+        //fail("Failed to read compressed data");
+        return 0;
     }
 
     fclose(input);
@@ -384,7 +501,8 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     if (!decompressed_buffer)
     {
         free(compressed_buffer);
-        fail("Memory allocation #2 failed");
+        //fail("Memory allocation #2 failed");
+        return 0;
     }
 
     size_t actual_decompressed_size = ZSTD_decompress(decompressed_buffer, decompressed_size, compressed_buffer, compressed_size);
@@ -393,7 +511,8 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
         free(compressed_buffer);
         free(decompressed_buffer);
         fprintf(stderr, "Zstd decompression error: %s\n", ZSTD_getErrorName(actual_decompressed_size));
-        fail("Decompression Error");
+        //fail("Decompression Error");
+        return 0;
     }
 
     free(compressed_buffer);
@@ -402,7 +521,8 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     {
         free(decompressed_buffer);
         fprintf(stderr, "Actual Decompressed size %lu mismatch with Decompressed size %lu \n", actual_decompressed_size, decompressed_size);
-        fail("Decompression Error");
+        //fail("Decompression Error");
+        return 0;
     }
 
     // Read header information
@@ -438,7 +558,8 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     if (runtimeVersion != *headerSource)
     {
         free(decompressed_buffer);
-        fail("PZP version mismatch stopping to ensure consistency..");
+        //fail("PZP version mismatch stopping to ensure consistency..");
+        return 0;
     }
 
     // Move from our local variables to function output

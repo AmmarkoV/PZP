@@ -1,5 +1,6 @@
 CC = gcc
 CFLAGS = -lzstd -lm
+SIMD_FLAGS = -DINTEL_OPTIMIZATIONS -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
 RELEASE_FLAGS= -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
 DEBUG_FLAGS = -D_GNU_SOURCE -O0 -g3 -fno-omit-frame-pointer -Wstrict-overflow -fPIE -fPIC
 
@@ -7,16 +8,20 @@ SRC = pzp.c
 OUTDIR = output
 PZP = pzp
 DPZP = dpzp
+SPZP = spzp
 
 .PHONY: all clean test
 
-all: $(PZP) $(DPZP)
+all: $(PZP) $(DPZP) $(SPZP)
 
 $(PZP): $(SRC)
 	$(CC) $(SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(PZP)
 
 $(DPZP): $(SRC)
 	$(CC) $(SRC) $(DEBUG_FLAGS) $(CFLAGS) -o $(DPZP)
+
+$(SPZP): $(SRC)
+	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(PZP)
 
 clean:
 	rm -rf $(PZP) $(DPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt

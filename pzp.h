@@ -389,31 +389,40 @@ static void pzp_extractCompressedBufferToFinalImage3Channels_AVX2(unsigned char 
     unsigned char *buf2 = (*buffers)[2];
     unsigned char *src = decompressed_bytes;
 
-__m256i shuffleMask = _mm256_set_epi8(
-    2, 5, 8, 11, 14, 17, 20, 23,
-    1, 4, 7, 10, 13, 16, 19, 22,
-    0, 3, 6, 9, 12, 15, 18, 21,
-    24, 27, 30, -1, 25, 28, 31, -1
-);
+    // Process 32 pixels at a time using AVX2
+    unsigned int simd_pixels = pixel_count / 32 * 32;
 
-
-    for (; i + 32 <= pixel_count * 3; i += 32)
+    for (; i < simd_pixels; i += 32)
     {
-        __m256i data = _mm256_loadu_si256((__m256i *)(src + i));
+        // Load 96 bytes (32 pixels, 3 bytes per pixel)
+        __m256i chunk0 = _mm256_loadu_si256((__m256i *)(src));
+        __m256i chunk1 = _mm256_loadu_si256((__m256i *)(src + 32));
+        __m256i chunk2 = _mm256_loadu_si256((__m256i *)(src + 64));
 
-        __m256i shuffled = _mm256_shuffle_epi8(data, shuffleMask);
+        // Interleave to separate RGB channels
+        __m256i shuffleMask = _mm256_set_epi8(
+            29, 26, 23, 20, 17, 14, 11, 8, 5, 2, 31, 28, 25, 22, 19, 16,
+            13, 10, 7, 4, 1, 30, 27, 24, 21, 18, 15, 12, 9, 6, 3, 0
+        );
 
-        _mm256_storeu_si256((__m256i *)(buf0 + i / 3), shuffled);
-        _mm256_storeu_si256((__m256i *)(buf1 + i / 3), _mm256_srli_si256(shuffled, 1));
-        _mm256_storeu_si256((__m256i *)(buf2 + i / 3), _mm256_srli_si256(shuffled, 2));
+        chunk0 = _mm256_shuffle_epi8(chunk0, shuffleMask);
+        chunk1 = _mm256_shuffle_epi8(chunk1, shuffleMask);
+        chunk2 = _mm256_shuffle_epi8(chunk2, shuffleMask);
+
+        // Store results
+        _mm256_storeu_si256((__m256i *)(buf0 + i), chunk0);
+        _mm256_storeu_si256((__m256i *)(buf1 + i), chunk1);
+        _mm256_storeu_si256((__m256i *)(buf2 + i), chunk2);
+
+        src += 96; // Move to the next 96-byte chunk
     }
 
-    // Process remaining pixels
-    for (; i / 3 < pixel_count; i += 3)
+    // Process remaining pixels (scalar mode)
+    for (; i < pixel_count; i++)
     {
-        *buf0++ = *src++;
-        *buf1++ = *src++;
-        *buf2++ = *src++;
+        buf0[i] = *src++;
+        buf1[i] = *src++;
+        buf2[i] = *src++;
     }
 }
 #endif // INTEL_OPTIMIZATIONS
@@ -425,7 +434,13 @@ static void pzp_extractCompressedBufferToFinalImage(unsigned char *decompressed_
     {
         case 1: pzp_extractCompressedBufferToFinalImage1Channel(decompressed_bytes,buffers,width,height);  break;
         case 2: pzp_extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);  break;
-        case 3: pzp_extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);  break;
+        case 3:
+            #if INTEL_OPTIMIZATIONS
+             pzp_extractCompressedBufferToFinalImage3Channels_AVX2(decompressed_bytes, buffers, width, height);
+            #else
+             pzp_extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);
+            #endif // INTEL_OPTIMIZATIONS
+        break;
         default:
          pzp_extractCompressedBufferToFinalImage_NChannels(decompressed_bytes,buffers,width,height,channels);
         break;
@@ -434,7 +449,7 @@ static void pzp_extractCompressedBufferToFinalImage(unsigned char *decompressed_
 
 
 
-static void pzp_decompress_combined(const char *input_filename, unsigned char ***buffers,
+static unsigned char* pzp_decompress_combined(const char *input_filename, unsigned char ***buffers,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
                                 unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput,
@@ -597,10 +612,19 @@ static void pzp_decompress_combined(const char *input_filename, unsigned char **
     }
 
     // Copy decompressed data into the channel buffers
+    /*TODO: Unify these calls */
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
     pzp_extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn);
 
+    unsigned char *reconstructed = malloc( width * height * (bitsperpixelIn/8)* channelsIn );
+    if (reconstructed!=NULL)
+         {
+          unsigned int restoreRLEChannels = compressionCfg && USE_RLE;
+          pzp_reconstruct(reconstructed, *buffers, width, height, channelsIn, restoreRLEChannels);
+         }
+
     free(decompressed_buffer);
+    return reconstructed;
 }
 
 #ifdef __cplusplus

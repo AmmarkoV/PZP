@@ -319,19 +319,19 @@ int main(int argc, char *argv[])
         unsigned int bitsperpixelInternal = 24, channelsInternal = 3;
         unsigned int configuration = 0;
 
-        pzp_decompress_combined(input_commandline_parameter, &buffers, &width, &height,
-                               &bitsperpixelExternal, &channelsExternal,
-                               &bitsperpixelInternal, &channelsInternal, &configuration);
+        unsigned char *reconstructed = pzp_decompress_combined(input_commandline_parameter, &buffers, &width, &height,
+                                                               &bitsperpixelExternal, &channelsExternal,
+                                                               &bitsperpixelInternal, &channelsInternal, &configuration);
 
         if (buffers!=NULL)
         {
 
          unsigned int restoreRLEChannels = configuration && USE_RLE;
 
-         unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
+         //unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
          if (reconstructed!=NULL)
          {
-          pzp_reconstruct(reconstructed, buffers, width, height, channelsInternal, restoreRLEChannels);
+          //pzp_reconstruct(reconstructed, buffers, width, height, channelsInternal, restoreRLEChannels);
 
           bitsperpixelExternal *= channelsExternal; //This is needed because of what writePNM expects..
           WritePNM(output_commandline_parameter, reconstructed, width, height, bitsperpixelExternal, channelsExternal);

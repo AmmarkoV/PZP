@@ -24,7 +24,7 @@ $(SPZP): $(SRC)
 	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(SPZP)
 
 clean:
-	rm -rf $(PZP) $(DPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt
+	rm -rf $(PZP) $(DPZP) $(SPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
@@ -32,17 +32,22 @@ $(OUTDIR):
 test: all $(OUTDIR)
 	./$(PZP) compress samples/sample.ppm $(OUTDIR)/sample.pzp
 	./$(PZP) decompress $(OUTDIR)/sample.pzp $(OUTDIR)/sampleRecode.ppm
-	#diff samples/sample.ppm $(OUTDIR)/sampleRecode.ppm 
 	./$(PZP) compress samples/depth16.pnm $(OUTDIR)/depth16.pzp
-	./$(PZP) decompress $(OUTDIR)/depth16.pzp $(OUTDIR)/depth16Recode.ppm
-	#diff samples/depth16.pnm $(OUTDIR)/depth16Recode.ppm 
+	./$(PZP) decompress $(OUTDIR)/depth16.pzp $(OUTDIR)/depth16Recode.ppm 
 	./$(PZP) compress samples/rgb8.pnm $(OUTDIR)/rgb8.pzp
-	./$(PZP) decompress $(OUTDIR)/rgb8.pzp $(OUTDIR)/rgb8Recode.ppm
-	#diff samples/rgb8.pnm $(OUTDIR)/rgb8Recode.ppm
+	./$(PZP) decompress $(OUTDIR)/rgb8.pzp $(OUTDIR)/rgb8Recode.ppm 
 	./$(PZP) compress samples/segment.ppm $(OUTDIR)/segment.pzp
-	./$(PZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm
-	#diff samples/segment.pnm $(OUTDIR)/segmentRecode.ppm
+	./$(PZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm 
 
+stest: all $(OUTDIR)
+	./$(SPZP) compress samples/sample.ppm $(OUTDIR)/sample.pzp
+	./$(SPZP) decompress $(OUTDIR)/sample.pzp $(OUTDIR)/sampleRecode.ppm
+	./$(SPZP) compress samples/depth16.pnm $(OUTDIR)/depth16.pzp
+	./$(SPZP) decompress $(OUTDIR)/depth16.pzp $(OUTDIR)/depth16Recode.ppm 
+	./$(SPZP) compress samples/rgb8.pnm $(OUTDIR)/rgb8.pzp
+	./$(SPZP) decompress $(OUTDIR)/rgb8.pzp $(OUTDIR)/rgb8Recode.ppm 
+	./$(SPZP) compress samples/segment.ppm $(OUTDIR)/segment.pzp
+	./$(SPZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm 
 
 debug: all $(OUTDIR)
 	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --track-origins=yes --num-callers=20 --track-fds=yes ./$(DPZP) compress samples/sample.ppm $(OUTDIR)/sample.pzp 2>log1.txt

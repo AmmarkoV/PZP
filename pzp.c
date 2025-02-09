@@ -325,9 +325,7 @@ int main(int argc, char *argv[])
 
         if (buffers!=NULL)
         {
-
-         unsigned int restoreRLEChannels = configuration && USE_RLE;
-
+         //unsigned int restoreRLEChannels = configuration && USE_RLE;
          //unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
          if (reconstructed!=NULL)
          {

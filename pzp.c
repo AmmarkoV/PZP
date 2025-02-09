@@ -253,7 +253,7 @@ int main(int argc, char *argv[])
 
     unsigned int configuration = 0;
     int performCompression     = 0;
-    if (strcmp(operation, "compress") == 0) { performCompression=1; configuration = USE_COMPRESSION || USE_RLE; } else
+    if (strcmp(operation, "compress") == 0) { performCompression=1; configuration = USE_COMPRESSION | USE_RLE; } else
     if (strcmp(operation, "pack") == 0)     { performCompression=1; configuration = USE_COMPRESSION; }
 
     if (performCompression)
@@ -317,7 +317,6 @@ int main(int argc, char *argv[])
     if (strcmp(operation, "decompress") == 0)
     {
         fprintf(stderr, "Decompress %s \n", input_commandline_parameter);
-
 
         unsigned int width = 0, height = 0;
         unsigned int bitsperpixelExternal = 0, channelsExternal = 3;

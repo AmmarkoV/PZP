@@ -223,20 +223,22 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
-
 static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels) {
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r = reconstructed;
 
-    if (restoreRLEChannels) {
-        switch (channels) {
+    if (restoreRLEChannels)
+    {
+        switch (channels)
+        {
             case 1: {
                 // Handle RLE for 1 channel
                 r[0] = src[0];
                 unsigned int i = 1;
                 // Process 32 elements at a time
-                for (; i + 31 < total_size; i += 32) {
+                for (; i + 31 < total_size; i += 32)
+                {
                     __m256i prev = _mm256_loadu_si256((__m256i*)(r + i - 1));
                     __m256i current = _mm256_loadu_si256((__m256i*)(src + i));
                     // Shift previous elements right by 1 byte and add
@@ -260,7 +262,8 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 r[0] = src[0];
                 r[1] = src[1];
                 unsigned int i = 1;
-                for (; i + 15 < total_size; i += 16) {
+                for (; i + 15 < total_size; i += 16)
+                {
                     // Load previous and current values
                     __m256i prev = _mm256_loadu_si256((__m256i*)(r + 2 * (i - 1)));
                     __m256i current = _mm256_loadu_si256((__m256i*)(src + 2 * i));
@@ -274,7 +277,8 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                     _mm256_storeu_si256((__m256i*)(r + 2 * i), result);
                 }
                 // Remaining elements
-                for (; i < total_size; ++i) {
+                for (; i < total_size; ++i)
+                {
                     r[2 * i] = src[2 * i] + r[2 * (i - 1)];
                     r[2 * i + 1] = src[2 * i + 1] + r[2 * (i - 1) + 1];
                 }
@@ -285,7 +289,8 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 r[0] = src[0];
                 r[1] = src[1];
                 r[2] = src[2];
-                for (unsigned int i = 1; i < total_size; ++i) {
+                for (unsigned int i = 1; i < total_size; ++i)
+                {
                     r += 3;
                     src += 3;
                     r[0] = src[0] + r[-3];
@@ -296,32 +301,39 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
             }
             default: {
                 // Generic case (scalar fallback)
-                for (unsigned int ch = 0; ch < channels; ++ch) {
+                for (unsigned int ch = 0; ch < channels; ++ch)
+                {
                     r[ch] = src[ch];
                 }
-                for (unsigned int i = 1; i < total_size; ++i) {
-                    for (unsigned int ch = 0; ch < channels; ++ch) {
+                for (unsigned int i = 1; i < total_size; ++i)
+                {
+                    for (unsigned int ch = 0; ch < channels; ++ch)
+                    {
                         r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
                     }
                 }
                 break;
             }
         }
-    } else {
+    } else
+    {
         // Non-RLE path
-        switch (channels) {
+        switch (channels)
+        {
             case 1:
                 memcpy(r, src, total_size);
                 break;
             case 2: {
                 // Copy 32 bytes at a time (16 pixels)
                 unsigned int i = 0;
-                for (; i + 15 < total_size; i += 16) {
+                for (; i + 15 < total_size; i += 16)
+                {
                     __m256i data = _mm256_loadu_si256((__m256i*)(src + 2 * i));
                     _mm256_storeu_si256((__m256i*)(r + 2 * i), data);
                 }
                 // Remaining elements
-                for (; i < total_size; ++i) {
+                for (; i < total_size; ++i)
+                {
                     r[2 * i] = src[2 * i];
                     r[2 * i + 1] = src[2 * i + 1];
                 }
@@ -330,12 +342,14 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
             case 3: {
                 // Copy 24 bytes at a time (8 pixels)
                 unsigned int i = 0;
-                for (; i + 7 < total_size; i += 8) {
+                for (; i + 7 < total_size; i += 8)
+                {
                     __m256i data = _mm256_loadu_si256((__m256i*)(src + 3 * i));
                     _mm256_storeu_si256((__m256i*)(r + 3 * i), data);
                 }
                 // Remaining elements
-                for (; i < total_size; ++i) {
+                for (; i < total_size; ++i)
+                {
                     r[3 * i] = src[3 * i];
                     r[3 * i + 1] = src[3 * i + 1];
                     r[3 * i + 2] = src[3 * i + 2];
@@ -344,8 +358,10 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
             }
             default: {
                 // Generic case (scalar fallback)
-                for (unsigned int i = 0; i < total_size; ++i) {
-                    for (unsigned int ch = 0; ch < channels; ++ch) {
+                for (unsigned int i = 0; i < total_size; ++i)
+                {
+                    for (unsigned int ch = 0; ch < channels; ++ch)
+                    {
                         r[i * channels + ch] = src[i * channels + ch];
                     }
                 }
@@ -450,15 +466,11 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
    // Force Naive implementation since AVX2 does not produce accurate results (yet)
-   //pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-   //return;
+   pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+   return;
 
    #if INTEL_OPTIMIZATIONS
-     if (channels==2)
-     {
-        pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-     } else
-     { pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels); }
+     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #endif // INTEL_OPTIMIZATIONS

@@ -223,105 +223,138 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
-static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
-{
+
+static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels) {
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r = reconstructed;
 
-    if (restoreRLEChannels)
-    {
-        switch (channels)
-        {
-            case 1:
+    if (restoreRLEChannels) {
+        switch (channels) {
+            case 1: {
+                // Handle RLE for 1 channel
                 r[0] = src[0];
-                for (unsigned int i = 1; i < total_size; i += 32)
-                {
-                    __m256i prev = _mm256_set1_epi8(r[i - 1]);
-                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i]);
-                    __m256i result = _mm256_add_epi8(data, prev);
-                    _mm256_storeu_si256((__m256i*)&r[i], result);
+                unsigned int i = 1;
+                // Process 32 elements at a time
+                for (; i + 31 < total_size; i += 32) {
+                    __m256i prev = _mm256_loadu_si256((__m256i*)(r + i - 1));
+                    __m256i current = _mm256_loadu_si256((__m256i*)(src + i));
+                    // Shift previous elements right by 1 byte and add
+                    __m256i shifted_prev = _mm256_srli_si256(prev, 1);
+                    __m256i result = _mm256_add_epi8(current, shifted_prev);
+                    // Propagate carry through the vector
+                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 1));
+                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 2));
+                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 4));
+                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 8));
+                    _mm256_storeu_si256((__m256i*)(r + i), result);
+                }
+                // Remaining elements
+                for (; i < total_size; ++i) {
+                    r[i] = src[i] + r[i - 1];
                 }
                 break;
-
-            case 2:
+            }
+            case 2: {
+                // Handle RLE for 2 channels
                 r[0] = src[0];
                 r[1] = src[1];
-                for (unsigned int i = 1; i < total_size; i += 16)
-                {
-                    __m256i prev = _mm256_loadu_si256((__m256i*)&r[(i - 1) * 2]);
-                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 2]);
-                    __m256i result = _mm256_add_epi8(data, prev);
-                    _mm256_storeu_si256((__m256i*)&r[i * 2], result);
+                unsigned int i = 1;
+                for (; i + 15 < total_size; i += 16) {
+                    // Load previous and current values
+                    __m256i prev = _mm256_loadu_si256((__m256i*)(r + 2 * (i - 1)));
+                    __m256i current = _mm256_loadu_si256((__m256i*)(src + 2 * i));
+                    // Separate channels
+                    __m256i prev_ch0 = _mm256_slli_si256(prev, 1);
+                    __m256i prev_ch1 = _mm256_srli_si256(prev, 1);
+                    __m256i res_ch0 = _mm256_add_epi8(_mm256_srli_si256(current, 1), prev_ch0);
+                    __m256i res_ch1 = _mm256_add_epi8(_mm256_slli_si256(current, 1), prev_ch1);
+                    // Combine results
+                    __m256i result = _mm256_blendv_epi8(res_ch0, res_ch1, _mm256_set1_epi16(0x00FF));
+                    _mm256_storeu_si256((__m256i*)(r + 2 * i), result);
+                }
+                // Remaining elements
+                for (; i < total_size; ++i) {
+                    r[2 * i] = src[2 * i] + r[2 * (i - 1)];
+                    r[2 * i + 1] = src[2 * i + 1] + r[2 * (i - 1) + 1];
                 }
                 break;
-
-            case 3:
+            }
+            case 3: {
+                // Handle RLE for 3 channels (scalar fallback)
                 r[0] = src[0];
                 r[1] = src[1];
                 r[2] = src[2];
-                for (unsigned int i = 1; i < total_size; i += 10)
-                {
-                    __m256i prev = _mm256_loadu_si256((__m256i*)&r[(i - 1) * 3]);
-                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 3]);
-                    __m256i result = _mm256_add_epi8(data, prev);
-                    _mm256_storeu_si256((__m256i*)&r[i * 3], result);
+                for (unsigned int i = 1; i < total_size; ++i) {
+                    r += 3;
+                    src += 3;
+                    r[0] = src[0] + r[-3];
+                    r[1] = src[1] + r[-2];
+                    r[2] = src[2] + r[-1];
                 }
                 break;
-
-            default:
-                for (unsigned int ch = 0; ch < channels; ch++)
-                {
+            }
+            default: {
+                // Generic case (scalar fallback)
+                for (unsigned int ch = 0; ch < channels; ++ch) {
                     r[ch] = src[ch];
                 }
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
+                for (unsigned int i = 1; i < total_size; ++i) {
+                    for (unsigned int ch = 0; ch < channels; ++ch) {
                         r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
                     }
                 }
                 break;
+            }
         }
-    }
-    else // Non-RLE path
-    {
-        switch (channels)
-        {
+    } else {
+        // Non-RLE path
+        switch (channels) {
             case 1:
-                memcpy(reconstructed, src, total_size);
+                memcpy(r, src, total_size);
                 break;
-
-            case 2:
-                for (unsigned int i = 0; i < total_size; i += 16)
-                {
-                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 2]);
-                    _mm256_storeu_si256((__m256i*)&r[i * 2], data);
+            case 2: {
+                // Copy 32 bytes at a time (16 pixels)
+                unsigned int i = 0;
+                for (; i + 15 < total_size; i += 16) {
+                    __m256i data = _mm256_loadu_si256((__m256i*)(src + 2 * i));
+                    _mm256_storeu_si256((__m256i*)(r + 2 * i), data);
+                }
+                // Remaining elements
+                for (; i < total_size; ++i) {
+                    r[2 * i] = src[2 * i];
+                    r[2 * i + 1] = src[2 * i + 1];
                 }
                 break;
-
-            case 3:
-                for (unsigned int i = 0; i < total_size; i += 10)
-                {
-                    __m256i data = _mm256_loadu_si256((__m256i*)&src[i * 3]);
-                    _mm256_storeu_si256((__m256i*)&r[i * 3], data);
+            }
+            case 3: {
+                // Copy 24 bytes at a time (8 pixels)
+                unsigned int i = 0;
+                for (; i + 7 < total_size; i += 8) {
+                    __m256i data = _mm256_loadu_si256((__m256i*)(src + 3 * i));
+                    _mm256_storeu_si256((__m256i*)(r + 3 * i), data);
+                }
+                // Remaining elements
+                for (; i < total_size; ++i) {
+                    r[3 * i] = src[3 * i];
+                    r[3 * i + 1] = src[3 * i + 1];
+                    r[3 * i + 2] = src[3 * i + 2];
                 }
                 break;
-
-            default:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
+            }
+            default: {
+                // Generic case (scalar fallback)
+                for (unsigned int i = 0; i < total_size; ++i) {
+                    for (unsigned int ch = 0; ch < channels; ++ch) {
                         r[i * channels + ch] = src[i * channels + ch];
                     }
                 }
                 break;
+            }
         }
     }
 }
-#endif // INTEL_OPTIMIZATIONS
-
+#else
 static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
@@ -413,12 +446,13 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
         }
     }
 }
+#endif // INTEL_OPTIMIZATIONS
 //-----------------------------------------------------------------------------------------------
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
    // Force Naive implementation since AVX2 does not produce accurate results (yet)
-   pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-   return;
+   //pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+   //return;
 
    #if INTEL_OPTIMIZATIONS
      pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);

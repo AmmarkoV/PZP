@@ -123,115 +123,6 @@ static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, 
 }
 //-----------------------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------------------
-static void pzp_reconstruct(unsigned char *reconstructed, unsigned char **buffers, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
-{
-    unsigned int total_size = width * height;
-    unsigned int idx;
-    unsigned char *r = reconstructed, *b0 = 0, *b1 = 0, *b2 = 0;
-
-    if (restoreRLEChannels)
-    {
-        switch (channels)
-        {
-            case 1:
-                reconstructed[0] = buffers[0][0];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    reconstructed[i] = buffers[0][i] + reconstructed[i - 1];
-                }
-                break;
-            case 2:
-                b0 = buffers[0];
-                b1 = buffers[1];
-                r[0] = b0[0];
-                r[1] = b1[0];
-
-                reconstructed[0] = buffers[0][0];
-                reconstructed[1] = buffers[1][0];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                 r += 2;  // Move to the next set of three channels
-                 b0++;
-                 b1++;
-
-                 r[0] = *b0 + r[-2];
-                 r[1] = *b1 + r[-1];
-                }
-                break;
-            case 3:
-                b0 = buffers[0];
-                b1 = buffers[1];
-                b2 = buffers[2];
-                r[0] = b0[0];
-                r[1] = b1[0];
-                r[2] = b2[0];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                 r += 3;  // Move to the next set of three channels
-                 b0++;
-                 b1++;
-                 b2++;
-
-                 r[0] = *b0 + r[-3];
-                 r[1] = *b1 + r[-2];
-                 r[2] = *b2 + r[-1];
-                }
-                break;
-            default:
-                for (unsigned int ch = 0; ch < channels; ch++)
-                {
-                    reconstructed[ch] = buffers[ch][0];
-                }
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        reconstructed[i * channels + ch] = buffers[ch][i] + reconstructed[(i - 1) * channels + ch];
-                    }
-                }
-                break;
-        }
-    }
-    else
-    { //Non RLE path
-        switch (channels)
-        {
-            case 1:
-                memcpy(reconstructed, buffers[0], total_size);
-                break;
-            case 2:
-                idx = 2;
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    reconstructed[idx]     = buffers[0][i];
-                    reconstructed[idx + 1] = buffers[1][i];
-                    idx+=2;
-                }
-                break;
-            case 3:
-                idx = 3;
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    reconstructed[idx]     = buffers[0][i];
-                    reconstructed[idx + 1] = buffers[1][i];
-                    reconstructed[idx + 2] = buffers[2][i];
-                    idx+=3;
-                }
-                break;
-            default:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        reconstructed[i * channels + ch] = buffers[ch][i];
-                    }
-                }
-                break;
-        }
-    }
-}
-
-
 static void pzp_compress_combined(unsigned char **buffers,
                               unsigned int width,unsigned int height,
                               unsigned int bitsperpixelExternal, unsigned int channelsExternal,
@@ -328,128 +219,101 @@ static void pzp_compress_combined(unsigned char **buffers,
     free(combined_buffer_raw);
     fclose(output);
 }
-
-static void pzp_extractCompressedBufferToFinalImage_NChannels(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
+//-----------------------------------------------------------------------------------------------
+//-----------------------------------------------------------------------------------------------
+static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
-    for (int i = 0; i < width * height; i++)
+    unsigned int total_size = width * height;
+    unsigned char *src = decompressed_bytes;
+    unsigned char *r = reconstructed;
+
+    if (restoreRLEChannels)
     {
-        for (unsigned int ch = 0; ch < channels; ch++)
+        switch (channels)
         {
-            (*buffers)[ch][i] = decompressed_bytes[i * channels + ch];
+            case 1:
+                r[0] = src[0];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    r[i] = src[i] + r[i - 1];
+                }
+                break;
+            case 2:
+                r[0] = src[0];
+                r[1] = src[1];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    r += 2;
+                    src += 2;
+                    r[0] = src[0] + r[-2];
+                    r[1] = src[1] + r[-1];
+                }
+                break;
+            case 3:
+                r[0] = src[0];
+                r[1] = src[1];
+                r[2] = src[2];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    r += 3;
+                    src += 3;
+                    r[0] = src[0] + r[-3];
+                    r[1] = src[1] + r[-2];
+                    r[2] = src[2] + r[-1];
+                }
+                break;
+            default:
+                for (unsigned int ch = 0; ch < channels; ch++)
+                {
+                    r[ch] = src[ch];
+                }
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+    else // Non-RLE path
+    {
+        switch (channels)
+        {
+            case 1:
+                memcpy(reconstructed, src, total_size);
+                break;
+            case 2:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    reconstructed[2 * i] = src[2 * i];
+                    reconstructed[2 * i + 1] = src[2 * i + 1];
+                }
+                break;
+            case 3:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    reconstructed[3 * i] = src[3 * i];
+                    reconstructed[3 * i + 1] = src[3 * i + 1];
+                    reconstructed[3 * i + 2] = src[3 * i + 2];
+                }
+                break;
+            default:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        reconstructed[i * channels + ch] = src[i * channels + ch];
+                    }
+                }
+                break;
         }
     }
 }
-
-static void pzp_extractCompressedBufferToFinalImage3Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
-{
-    unsigned int pixel_count = width * height;
-
-    unsigned char *buf0 = (*buffers)[0];
-    unsigned char *buf1 = (*buffers)[1];
-    unsigned char *buf2 = (*buffers)[2];
-    unsigned char *src = decompressed_bytes;
-
-    for (unsigned int i = 0; i < pixel_count; i++)
-    {
-        *buf0++ = *src++;
-        *buf1++ = *src++;
-        *buf2++ = *src++;
-    }
-}
-
-static void pzp_extractCompressedBufferToFinalImage2Channels(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
-{
-    unsigned int pixel_count = width * height;
-
-    unsigned char *buf0 = (*buffers)[0];
-    unsigned char *buf1 = (*buffers)[1];
-    unsigned char *src = decompressed_bytes;
-
-    for (unsigned int i = 0; i < pixel_count; i++)
-    {
-        *buf0++ = *src++;
-        *buf1++ = *src++;
-    }
-}
-
-static void pzp_extractCompressedBufferToFinalImage1Channel(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
-{
-   memcpy((*buffers)[0], decompressed_bytes, width * height);
-}
-
-
-#if INTEL_OPTIMIZATIONS
-static void pzp_extractCompressedBufferToFinalImage3Channels_AVX2(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
-{
-    unsigned int pixel_count = width * height;
-    unsigned int i = 0;
-
-    unsigned char *buf0 = (*buffers)[0];
-    unsigned char *buf1 = (*buffers)[1];
-    unsigned char *buf2 = (*buffers)[2];
-    unsigned char *src = decompressed_bytes;
-
-    // Process 32 pixels at a time using AVX2
-    unsigned int simd_pixels = pixel_count / 32 * 32;
-
-    for (; i < simd_pixels; i += 32)
-    {
-        // Load 96 bytes (32 pixels, 3 bytes per pixel)
-        __m256i chunk0 = _mm256_loadu_si256((__m256i *)(src));
-        __m256i chunk1 = _mm256_loadu_si256((__m256i *)(src + 32));
-        __m256i chunk2 = _mm256_loadu_si256((__m256i *)(src + 64));
-
-        // Interleave to separate RGB channels
-        __m256i shuffleMask = _mm256_set_epi8(
-            29, 26, 23, 20, 17, 14, 11, 8, 5, 2, 31, 28, 25, 22, 19, 16,
-            13, 10, 7, 4, 1, 30, 27, 24, 21, 18, 15, 12, 9, 6, 3, 0
-        );
-
-        chunk0 = _mm256_shuffle_epi8(chunk0, shuffleMask);
-        chunk1 = _mm256_shuffle_epi8(chunk1, shuffleMask);
-        chunk2 = _mm256_shuffle_epi8(chunk2, shuffleMask);
-
-        // Store results
-        _mm256_storeu_si256((__m256i *)(buf0 + i), chunk0);
-        _mm256_storeu_si256((__m256i *)(buf1 + i), chunk1);
-        _mm256_storeu_si256((__m256i *)(buf2 + i), chunk2);
-
-        src += 96; // Move to the next 96-byte chunk
-    }
-
-    // Process remaining pixels (scalar mode)
-    for (; i < pixel_count; i++)
-    {
-        buf0[i] = *src++;
-        buf1[i] = *src++;
-        buf2[i] = *src++;
-    }
-}
-#endif // INTEL_OPTIMIZATIONS
-
-
-static void pzp_extractCompressedBufferToFinalImage(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
-{
-    switch(channels)
-    {
-        case 1: pzp_extractCompressedBufferToFinalImage1Channel(decompressed_bytes,buffers,width,height);  break;
-        case 2: pzp_extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);  break;
-        case 3:
-            #if INTEL_OPTIMIZATIONS
-             pzp_extractCompressedBufferToFinalImage3Channels_AVX2(decompressed_bytes, buffers, width, height);
-            #else
-             pzp_extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);
-            #endif // INTEL_OPTIMIZATIONS
-        break;
-        default:
-         pzp_extractCompressedBufferToFinalImage_NChannels(decompressed_bytes,buffers,width,height,channels);
-        break;
-    };
-}
-
-
-
-static unsigned char* pzp_decompress_combined(const char *input_filename, unsigned char ***buffers,
+//-----------------------------------------------------------------------------------------------
+//-----------------------------------------------------------------------------------------------
+static unsigned char* pzp_decompress_combined(const char *input_filename,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
                                 unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput,
@@ -586,41 +450,14 @@ static unsigned char* pzp_decompress_combined(const char *input_filename, unsign
     *channelsInternalOutput     = channelsIn;
     *configuration              = compressionCfg;
 
-    // Allocate memory for all channels
-    *buffers = (unsigned char **)malloc(channelsIn * sizeof(unsigned char *));
-    if (!*buffers)
-    {
-        free(decompressed_buffer);
-        fail("Memory allocation failed");
-    }
-
-    //Allocate all intermediate buffers
-    for (unsigned int ch = 0; ch < channelsIn; ch++)
-    {
-        (*buffers)[ch] = (unsigned char *)malloc(dataSize);
-        if (!(*buffers)[ch])
-        {
-            //If we failed deallocate everything
-            for (unsigned int i = 0; i < ch; i++)
-            {
-                free((*buffers)[i]);  // Free previously allocated channels
-            }
-            free(*buffers);
-            free(decompressed_buffer);
-            fail("Memory allocation failed");
-        }
-    }
-
-    // Copy decompressed data into the channel buffers
-    /*TODO: Unify these calls */
+    // Copy decompressed data into the reconstructed buffers
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
-    pzp_extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn);
 
     unsigned char *reconstructed = malloc( width * height * (bitsperpixelIn/8)* channelsIn );
     if (reconstructed!=NULL)
          {
-          unsigned int restoreRLEChannels = compressionCfg && USE_RLE;
-          pzp_reconstruct(reconstructed, *buffers, width, height, channelsIn, restoreRLEChannels);
+           unsigned int restoreRLEChannels = compressionCfg && USE_RLE;
+           pzp_extractAndReconstruct(decompressed_bytes, reconstructed, width, height, channelsIn, restoreRLEChannels);
          }
 
     free(decompressed_buffer);

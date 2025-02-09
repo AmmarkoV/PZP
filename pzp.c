@@ -313,37 +313,23 @@ int main(int argc, char *argv[])
     {
         fprintf(stderr, "Decompress %s \n", input_commandline_parameter);
 
-        unsigned char **buffers = NULL;
+
         unsigned int width = 0, height = 0;
         unsigned int bitsperpixelExternal = 0, channelsExternal = 3;
         unsigned int bitsperpixelInternal = 24, channelsInternal = 3;
         unsigned int configuration = 0;
 
-        unsigned char *reconstructed = pzp_decompress_combined(input_commandline_parameter, &buffers, &width, &height,
+        unsigned char *reconstructed = pzp_decompress_combined(input_commandline_parameter, &width, &height,
                                                                &bitsperpixelExternal, &channelsExternal,
                                                                &bitsperpixelInternal, &channelsInternal, &configuration);
 
-        if (buffers!=NULL)
-        {
-         //unsigned int restoreRLEChannels = configuration && USE_RLE;
-         //unsigned char *reconstructed = malloc( width * height * (bitsperpixelInternal/8)* channelsInternal );
          if (reconstructed!=NULL)
          {
-          //pzp_reconstruct(reconstructed, buffers, width, height, channelsInternal, restoreRLEChannels);
-
           bitsperpixelExternal *= channelsExternal; //This is needed because of what writePNM expects..
           WritePNM(output_commandline_parameter, reconstructed, width, height, bitsperpixelExternal, channelsExternal);
           free(reconstructed);
          }
 
-         //Deallocate intermediate buffers..
-         for (unsigned int ch = 0; ch < channelsInternal; ch++)
-         {
-            free(buffers[ch]);
-         }
-         free(buffers);
-
-        }
     }
     else
     {

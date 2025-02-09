@@ -34,6 +34,7 @@ extern "C"
 
 #if INTEL_OPTIMIZATIONS
 #include <immintrin.h>  // AVX intrinsics
+#include <emmintrin.h>  // SSE2
 #include <stdint.h>
 #warning "Intel Optimizations Enabled"
 #endif // INTEL_OPTIMIZATIONS
@@ -105,7 +106,6 @@ static void pzp_split_channels(const unsigned char *image, unsigned char **buffe
             buffers[ch][i] = image[i * num_buffers + ch];
         }
     }
-
 }
 
 static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
@@ -223,6 +223,155 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
+static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+{
+    unsigned int total_size = width * height;
+    unsigned char *src = decompressed_bytes;
+    unsigned char *r = reconstructed;
+    unsigned int i;
+
+    if (restoreRLEChannels)
+    {
+        switch (channels)
+        {
+            case 1:
+                // First pixel
+                r[0] = src[0];
+
+                i = 1;
+                for (; i + 15 < total_size; i += 16)
+                {
+                    // Load previous 16 bytes
+                    __m128i prev = _mm_loadu_si128((__m128i*)&r[i - 1]);
+                    __m128i curr = _mm_loadu_si128((__m128i*)&src[i]);
+
+                    // Add RLE deltas
+                    __m128i res = _mm_add_epi8(curr, prev);
+
+                    // Store result
+                    _mm_storeu_si128((__m128i*)&r[i], res);
+                }
+
+                // Process remaining pixels
+                for (; i < total_size; i++)
+                {
+                    r[i] = src[i] + r[i - 1];
+                }
+                break;
+
+            case 2:
+                // First pixel
+                r[0] = src[0];
+                r[1] = src[1];
+
+                i = 1;
+                for (; i + 7 < total_size; i += 8)
+                {
+                    // Load previous 16 bytes (2 bytes per pixel)
+                    __m128i prev = _mm_loadu_si128((__m128i*)&r[2 * (i - 1)]);
+                    __m128i curr = _mm_loadu_si128((__m128i*)&src[2 * i]);
+
+                    // Unpack to 16-bit (since we are dealing with two-byte channels)
+                    __m128i prev_lo = _mm_unpacklo_epi8(prev, _mm_setzero_si128());
+                    __m128i prev_hi = _mm_unpackhi_epi8(prev, _mm_setzero_si128());
+                    __m128i curr_lo = _mm_unpacklo_epi8(curr, _mm_setzero_si128());
+                    __m128i curr_hi = _mm_unpackhi_epi8(curr, _mm_setzero_si128());
+
+                    // Perform RLE reconstruction
+                    __m128i res_lo = _mm_add_epi16(curr_lo, prev_lo);
+                    __m128i res_hi = _mm_add_epi16(curr_hi, prev_hi);
+
+                    // Pack back to 8-bit
+                    __m128i result = _mm_packus_epi16(res_lo, res_hi);
+
+                    // Store result
+                    _mm_storeu_si128((__m128i*)&r[2 * i], result);
+                }
+
+                // Process remaining pixels
+                for (; i < total_size; i++)
+                {
+                    r[2 * i] = src[2 * i] + r[2 * (i - 1)];
+                    r[2 * i + 1] = src[2 * i + 1] + r[2 * (i - 1) + 1];
+                }
+                break;
+
+            case 3:
+                // First pixel
+                r[0] = src[0];
+                r[1] = src[1];
+                r[2] = src[2];
+
+                i = 1;
+                for (; i < total_size; i++)
+                {
+                    r[3 * i] = src[3 * i] + r[3 * (i - 1)];
+                    r[3 * i + 1] = src[3 * i + 1] + r[3 * (i - 1) + 1];
+                    r[3 * i + 2] = src[3 * i + 2] + r[3 * (i - 1) + 2];
+                }
+                break;
+
+            default:
+                for (unsigned int ch = 0; ch < channels; ch++)
+                {
+                    r[ch] = src[ch];
+                }
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+    else // Non-RLE path
+    {
+        switch (channels)
+        {
+            case 1:
+                memcpy(reconstructed, src, total_size);
+                break;
+
+            case 2:
+                i = 0;
+                for (; i + 7 < total_size; i += 8)
+                {
+                    __m128i data = _mm_loadu_si128((__m128i*)&src[2 * i]);
+                    _mm_storeu_si128((__m128i*)&r[2 * i], data);
+                }
+                for (; i < total_size; i++)
+                {
+                    r[2 * i] = src[2 * i];
+                    r[2 * i + 1] = src[2 * i + 1];
+                }
+                break;
+
+            case 3:
+                i = 0;
+                for (; i < total_size; i++)
+                {
+                    r[3 * i] = src[3 * i];
+                    r[3 * i + 1] = src[3 * i + 1];
+                    r[3 * i + 2] = src[3 * i + 2];
+                }
+                break;
+
+            default:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        reconstructed[i * channels + ch] = src[i * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+}
+
+
 static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels) {
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
@@ -393,7 +542,7 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
                 r[1] = src[1];
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    r += 2;
+                    r   += 2;
                     src += 2;
                     r[0] = src[0] + r[-2];
                     r[1] = src[1] + r[-1];
@@ -405,7 +554,7 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
                 r[2] = src[2];
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    r += 3;
+                    r   += 3;
                     src += 3;
                     r[0] = src[0] + r[-3];
                     r[1] = src[1] + r[-2];
@@ -471,10 +620,11 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
    // Force Naive implementation since AVX2 does not produce accurate results (yet)
-   pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-   return;
+   //pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+   //return;
 
    #if INTEL_OPTIMIZATIONS
+     pzp_extractAndReconstruct_SSE2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
      pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);

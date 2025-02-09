@@ -221,98 +221,7 @@ static void pzp_compress_combined(unsigned char **buffers,
 }
 //-----------------------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------------------
-static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
-{
-    unsigned int total_size = width * height;
-    unsigned char *src = decompressed_bytes;
-    unsigned char *r = reconstructed;
-
-    if (restoreRLEChannels)
-    {
-        switch (channels)
-        {
-            case 1:
-                r[0] = src[0];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    r[i] = src[i] + r[i - 1];
-                }
-                break;
-            case 2:
-                r[0] = src[0];
-                r[1] = src[1];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    r += 2;
-                    src += 2;
-                    r[0] = src[0] + r[-2];
-                    r[1] = src[1] + r[-1];
-                }
-                break;
-            case 3:
-                r[0] = src[0];
-                r[1] = src[1];
-                r[2] = src[2];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    r += 3;
-                    src += 3;
-                    r[0] = src[0] + r[-3];
-                    r[1] = src[1] + r[-2];
-                    r[2] = src[2] + r[-1];
-                }
-                break;
-            default:
-                for (unsigned int ch = 0; ch < channels; ch++)
-                {
-                    r[ch] = src[ch];
-                }
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
-                    }
-                }
-                break;
-        }
-    }
-    else // Non-RLE path
-    {
-        switch (channels)
-        {
-            //This path can be optimized to reduce multiplications ( with i )
-            case 1:
-                memcpy(reconstructed, src, total_size);
-                break;
-            case 2:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    reconstructed[2 * i] = src[2 * i];
-                    reconstructed[2 * i + 1] = src[2 * i + 1];
-                }
-                break;
-            case 3:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    reconstructed[3 * i] = src[3 * i];
-                    reconstructed[3 * i + 1] = src[3 * i + 1];
-                    reconstructed[3 * i + 2] = src[3 * i + 2];
-                }
-                break;
-            default:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        reconstructed[i * channels + ch] = src[i * channels + ch];
-                    }
-                }
-                break;
-        }
-    }
-}
-//-----------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATION
 static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
@@ -405,6 +314,98 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                     for (unsigned int ch = 0; ch < channels; ch++)
                     {
                         r[i * channels + ch] = src[i * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+}
+#else
+static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+{
+    unsigned int total_size = width * height;
+    unsigned char *src = decompressed_bytes;
+    unsigned char *r = reconstructed;
+
+    if (restoreRLEChannels)
+    {
+        switch (channels)
+        {
+            case 1:
+                r[0] = src[0];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    r[i] = src[i] + r[i - 1];
+                }
+                break;
+            case 2:
+                r[0] = src[0];
+                r[1] = src[1];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    r += 2;
+                    src += 2;
+                    r[0] = src[0] + r[-2];
+                    r[1] = src[1] + r[-1];
+                }
+                break;
+            case 3:
+                r[0] = src[0];
+                r[1] = src[1];
+                r[2] = src[2];
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    r += 3;
+                    src += 3;
+                    r[0] = src[0] + r[-3];
+                    r[1] = src[1] + r[-2];
+                    r[2] = src[2] + r[-1];
+                }
+                break;
+            default:
+                for (unsigned int ch = 0; ch < channels; ch++)
+                {
+                    r[ch] = src[ch];
+                }
+                for (unsigned int i = 1; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
+                    }
+                }
+                break;
+        }
+    }
+    else // Non-RLE path
+    {
+        switch (channels)
+        {
+            //This path can be optimized to reduce multiplications ( with i )
+            case 1:
+                memcpy(reconstructed, src, total_size);
+                break;
+            case 2:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    reconstructed[2 * i] = src[2 * i];
+                    reconstructed[2 * i + 1] = src[2 * i + 1];
+                }
+                break;
+            case 3:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    reconstructed[3 * i] = src[3 * i];
+                    reconstructed[3 * i + 1] = src[3 * i + 1];
+                    reconstructed[3 * i + 2] = src[3 * i + 2];
+                }
+                break;
+            default:
+                for (unsigned int i = 0; i < total_size; i++)
+                {
+                    for (unsigned int ch = 0; ch < channels; ch++)
+                    {
+                        reconstructed[i * channels + ch] = src[i * channels + ch];
                     }
                 }
                 break;

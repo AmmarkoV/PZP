@@ -32,6 +32,12 @@ extern "C"
 #include <zstd.h>
 //sudo apt install libzstd-dev
 
+#if INTEL_OPTIMIZATIONS
+#include <immintrin.h>  // AVX intrinsics
+#include <stdint.h>
+#warning "Intel Optimizations Enabled"
+#endif // INTEL_OPTIMIZATIONS
+
 #define PZP_VERBOSE 0
 
 static const char pzp_version[]="v0.0";
@@ -323,7 +329,7 @@ static void pzp_compress_combined(unsigned char **buffers,
     fclose(output);
 }
 
-static void pzp_extractCompressedBufferToFinalImage(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
+static void pzp_extractCompressedBufferToFinalImage_NChannels(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
 {
     for (int i = 0; i < width * height; i++)
     {
@@ -370,6 +376,63 @@ static void pzp_extractCompressedBufferToFinalImage1Channel(unsigned char *decom
 {
    memcpy((*buffers)[0], decompressed_bytes, width * height);
 }
+
+
+#if INTEL_OPTIMIZATIONS
+static void pzp_extractCompressedBufferToFinalImage3Channels_AVX2(unsigned char *decompressed_bytes, unsigned char ***buffers, unsigned int width, unsigned int height)
+{
+    unsigned int pixel_count = width * height;
+    unsigned int i = 0;
+
+    unsigned char *buf0 = (*buffers)[0];
+    unsigned char *buf1 = (*buffers)[1];
+    unsigned char *buf2 = (*buffers)[2];
+    unsigned char *src = decompressed_bytes;
+
+__m256i shuffleMask = _mm256_set_epi8(
+    2, 5, 8, 11, 14, 17, 20, 23,
+    1, 4, 7, 10, 13, 16, 19, 22,
+    0, 3, 6, 9, 12, 15, 18, 21,
+    24, 27, 30, -1, 25, 28, 31, -1
+);
+
+
+    for (; i + 32 <= pixel_count * 3; i += 32)
+    {
+        __m256i data = _mm256_loadu_si256((__m256i *)(src + i));
+
+        __m256i shuffled = _mm256_shuffle_epi8(data, shuffleMask);
+
+        _mm256_storeu_si256((__m256i *)(buf0 + i / 3), shuffled);
+        _mm256_storeu_si256((__m256i *)(buf1 + i / 3), _mm256_srli_si256(shuffled, 1));
+        _mm256_storeu_si256((__m256i *)(buf2 + i / 3), _mm256_srli_si256(shuffled, 2));
+    }
+
+    // Process remaining pixels
+    for (; i / 3 < pixel_count; i += 3)
+    {
+        *buf0++ = *src++;
+        *buf1++ = *src++;
+        *buf2++ = *src++;
+    }
+}
+#endif // INTEL_OPTIMIZATIONS
+
+
+static void pzp_extractCompressedBufferToFinalImage(unsigned char *decompressed_bytes,unsigned char ***buffers,unsigned int width,unsigned int height,unsigned int channels)
+{
+    switch(channels)
+    {
+        case 1: pzp_extractCompressedBufferToFinalImage1Channel(decompressed_bytes,buffers,width,height);  break;
+        case 2: pzp_extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);  break;
+        case 3: pzp_extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);  break;
+        default:
+         pzp_extractCompressedBufferToFinalImage_NChannels(decompressed_bytes,buffers,width,height,channels);
+        break;
+    };
+}
+
+
 
 static void pzp_decompress_combined(const char *input_filename, unsigned char ***buffers,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
@@ -535,10 +598,7 @@ static void pzp_decompress_combined(const char *input_filename, unsigned char **
 
     // Copy decompressed data into the channel buffers
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
-    if (channelsIn==1) { pzp_extractCompressedBufferToFinalImage1Channel(decompressed_bytes,buffers,width,height);    } else
-    if (channelsIn==2) { pzp_extractCompressedBufferToFinalImage2Channels(decompressed_bytes,buffers,width,height);   } else
-    if (channelsIn==3) { pzp_extractCompressedBufferToFinalImage3Channels(decompressed_bytes,buffers,width,height);   } else
-                       { pzp_extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn); }
+    pzp_extractCompressedBufferToFinalImage(decompressed_bytes,buffers,width,height,channelsIn);
 
     free(decompressed_buffer);
 }

@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -lzstd -lm
-SIMD_FLAGS = -DINTEL_OPTIMIZATIONS -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
+SIMD_FLAGS = -DINTEL_OPTIMIZATIONS -D_GNU_SOURCE  -O3 -mavx2 -march=native -mtune=native  -fPIE -fPIC
 RELEASE_FLAGS= -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
 DEBUG_FLAGS = -D_GNU_SOURCE -O0 -g3 -fno-omit-frame-pointer -Wstrict-overflow -fPIE -fPIC
 
@@ -21,7 +21,7 @@ $(DPZP): $(SRC)
 	$(CC) $(SRC) $(DEBUG_FLAGS) $(CFLAGS) -o $(DPZP)
 
 $(SPZP): $(SRC)
-	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(PZP)
+	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(SPZP)
 
 clean:
 	rm -rf $(PZP) $(DPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt

@@ -375,7 +375,7 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
 {
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
-    unsigned char *r = reconstructed;
+    unsigned char *r   = reconstructed;
 
     if (restoreRLEChannels)
     {
@@ -438,16 +438,21 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
             case 2:
                 for (unsigned int i = 0; i < total_size; i++)
                 {
-                    reconstructed[2 * i] = src[2 * i];
-                    reconstructed[2 * i + 1] = src[2 * i + 1];
+                    *r = *src;
+                    r++; src++;
+                    *r = *src;
+                    r++; src++;
                 }
                 break;
             case 3:
                 for (unsigned int i = 0; i < total_size; i++)
                 {
-                    reconstructed[3 * i] = src[3 * i];
-                    reconstructed[3 * i + 1] = src[3 * i + 1];
-                    reconstructed[3 * i + 2] = src[3 * i + 2];
+                    *r = *src;
+                    r++; src++;
+                    *r = *src;
+                    r++; src++;
+                    *r = *src;
+                    r++; src++;
                 }
                 break;
             default:

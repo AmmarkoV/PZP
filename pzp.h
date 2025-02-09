@@ -354,7 +354,7 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
         }
     }
 }
-#else
+#endif // INTEL_OPTIMIZATIONS
 static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
@@ -446,7 +446,6 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
         }
     }
 }
-#endif // INTEL_OPTIMIZATIONS
 //-----------------------------------------------------------------------------------------------
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
@@ -455,7 +454,11 @@ static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigne
    //return;
 
    #if INTEL_OPTIMIZATIONS
-     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     if (channels==2)
+     {
+        pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     } else
+     { pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels); }
    #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #endif // INTEL_OPTIMIZATIONS

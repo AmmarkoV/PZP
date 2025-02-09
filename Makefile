@@ -39,6 +39,17 @@ test: all $(OUTDIR)
 	./$(PZP) compress samples/segment.ppm $(OUTDIR)/segment.pzp
 	./$(PZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm 
 
+
+ptest: all $(OUTDIR)
+	./$(PZP) pack samples/sample.ppm $(OUTDIR)/sample.pzp
+	./$(PZP) decompress $(OUTDIR)/sample.pzp $(OUTDIR)/sampleRecode.ppm
+	./$(PZP) pack samples/depth16.pnm $(OUTDIR)/depth16.pzp
+	./$(PZP) decompress $(OUTDIR)/depth16.pzp $(OUTDIR)/depth16Recode.ppm 
+	./$(PZP) pack samples/rgb8.pnm $(OUTDIR)/rgb8.pzp
+	./$(PZP) decompress $(OUTDIR)/rgb8.pzp $(OUTDIR)/rgb8Recode.ppm 
+	./$(PZP) pack samples/segment.ppm $(OUTDIR)/segment.pzp
+	./$(PZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm 
+
 stest: all $(OUTDIR)
 	./$(SPZP) compress samples/sample.ppm $(OUTDIR)/sample.pzp
 	./$(SPZP) decompress $(OUTDIR)/sample.pzp $(OUTDIR)/sampleRecode.ppm

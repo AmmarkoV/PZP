@@ -251,14 +251,18 @@ int main(int argc, char *argv[])
     const char * input_commandline_parameter  = argv[2];
     const char * output_commandline_parameter = argv[3];
 
-    if (strcmp(operation, "compress") == 0)
+    unsigned int configuration = 0;
+    int performCompression     = 0;
+    if (strcmp(operation, "compress") == 0) { performCompression=1; configuration = USE_COMPRESSION || USE_RLE; } else
+    if (strcmp(operation, "pack") == 0)     { performCompression=1; configuration = USE_COMPRESSION; }
+
+    if (performCompression)
     {
         fprintf(stderr, "Opening %s:", input_commandline_parameter);
 
         unsigned char *image = NULL;
         unsigned int width = 0, height = 0, bytesPerPixel = 0, channels = 0, bitsperpixelInternal = 0, channelsInternal=0;
         unsigned long timestamp = 0;
-        unsigned int configuration = USE_COMPRESSION || USE_RLE;
 
         image = ReadPNM(0, input_commandline_parameter, &width, &height, &timestamp, &bytesPerPixel, &channels);
         unsigned int bitsperpixel = bytesPerPixel * 8;
@@ -289,9 +293,9 @@ int main(int argc, char *argv[])
 
            pzp_split_channels(image, buffers, channelsInternal, width, height);
 
-           if (configuration && USE_RLE)
+           if (configuration & USE_RLE)
            {
-            fprintf(stderr,"Using RLE for compression\n");
+            fprintf(stderr,"Using RLE for compression (mode %u)\n",configuration);
             pzp_RLE_filter(buffers, channelsInternal, width, height);
            }
 
@@ -309,7 +313,8 @@ int main(int argc, char *argv[])
         }//If we have an image
         else{ return EXIT_FAILURE; }
     }
-    else if (strcmp(operation, "decompress") == 0)
+    else
+    if (strcmp(operation, "decompress") == 0)
     {
         fprintf(stderr, "Decompress %s \n", input_commandline_parameter);
 

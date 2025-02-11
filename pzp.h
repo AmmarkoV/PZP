@@ -740,8 +740,8 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
    // Force Naive implementation since AVX2 does not produce accurate results (yet)
-   //pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-   //return;
+   pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+   return;
 
    #if INTEL_OPTIMIZATIONS
      //pzp_extractAndReconstruct_SSE2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);

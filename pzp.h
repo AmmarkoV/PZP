@@ -223,9 +223,9 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
-//This is buggy :
 static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
+    fprintf(stderr,"pzp_extractAndReconstruct_SSE2 is incorrect..\n");
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r   = reconstructed;
@@ -370,8 +370,126 @@ static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, un
     }
 }
 
+
+static void pzp_memcpy_avx2(unsigned char *dst, unsigned char *src, unsigned int size)
+{
+    unsigned int i = 0;
+    __m256i v;
+
+    // Process 32 bytes at a time
+    for (; i + 31 < size; i += 32)
+    {
+        v = _mm256_loadu_si256((__m256i *)(src + i));
+        _mm256_storeu_si256((__m256i *)(dst + i), v);
+    }
+
+    // Process remaining bytes
+    for (; i < size; i++)
+    {
+        dst[i] = src[i];
+    }
+}
+
+/**
+ * @brief Computes the prefix sum of an array using AVX2 SIMD operations.
+ *
+ * This function processes an array of unsigned 8-bit integers (bytes) in chunks of 32 bytes at a time,
+ * using AVX2 intrinsics to perform vectorized addition. The prefix sum means that each element in the
+ * output is the sum of all previous elements including itself, i.e.,
+ *
+ *      dst[i] = src[i] + dst[i-1]
+ *
+ * The algorithm leverages SIMD parallelism for faster execution by processing 32 elements in a single iteration.
+ *
+ * @param src  Pointer to the source array of unsigned 8-bit integers.
+ * @param dst  Pointer to the destination array where the computed prefix sum will be stored.
+ * @param size Number of elements in the source array. Must be a multiple of 32 for best performance.
+ * @note
+ * - The function assumes `size` is a multiple of 32 for optimal performance. If not, a scalar fallback is needed.
+ * - This implementation is efficient for **short sequences** but not ideal for very long sequences,
+ *   as it does not fully exploit SIMD-friendly prefix sum techniques like **Hillis-Steele scan**.
+ * - If processing very large arrays, consider a **two-pass approach** to propagate values properly across blocks.
+ * - Works best when `src` and `dst` are **aligned** to 32-byte boundaries, though `_mm256_loadu_si256`
+ *   handles unaligned memory safely but slightly slower than aligned `_mm256_load_si256`.
+ */
+static void pzp_prefix_sum_avx2(unsigned char *src, unsigned char *dst, unsigned int size)
+{
+    // Initialize previous sum to zero
+    __m256i prev = _mm256_setzero_si256();  // Holds the last accumulated sum across iterations
+    __m256i v, sum;  // Temporary variables for SIMD operations
+
+    // Process the array in chunks of 32 bytes (AVX2 register width)
+    for (unsigned int i = 0; i < size; i += 32)
+    {
+        // Load 32 bytes from the source array into an AVX2 register
+        v = _mm256_loadu_si256((__m256i *)(src + i));
+
+        // Compute the prefix sum for this block by adding the previous sum
+        sum = _mm256_add_epi8(v, prev);
+
+        // Store the result back into the destination array
+        _mm256_storeu_si256((__m256i *)(dst + i), sum);
+
+        // Update `prev` to propagate the last element for the next block
+        // `_mm256_permute2x128_si256` extracts the high 128-bit half and moves it to low half
+        prev = _mm256_permute2x128_si256(sum, sum, 0x11);  // Shuffle the last 16 bytes
+    }
+}
+
+/**
+ * @brief Computes the prefix sum for a 2-channel interleaved array using AVX2 SIMD operations.
+ *
+ * This function processes an array where two interleaved unsigned 8-bit integer channels are present.
+ * It computes the prefix sum separately for each channel while preserving their interleaved layout.
+ * The prefix sum ensures that:
+ *
+ *      dst[2*i]   = src[2*i]   + dst[2*i - 2]
+ *      dst[2*i+1] = src[2*i+1] + dst[2*i - 1]
+ *
+ * The function uses AVX2 to process 16 elements (8 pairs of channels) per iteration, improving performance.
+ *
+ * @param src  Pointer to the source array of unsigned 8-bit integers (interleaved 2-channel format).
+ * @param dst  Pointer to the destination array where the computed prefix sum will be stored.
+ * @param size Number of interleaved channel pairs in the source array (not the byte size).
+ * @note
+ * - The function assumes `size` is a multiple of 16 for optimal performance. If not, a scalar fallback is needed.
+ * - This implementation works efficiently for small to medium-sized sequences but does not fully optimize
+ *   long sequences where more sophisticated prefix sum algorithms (such as Hillis-Steele scan) may be required.
+ * - Works best when `src` and `dst` are **aligned** to 32-byte boundaries, although `_mm256_loadu_si256`
+ *   allows for unaligned memory access at a slight performance cost.
+ */
+static void pzp_prefix_sum_avx2_2ch(unsigned char *src, unsigned char *dst, unsigned int size)
+{
+    // Initialize previous sum to zero
+    __m256i prev = _mm256_setzero_si256();  // Holds the last accumulated sum across iterations
+    __m256i v0, v1, sum0, sum1;  // Temporary variables for SIMD operations
+
+    // Process the array in chunks of 16 pairs (32 elements total, 16 per channel)
+    for (unsigned int i = 0; i < size; i += 16)
+    {
+        // Load 16 pairs (32 bytes total) from the source array into AVX2 registers
+        v0 = _mm256_loadu_si256((__m256i *)(src + 2 * i));       // Load channel 0 data
+        v1 = _mm256_loadu_si256((__m256i *)(src + 2 * i + 1));   // Load channel 1 data
+
+        // Compute the prefix sum for each channel separately
+        sum0 = _mm256_add_epi8(v0, prev);
+        sum1 = _mm256_add_epi8(v1, prev);
+
+        // Store the results back into the destination array
+        _mm256_storeu_si256((__m256i *)(dst + 2 * i), sum0);
+        _mm256_storeu_si256((__m256i *)(dst + 2 * i + 1), sum1);
+
+        // Update `prev` to propagate the last element for the next block
+        // `_mm256_permute2x128_si256` extracts the high 128-bit half and moves it to low half
+        prev = _mm256_permute2x128_si256(sum0, sum1, 0x11);  // Shuffle last elements across registers
+    }
+}
+
+
 //This is buggy :
-static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels) {
+static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+{
+    fprintf(stderr,"pzp_extractAndReconstruct_AVX2 is incorrect..\n");
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r = reconstructed;
@@ -416,13 +534,14 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                     __m256i prev = _mm256_loadu_si256((__m256i*)(r + 2 * (i - 1)));
                     __m256i current = _mm256_loadu_si256((__m256i*)(src + 2 * i));
                     // Separate channels
-                    __m256i prev_ch0 = _mm256_slli_si256(prev, 1);
-                    __m256i prev_ch1 = _mm256_srli_si256(prev, 1);
-                    __m256i res_ch0 = _mm256_add_epi8(_mm256_srli_si256(current, 1), prev_ch0);
-                    __m256i res_ch1 = _mm256_add_epi8(_mm256_slli_si256(current, 1), prev_ch1);
+
+                    __m256i prev_ch0 = _mm256_slli_si256(prev, 1); //Logical shift of byte elements to left according to specified number. The corresponding Intel® AVX2 instruction is VPSLLDQ.
+                    __m256i prev_ch1 = _mm256_srli_si256(prev, 1); //Logical shift of byte elements to right according to specified number. The corresponding Intel® AVX2 instruction is VPSRLDQ.
+                    __m256i res_ch0 = _mm256_add_epi8(_mm256_srli_si256(current, 1), prev_ch0); //Adds signed/unsigned packed 8/16/32/64-bit integer data elements of two vectors. The corresponding Intel® AVX2 instruction is VPADDB, VPADDW, VPADDD, or VPADDQ.
+                    __m256i res_ch1 = _mm256_add_epi8(_mm256_slli_si256(current, 1), prev_ch1); //Adds signed/unsigned packed 8/16/32/64-bit integer data elements of two vectors. The corresponding Intel® AVX2 instruction is VPADDB, VPADDW, VPADDD, or VPADDQ.
                     // Combine results
-                    __m256i result = _mm256_blendv_epi8(res_ch0, res_ch1, _mm256_set1_epi16(0x00FF));
-                    _mm256_storeu_si256((__m256i*)(r + 2 * i), result);
+                    __m256i result = _mm256_blendv_epi8(res_ch0, res_ch1, _mm256_set1_epi16(0x00FF)); // Conditionally blends word elements of source vector depending on bits in a mask vector. The corresponding Intel® AVX2 instruction is VPBLENDVB.
+                    _mm256_storeu_si256((__m256i*)(r + 2 * i), result); // Moves values from a integer vector to an unaligned memory location. The corresponding Intel® AVX instruction is VMOVDQU.
                 }
                 // Remaining elements
                 for (; i < total_size; ++i)
@@ -471,7 +590,8 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
             case 1:
                 memcpy(r, src, total_size);
                 break;
-            case 2: {
+            case 2:
+            {
                 // Copy 32 bytes at a time (16 pixels)
                 unsigned int i = 0;
                 for (; i + 15 < total_size; i += 16)
@@ -487,7 +607,8 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 }
                 break;
             }
-            case 3: {
+            case 3:
+            {
                 // Copy 24 bytes at a time (8 pixels)
                 unsigned int i = 0;
                 for (; i + 7 < total_size; i += 8)
@@ -498,7 +619,7 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 // Remaining elements
                 for (; i < total_size; ++i)
                 {
-                    r[3 * i] = src[3 * i];
+                    r[3 * i]     = src[3 * i];
                     r[3 * i + 1] = src[3 * i + 1];
                     r[3 * i + 2] = src[3 * i + 2];
                 }
@@ -579,7 +700,6 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
     {
         switch (channels)
         {
-            //This path can be optimized to reduce multiplications ( with i )
             case 1:
                 memcpy(reconstructed, src, total_size);
                 break;
@@ -619,12 +739,12 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
    // Force Naive implementation since AVX2 does not produce accurate results (yet)
-   pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-   return;
+   //pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+   //return;
 
    #if INTEL_OPTIMIZATIONS
-     pzp_extractAndReconstruct_SSE2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-     //pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     //pzp_extractAndReconstruct_SSE2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #endif // INTEL_OPTIMIZATIONS

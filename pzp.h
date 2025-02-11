@@ -47,6 +47,13 @@ static const char pzp_header[4]={"PZP0"};
 static const int headerSize =  sizeof(unsigned int) * 10;
 //header, width, height, bitsperpixel, channels, internalbitsperpixel, internalchannels, checksum, compression_mode, unused
 
+
+#define NORMAL   "\033[0m"
+#define BLACK   "\033[30m"      /* Black */
+#define RED     "\033[31m"      /* Red */
+#define GREEN   "\033[32m"      /* Green */
+#define YELLOW  "\033[33m"      /* Yellow */
+
 // Define flags using bitwise shift for clarity
 typedef enum
 {
@@ -66,7 +73,7 @@ static unsigned int convert_header(const char header[4])
 
 static void fail(const char * message)
 {
-  fprintf(stderr,"PZP Fatal Error: %s\n",message);
+  fprintf(stderr,RED "PZP Fatal Error: %s\n" NORMAL,message);
   exit(EXIT_FAILURE);
 }
 
@@ -223,9 +230,10 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
+//This function is ChatGPT generated and is crappy and incorrect
 static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
-    fprintf(stderr,"pzp_extractAndReconstruct_SSE2 is incorrect..\n");
+    fprintf(stderr,YELLOW "pzp_extractAndReconstruct_SSE2 is incorrect..\n" NORMAL);
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r   = reconstructed;
@@ -414,7 +422,8 @@ static void pzp_memcpy_avx2(unsigned char *dst, unsigned char *src, unsigned int
  */
 static void pzp_prefix_sum_avx2(unsigned char *src, unsigned char *dst, unsigned int size)
 {
-    // Initialize previous sum to zero
+ //This function is ChatGPT generated and is crappy and incorrect
+   // Initialize previous sum to zero
     __m256i prev = _mm256_setzero_si256();  // Holds the last accumulated sum across iterations
     __m256i v, sum;  // Temporary variables for SIMD operations
 
@@ -446,7 +455,7 @@ static void pzp_prefix_sum_avx2(unsigned char *src, unsigned char *dst, unsigned
  *      dst[2*i]   = src[2*i]   + dst[2*i - 2]
  *      dst[2*i+1] = src[2*i+1] + dst[2*i - 1]
  *
- * The function uses AVX2 to process 16 elements (8 pairs of channels) per iteration, improving performance.
+ * The function uses AVX2 to process 32 elements (16 pairs of channels) per iteration, improving performance.
  *
  * @param src  Pointer to the source array of unsigned 8-bit integers (interleaved 2-channel format).
  * @param dst  Pointer to the destination array where the computed prefix sum will be stored.
@@ -460,28 +469,43 @@ static void pzp_prefix_sum_avx2(unsigned char *src, unsigned char *dst, unsigned
  */
 static void pzp_prefix_sum_avx2_2ch(unsigned char *src, unsigned char *dst, unsigned int size)
 {
-    // Initialize previous sum to zero
-    __m256i prev = _mm256_setzero_si256();  // Holds the last accumulated sum across iterations
-    __m256i v0, v1, sum0, sum1;  // Temporary variables for SIMD operations
+ //This function is ChatGPT generated and is crappy and incorrect
+   // Initialize previous sum to zero for both channels
+    __m256i prev0 = _mm256_setzero_si256();  // Holds the last accumulated sum for channel 0
+    __m256i prev1 = _mm256_setzero_si256();  // Holds the last accumulated sum for channel 1
+    __m256i v0, v1, sum0, sum1;
 
     // Process the array in chunks of 16 pairs (32 elements total, 16 per channel)
     for (unsigned int i = 0; i < size; i += 16)
     {
         // Load 16 pairs (32 bytes total) from the source array into AVX2 registers
         v0 = _mm256_loadu_si256((__m256i *)(src + 2 * i));       // Load channel 0 data
-        v1 = _mm256_loadu_si256((__m256i *)(src + 2 * i + 1));   // Load channel 1 data
+        v1 = _mm256_loadu_si256((__m256i *)(src + 2 * i + 32));  // Load channel 1 data
 
-        // Compute the prefix sum for each channel separately
-        sum0 = _mm256_add_epi8(v0, prev);
-        sum1 = _mm256_add_epi8(v1, prev);
+        // Compute prefix sum by adding the previous accumulated sum
+        sum0 = _mm256_add_epi8(v0, prev0);
+        sum1 = _mm256_add_epi8(v1, prev1);
+
+        // Perform horizontal prefix sum within each register
+        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 1));
+        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 2));
+        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 4));
+        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 8));
+        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 16));
+
+        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 1));
+        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 2));
+        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 4));
+        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 8));
+        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 16));
 
         // Store the results back into the destination array
         _mm256_storeu_si256((__m256i *)(dst + 2 * i), sum0);
-        _mm256_storeu_si256((__m256i *)(dst + 2 * i + 1), sum1);
+        _mm256_storeu_si256((__m256i *)(dst + 2 * i + 32), sum1);
 
-        // Update `prev` to propagate the last element for the next block
-        // `_mm256_permute2x128_si256` extracts the high 128-bit half and moves it to low half
-        prev = _mm256_permute2x128_si256(sum0, sum1, 0x11);  // Shuffle last elements across registers
+        // Update prev0 and prev1 with the last elements for the next batch
+        prev0 = _mm256_permute2x128_si256(sum0, sum0, 0x11);
+        prev1 = _mm256_permute2x128_si256(sum1, sum1, 0x11);
     }
 }
 
@@ -489,7 +513,8 @@ static void pzp_prefix_sum_avx2_2ch(unsigned char *src, unsigned char *dst, unsi
 //This is buggy :
 static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
-    fprintf(stderr,"pzp_extractAndReconstruct_AVX2 is incorrect..\n");
+ //This function is ChatGPT generated and is crappy and incorrect
+   fprintf(stderr,YELLOW "pzp_extractAndReconstruct_AVX2 is incorrect..\n" NORMAL);
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r = reconstructed;
@@ -524,31 +549,7 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 break;
             }
             case 2: {
-                // Handle RLE for 2 channels
-                r[0] = src[0];
-                r[1] = src[1];
-                unsigned int i = 1;
-                for (; i + 15 < total_size; i += 16)
-                {
-                    // Load previous and current values
-                    __m256i prev = _mm256_loadu_si256((__m256i*)(r + 2 * (i - 1)));
-                    __m256i current = _mm256_loadu_si256((__m256i*)(src + 2 * i));
-                    // Separate channels
-
-                    __m256i prev_ch0 = _mm256_slli_si256(prev, 1); //Logical shift of byte elements to left according to specified number. The corresponding Intel® AVX2 instruction is VPSLLDQ.
-                    __m256i prev_ch1 = _mm256_srli_si256(prev, 1); //Logical shift of byte elements to right according to specified number. The corresponding Intel® AVX2 instruction is VPSRLDQ.
-                    __m256i res_ch0 = _mm256_add_epi8(_mm256_srli_si256(current, 1), prev_ch0); //Adds signed/unsigned packed 8/16/32/64-bit integer data elements of two vectors. The corresponding Intel® AVX2 instruction is VPADDB, VPADDW, VPADDD, or VPADDQ.
-                    __m256i res_ch1 = _mm256_add_epi8(_mm256_slli_si256(current, 1), prev_ch1); //Adds signed/unsigned packed 8/16/32/64-bit integer data elements of two vectors. The corresponding Intel® AVX2 instruction is VPADDB, VPADDW, VPADDD, or VPADDQ.
-                    // Combine results
-                    __m256i result = _mm256_blendv_epi8(res_ch0, res_ch1, _mm256_set1_epi16(0x00FF)); // Conditionally blends word elements of source vector depending on bits in a mask vector. The corresponding Intel® AVX2 instruction is VPBLENDVB.
-                    _mm256_storeu_si256((__m256i*)(r + 2 * i), result); // Moves values from a integer vector to an unaligned memory location. The corresponding Intel® AVX instruction is VMOVDQU.
-                }
-                // Remaining elements
-                for (; i < total_size; ++i)
-                {
-                    r[2 * i] = src[2 * i] + r[2 * (i - 1)];
-                    r[2 * i + 1] = src[2 * i + 1] + r[2 * (i - 1) + 1];
-                }
+                pzp_prefix_sum_avx2_2ch(src,r,total_size);
                 break;
             }
             case 3: {
@@ -863,7 +864,9 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
     unsigned int *heightSource            = memStartAsUINT + 4;
     unsigned int *bitsperpixelInSource    = memStartAsUINT + 5;
     unsigned int *channelsInSource        = memStartAsUINT + 6;
+#if PZP_VERBOSE
     unsigned int *checksumSource          = memStartAsUINT + 7;
+#endif
     unsigned int *compressionConfigSource = memStartAsUINT + 8;
     //unsigned int *unusedSource            = memStartAsUINT + 9;
 

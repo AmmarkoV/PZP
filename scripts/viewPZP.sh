@@ -20,7 +20,7 @@ FILENAME_NO_EXT="${FILENAME%.*}"
 echo "Converting $INPUT_FILE"
  
 # Compress using pzp
-./pzp uncompress "$INPUT_FILE" temporary.ppm 
+./pzp decompress "$INPUT_FILE" temporary.ppm 
 if [ $? -ne 0 ]; then
         echo "Error: pzp compression failed for $file"
         exit 4

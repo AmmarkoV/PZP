@@ -314,7 +314,7 @@ int main(int argc, char *argv[])
         else{ return EXIT_FAILURE; }
     }
     else
-    if (strcmp(operation, "decompress") == 0)
+    if ( (strcmp(operation, "decompress") == 0) || (strcmp(operation, "uncompress") == 0) )
     {
         fprintf(stderr, "Decompress %s \n", input_commandline_parameter);
 

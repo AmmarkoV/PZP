@@ -33,8 +33,20 @@ if [ $? -ne 0 ]; then
         exit 4
 fi
 
-
 # Remove temporary file
 rm -f temporary.ppm
+
+
+# Calculate compression ratio
+INPUT_SIZE=$(stat -c%s "$INPUT_FILE")
+OUTPUT_SIZE=$(stat -c%s "$OUTPUT_FILE")
+
+if [ "$OUTPUT_SIZE" -gt 0 ]; then
+    RATIO=$(echo "scale=2; $INPUT_SIZE / $OUTPUT_SIZE" | bc)
+    echo "Compression ratio: $RATIO : 1"
+else
+    echo "Error: Output file size is zero."
+    exit 5
+fi
 
 exit 0

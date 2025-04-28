@@ -41,7 +41,7 @@ extern "C"
 
 #define PZP_VERBOSE 0
 
-static const char pzp_version[]="v0.0";
+static const char pzp_version[]="v0.01";
 static const char pzp_header[4]={"PZP0"};
 
 static const int headerSize =  sizeof(unsigned int) * 10;

@@ -101,6 +101,56 @@ static unsigned int hash_checksum(const void *data, size_t dataSize)
     return (h1 ^ (h2 >> 3)) + (h3 ^ (h4 << 5));
 }
 
+
+static void * pzp_read_file_to_memory(const char *filename, size_t *fileSize)
+{
+    FILE *fp = fopen(filename, "rb");
+    if (!fp)
+       {
+        fprintf(stderr,"Failed to open file");
+        return NULL;
+       }
+
+    if (fseek(fp, 0, SEEK_END) != 0)
+       {
+        fprintf(stderr,"Failed to seek file");
+        fclose(fp);
+        return NULL;
+       }
+
+    long file_size = ftell(fp);
+    if (file_size < 0)
+       {
+        fprintf(stderr,"Failed to tell file size");
+        fclose(fp);
+        return NULL;
+       }
+    rewind(fp);
+
+    void *buffer = malloc(file_size);
+    if (!buffer)
+      {
+        fprintf(stderr,"Failed to allocate memory");
+        fclose(fp);
+        return NULL;
+       }
+
+    size_t read_size = fread(buffer, 1, file_size, fp);
+    if (read_size != (size_t)file_size)
+       {
+        fprintf(stderr,"Failed to read file completely");
+        free(buffer);
+        fclose(fp);
+        return NULL;
+       }
+
+    fclose(fp);
+    if (fileSize) *fileSize = read_size;
+    return buffer;
+}
+
+
+
 static void pzp_split_channels(const unsigned char *image, unsigned char **buffers, int num_buffers, int WIDTH, int HEIGHT)
 {
     int total_size = WIDTH * HEIGHT;
@@ -751,100 +801,56 @@ static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigne
    #endif // INTEL_OPTIMIZATIONS
 }
 //-----------------------------------------------------------------------------------------------
-static unsigned char* pzp_decompress_combined(const char *input_filename,
+static unsigned char* pzp_decompress_combined_from_memory(
+                                const void *file_data, size_t file_size,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
                                 unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput,
                                 unsigned int *configuration)
 {
-    FILE *input = fopen(input_filename, "rb");
-    if (!input)
+    if (!file_data || file_size <= sizeof(unsigned int))
     {
-        //fail("File error");
-        return 0;
+        fprintf(stderr, "Invalid file data or size\n");
+        return NULL;
     }
+
+    const unsigned char *input_ptr = (const unsigned char *)file_data;
 
     // Read stored size
     unsigned int dataSize;
-    if (fread(&dataSize, sizeof(unsigned int), 1, input) != 1)
-    {
-        fclose(input);
-        //fail("Failed to read data size");
-        return 0;
+    memcpy(&dataSize, input_ptr, sizeof(unsigned int));
+
+    if (dataSize == 0 || dataSize > 100000000)
+    { // sanity check
+        fprintf(stderr, "Error: Invalid size read from memory (%u)\n", dataSize);
+        return NULL;
     }
 
-    if (dataSize == 0 || dataSize > 100000000)   // Sanity check
-    {
-        fclose(input);
-        fprintf(stderr, "Error: Invalid size read from file (%d)\n", dataSize);
-        //fail("Error: Invalid size read from file");
-        return 0;
-    }
-    //printf("Read size: %d bytes\n", dataSize);
-
-    // Read compressed data
-    if (fseek(input, 0, SEEK_END) != 0)
-    {
-        fclose(input);
-        //fail("Failed to seek file end");
-        return 0;
-    }
-
-    long fileSize = ftell(input);
-    if (fileSize < 0)
-    {
-        fclose(input);
-        //fail("Failed to determine file size");
-        return 0;
-    }
-
-    size_t compressed_size = fileSize - sizeof(unsigned int);
-
-    if (fseek(input, sizeof(unsigned int), SEEK_SET) != 0)
-    {
-        fclose(input);
-        //fail("Failed to seek to compressed data");
-        return 0;
-    }
-
-    void *compressed_buffer = malloc(compressed_size);
-    if (!compressed_buffer)
-    {
-        fclose(input);
-        //fail("Memory allocation #1 failed");
-        return 0;
-    }
-
-    if (fread(compressed_buffer, 1, compressed_size, input) != compressed_size)
-    {
-        free(compressed_buffer);
-        fclose(input);
-        //fail("Failed to read compressed data");
-        return 0;
-    }
-
-    fclose(input);
+    size_t compressed_size = file_size - sizeof(unsigned int);
+    const void *compressed_buffer = input_ptr + sizeof(unsigned int);
 
     size_t decompressed_size = (size_t)dataSize;
     void *decompressed_buffer = malloc(decompressed_size);
     if (!decompressed_buffer)
     {
-        free(compressed_buffer);
+        //free(compressed_buffer);
         //fail("Memory allocation #2 failed");
         return 0;
     }
 
+
+
     size_t actual_decompressed_size = ZSTD_decompress(decompressed_buffer, decompressed_size, compressed_buffer, compressed_size);
     if (ZSTD_isError(actual_decompressed_size))
     {
-        free(compressed_buffer);
+        //free(compressed_buffer);
         free(decompressed_buffer);
         fprintf(stderr, "Zstd decompression error: %s\n", ZSTD_getErrorName(actual_decompressed_size));
         //fail("Decompression Error");
         return 0;
     }
 
-    free(compressed_buffer);
+    //free(compressed_buffer);
 
     if (actual_decompressed_size != decompressed_size)
     {
@@ -914,6 +920,33 @@ static unsigned char* pzp_decompress_combined(const char *input_filename,
 
     free(decompressed_buffer);
     return reconstructed;
+}
+
+
+static unsigned char* pzp_decompress_combined(const char *input_filename,
+                                unsigned int *widthOutput, unsigned int *heightOutput,
+                                unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
+                                unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput,
+                                unsigned int *configuration)
+{
+    size_t file_size = 0;
+    void *file_data = pzp_read_file_to_memory(input_filename, &file_size);
+    if (file_data!=NULL)
+    {
+      unsigned char *result = pzp_decompress_combined_from_memory(
+                                                                    file_data, file_size,
+                                                                    widthOutput, heightOutput,
+                                                                    bitsperpixelExternalOutput, channelsExternalOutput,
+                                                                    bitsperpixelInternalOutput, channelsInternalOutput,
+                                                                    configuration
+                                                                  );
+
+      free(file_data);
+      return result;
+    }
+
+    fprintf(stderr, "Failed to read file: %s\n", input_filename);
+    return NULL;
 }
 
 #ifdef __cplusplus

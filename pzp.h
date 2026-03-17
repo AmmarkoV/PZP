@@ -870,9 +870,7 @@ static unsigned char* pzp_decompress_combined_from_memory(
     unsigned int *heightSource            = memStartAsUINT + 4;
     unsigned int *bitsperpixelInSource    = memStartAsUINT + 5;
     unsigned int *channelsInSource        = memStartAsUINT + 6;
-#if PZP_VERBOSE
     unsigned int *checksumSource          = memStartAsUINT + 7;
-#endif
     unsigned int *compressionConfigSource = memStartAsUINT + 8;
     //unsigned int *unusedSource            = memStartAsUINT + 9;
 
@@ -910,6 +908,16 @@ static unsigned char* pzp_decompress_combined_from_memory(
 
     // Copy decompressed data into the reconstructed buffers
     unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
+
+    // Fix: validate checksum to detect data corruption
+    unsigned int computedChecksum = hash_checksum(decompressed_bytes, width * height * channelsIn);
+    if (computedChecksum != *checksumSource)
+    {
+        free(decompressed_buffer);
+        fprintf(stderr, "PZP checksum mismatch (stored 0x%X, computed 0x%X): file may be corrupted\n",
+                *checksumSource, computedChecksum);
+        return NULL;
+    }
 
     unsigned char *reconstructed = malloc( width * height * (bitsperpixelIn/8)* channelsIn );
     if (reconstructed!=NULL)

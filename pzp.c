@@ -284,11 +284,18 @@ int main(int argc, char *argv[])
 
          if (buffers!=NULL)
          {
+           // Fix: check each per-channel allocation; clean up and bail on failure
            for (unsigned int ch = 0; ch < channelsInternal; ch++)
            {
              buffers[ch] = malloc(width * height * sizeof(unsigned char));
-             //if (buffers[ch]!=NULL)
-             //{ memset(buffers[ch],0,width * height * sizeof(unsigned char)); }
+             if (buffers[ch] == NULL)
+             {
+                 fprintf(stderr, "Failed to allocate channel buffer %u\n", ch);
+                 for (unsigned int j = 0; j < ch; j++) { free(buffers[j]); }
+                 free(buffers);
+                 free(image);
+                 return EXIT_FAILURE;
+             }
            }
 
            pzp_split_channels(image, buffers, channelsInternal, width, height);
@@ -301,15 +308,16 @@ int main(int argc, char *argv[])
 
            pzp_compress_combined(buffers, width,height, bitsperpixel,channels, bitsperpixelInternal, channelsInternal, configuration, output_commandline_parameter);
 
-         free(image);
-
-         //Deallocate intermediate buffers..
-         for (unsigned int ch = 0; ch < channels; ch++)
-          {
-            free(buffers[ch]);
-          }
-          free(buffers);
+           //Deallocate intermediate buffers..
+           // Fix: use channelsInternal (not channels) — for 16-bit images these differ
+           for (unsigned int ch = 0; ch < channelsInternal; ch++)
+           {
+             free(buffers[ch]);
+           }
+           free(buffers);
          }
+         // Fix: free image regardless of whether buffers allocation succeeded
+         free(image);
         }//If we have an image
         else{ return EXIT_FAILURE; }
     }

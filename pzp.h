@@ -438,27 +438,59 @@ static void pzp_memcpy_avx2(unsigned char *dst, unsigned char *src, unsigned int
  */
 static void pzp_prefix_sum_avx2(unsigned char *src, unsigned char *dst, unsigned int size)
 {
- //This function is ChatGPT generated and is crappy and incorrect
-   // Initialize previous sum to zero
-    __m256i prev = _mm256_setzero_si256();  // Holds the last accumulated sum across iterations
-    __m256i v, sum;  // Temporary variables for SIMD operations
+    // 1-channel prefix sum: dst[i] = src[i] + dst[i-1], processing 32 bytes per iteration.
+    //
+    // AVX2 key constraint: _mm256_slli_si256 shifts within each 128-bit lane independently.
+    // It cannot propagate across the lane boundary.  We handle this in two explicit steps:
+    //
+    //   Step 1 – Kogge-Stone within each 16-byte lane (shifts 1, 2, 4, 8).
+    //            Lane 0 (bytes  0-15): correct prefix sums from byte 0.
+    //            Lane 1 (bytes 16-31): correct prefix sums from byte 16 only (missing carry).
+    //
+    //   Step 2 – Cross-lane carry: extract last byte of lane 0, broadcast to all of lane 1,
+    //            add to lane 1 only so bytes 16-31 gain the cumulative sum through byte 15.
+    //
+    //   Step 3 – Cross-block carry: add the carry from the previous 32-byte block to every
+    //            element.  Carry = last byte of the previous block's result, broadcast to 32.
 
-    // Process the array in chunks of 32 bytes (AVX2 register width)
-    for (unsigned int i = 0; i < size; i += 32)
+    __m256i carry = _mm256_setzero_si256();
+    unsigned int i = 0;
+
+    for (; i + 31 < size; i += 32)
     {
-        // Load 32 bytes from the source array into an AVX2 register
-        v = _mm256_loadu_si256((__m256i *)(src + i));
+        __m256i v = _mm256_loadu_si256((__m256i *)(src + i));
 
-        // Compute the prefix sum for this block by adding the previous sum
-        sum = _mm256_add_epi8(v, prev);
+        // Step 1: Kogge-Stone within each 128-bit lane.
+        v = _mm256_add_epi8(v, _mm256_slli_si256(v, 1));
+        v = _mm256_add_epi8(v, _mm256_slli_si256(v, 2));
+        v = _mm256_add_epi8(v, _mm256_slli_si256(v, 4));
+        v = _mm256_add_epi8(v, _mm256_slli_si256(v, 8));
 
-        // Store the result back into the destination array
-        _mm256_storeu_si256((__m256i *)(dst + i), sum);
+        // Step 2: propagate last byte of lane 0 to all bytes of lane 1.
+        {
+            __m128i lane0 = _mm256_castsi256_si128(v);
+            unsigned char last0 = (unsigned char)_mm_cvtsi128_si32(_mm_srli_si128(lane0, 15));
+            // Build a 256-bit vector: zeros in lane 0, broadcast of last0 in lane 1.
+            __m256i lane_carry = _mm256_set_m128i(_mm_set1_epi8((char)last0),
+                                                   _mm_setzero_si128());
+            v = _mm256_add_epi8(v, lane_carry);
+        }
 
-        // Update `prev` to propagate the last element for the next block
-        // `_mm256_permute2x128_si256` extracts the high 128-bit half and moves it to low half
-        prev = _mm256_permute2x128_si256(sum, sum, 0x11);  // Shuffle the last 16 bytes
+        // Step 3: add cross-block carry to all 32 bytes.
+        v = _mm256_add_epi8(v, carry);
+        _mm256_storeu_si256((__m256i *)(dst + i), v);
+
+        // Update carry: broadcast last byte of the result (byte 31 = last of lane 1).
+        {
+            __m128i hi = _mm256_extracti128_si256(v, 1);
+            unsigned char last = (unsigned char)_mm_cvtsi128_si32(_mm_srli_si128(hi, 15));
+            carry = _mm256_set1_epi8((char)last);
+        }
     }
+
+    // Scalar tail (also covers the case size < 32).
+    for (; i < size; i++)
+        dst[i] = src[i] + (i > 0 ? dst[i - 1] : 0);
 }
 
 /**
@@ -485,52 +517,69 @@ static void pzp_prefix_sum_avx2(unsigned char *src, unsigned char *dst, unsigned
  */
 static void pzp_prefix_sum_avx2_2ch(unsigned char *src, unsigned char *dst, unsigned int size)
 {
- //This function is ChatGPT generated and is crappy and incorrect
-   // Initialize previous sum to zero for both channels
-    __m256i prev0 = _mm256_setzero_si256();  // Holds the last accumulated sum for channel 0
-    __m256i prev1 = _mm256_setzero_si256();  // Holds the last accumulated sum for channel 1
-    __m256i v0, v1, sum0, sum1;
+    // 2-channel interleaved prefix sum: 16 pixel-pairs (32 bytes) per iteration.
+    // size = number of pixels (pairs); total bytes = size * 2.
+    //
+    //   dst[2*i]   = src[2*i]   + dst[2*(i-1)]     (channel 0)
+    //   dst[2*i+1] = src[2*i+1] + dst[2*(i-1)+1]   (channel 1)
+    //
+    // The two channels are independent; their stride in the interleaved layout is 2 bytes.
+    // Kogge-Stone uses shifts of 2, 4, 8 (not 1, 2, 4, 8) to match that stride.
+    // After the intra-lane scan, cross-lane carry propagates the last pixel-pair of lane 0
+    // (bytes 14-15) to all 8 pixel positions in lane 1.
+    // The _mm256_set1_epi16 broadcast replicates the 2-byte [ch0,ch1] pattern to all 16
+    // positions across both lanes, forming the cross-block carry.
 
-    // Process the array in chunks of 16 pairs (32 elements total, 16 per channel)
-    for (unsigned int i = 0; i < size; i += 16)
+    __m256i carry = _mm256_setzero_si256();
+    unsigned int i = 0;
+
+    for (; i + 15 < size; i += 16)
     {
-        // Load 16 pairs (32 bytes total) from the source array into AVX2 registers
-        v0 = _mm256_loadu_si256((__m256i *)(src + 2 * i));       // Load channel 0 data
-        v1 = _mm256_loadu_si256((__m256i *)(src + 2 * i + 32));  // Load channel 1 data
+        // Load 16 interleaved pixel-pairs = 32 bytes.
+        __m256i v = _mm256_loadu_si256((__m256i *)(src + i * 2));
 
-        // Compute prefix sum by adding the previous accumulated sum
-        sum0 = _mm256_add_epi8(v0, prev0);
-        sum1 = _mm256_add_epi8(v1, prev1);
+        // Step 1: Kogge-Stone within each 128-bit lane, stride 2 (one pixel-pair per step).
+        v = _mm256_add_epi8(v, _mm256_slli_si256(v, 2));
+        v = _mm256_add_epi8(v, _mm256_slli_si256(v, 4));
+        v = _mm256_add_epi8(v, _mm256_slli_si256(v, 8));
+        // Lane 0 (pixels 0-7): correct prefix sums.
+        // Lane 1 (pixels 8-15): sums relative to pixel 8 only — missing pixel 7 carry.
 
-        // Perform horizontal prefix sum within each register
-        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 1));
-        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 2));
-        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 4));
-        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 8));
-        sum0 = _mm256_add_epi8(sum0, _mm256_slli_si256(sum0, 16));
+        // Step 2: cross-lane carry — last pixel-pair of lane 0 (bytes 14-15) → all of lane 1.
+        {
+            __m128i lane0 = _mm256_castsi256_si128(v);
+            // Shift right by 14: puts bytes 14 and 15 in positions 0 and 1.
+            int last_px = _mm_cvtsi128_si32(_mm_srli_si128(lane0, 14));
+            // _mm_set1_epi16 replicates the 16-bit [ch0,ch1] pair to all 8 positions.
+            __m128i bcast = _mm_set1_epi16((short)(last_px & 0xFFFF));
+            // Add to lane 1 only (zeros in lane 0).
+            __m256i lane_carry = _mm256_set_m128i(bcast, _mm_setzero_si128());
+            v = _mm256_add_epi8(v, lane_carry);
+        }
 
-        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 1));
-        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 2));
-        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 4));
-        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 8));
-        sum1 = _mm256_add_epi8(sum1, _mm256_slli_si256(sum1, 16));
+        // Step 3: add cross-block carry to all 32 bytes.
+        v = _mm256_add_epi8(v, carry);
+        _mm256_storeu_si256((__m256i *)(dst + i * 2), v);
 
-        // Store the results back into the destination array
-        _mm256_storeu_si256((__m256i *)(dst + 2 * i), sum0);
-        _mm256_storeu_si256((__m256i *)(dst + 2 * i + 32), sum1);
+        // Update carry: last pixel-pair of the result (bytes 30-31 of lane 1).
+        {
+            __m128i hi = _mm256_extracti128_si256(v, 1);
+            int last_px = _mm_cvtsi128_si32(_mm_srli_si128(hi, 14));
+            carry = _mm256_set1_epi16((short)(last_px & 0xFFFF));
+        }
+    }
 
-        // Update prev0 and prev1 with the last elements for the next batch
-        prev0 = _mm256_permute2x128_si256(sum0, sum0, 0x11);
-        prev1 = _mm256_permute2x128_si256(sum1, sum1, 0x11);
+    // Scalar tail (also covers size < 16).
+    for (; i < size; i++)
+    {
+        dst[i * 2]     = src[i * 2]     + (i > 0 ? dst[(i - 1) * 2]     : 0);
+        dst[i * 2 + 1] = src[i * 2 + 1] + (i > 0 ? dst[(i - 1) * 2 + 1] : 0);
     }
 }
 
 
-//This is buggy :
 static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
- //This function is ChatGPT generated and is crappy and incorrect
-   fprintf(stderr,YELLOW "pzp_extractAndReconstruct_AVX2 is incorrect..\n" NORMAL);
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r = reconstructed;
@@ -540,28 +589,7 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
         switch (channels)
         {
             case 1: {
-                // Handle RLE for 1 channel
-                r[0] = src[0];
-                unsigned int i = 1;
-                // Process 32 elements at a time
-                for (; i + 31 < total_size; i += 32)
-                {
-                    __m256i prev = _mm256_loadu_si256((__m256i*)(r + i - 1));
-                    __m256i current = _mm256_loadu_si256((__m256i*)(src + i));
-                    // Shift previous elements right by 1 byte and add
-                    __m256i shifted_prev = _mm256_srli_si256(prev, 1);
-                    __m256i result = _mm256_add_epi8(current, shifted_prev);
-                    // Propagate carry through the vector
-                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 1));
-                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 2));
-                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 4));
-                    result = _mm256_add_epi8(result, _mm256_slli_si256(result, 8));
-                    _mm256_storeu_si256((__m256i*)(r + i), result);
-                }
-                // Remaining elements
-                for (; i < total_size; ++i) {
-                    r[i] = src[i] + r[i - 1];
-                }
+                pzp_prefix_sum_avx2(src, r, total_size);
                 break;
             }
             case 2: {
@@ -722,7 +750,7 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
    #if INTEL_OPTIMIZATIONS
-     pzp_extractAndReconstruct_SSE2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #endif // INTEL_OPTIMIZATIONS

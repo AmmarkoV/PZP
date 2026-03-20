@@ -5,14 +5,16 @@ RELEASE_FLAGS= -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
 DEBUG_FLAGS = -D_GNU_SOURCE -O0 -g3 -fno-omit-frame-pointer -Wstrict-overflow -fPIE -fPIC
 
 SRC = pzp.c
+LIB_SRC = pzp_lib.c
 OUTDIR = output
 PZP = pzp
 DPZP = dpzp
 SPZP = spzp
+LIBPZP = libpzp.so
 
 .PHONY: all clean test
 
-all: $(PZP) $(DPZP) $(SPZP)
+all: $(PZP) $(DPZP) $(SPZP) $(LIBPZP)
 
 $(PZP): $(SRC)
 	$(CC) $(SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(PZP)
@@ -23,8 +25,11 @@ $(DPZP): $(SRC)
 $(SPZP): $(SRC)
 	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(SPZP)
 
+$(LIBPZP): $(LIB_SRC) pzp.h
+	$(CC) -shared -fPIC $(LIB_SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(LIBPZP)
+
 clean:
-	rm -rf $(PZP) $(DPZP) $(SPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt
+	rm -rf $(PZP) $(DPZP) $(SPZP) $(LIBPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)

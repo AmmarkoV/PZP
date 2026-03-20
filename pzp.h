@@ -747,43 +747,9 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
                 break;
         }
     }
-    else // Non-RLE path
+    else // Non-RLE path: data is already in final interleaved layout
     {
-        switch (channels)
-        {
-            case 1:
-                memcpy(reconstructed, src, total_size);
-                break;
-            case 2:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    *r = *src;
-                    r++; src++;
-                    *r = *src;
-                    r++; src++;
-                }
-                break;
-            case 3:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    *r = *src;
-                    r++; src++;
-                    *r = *src;
-                    r++; src++;
-                    *r = *src;
-                    r++; src++;
-                }
-                break;
-            default:
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        reconstructed[i * channels + ch] = src[i * channels + ch];
-                    }
-                }
-                break;
-        }
+        memcpy(reconstructed, src, total_size * channels);
     }
 }
 //-----------------------------------------------------------------------------------------------
@@ -919,12 +885,24 @@ static unsigned char* pzp_decompress_combined_from_memory(
         return NULL;
     }
 
-    unsigned char *reconstructed = malloc( width * height * (bitsperpixelIn/8)* channelsIn );
-    if (reconstructed!=NULL)
-         {
-           unsigned int restoreRLEChannels = compressionCfg & USE_RLE;
-           pzp_extractAndReconstruct(decompressed_bytes, reconstructed, width, height, channelsIn, restoreRLEChannels);
-         }
+    unsigned int restoreRLEChannels = compressionCfg & USE_RLE;
+    size_t pixel_size = (size_t)width * height * (bitsperpixelIn / 8) * channelsIn;
+
+    if (!restoreRLEChannels)
+    {
+        // Non-RLE: pixel data is already in final layout inside decompressed_buffer.
+        // Shift it to the front of the allocation and return directly —
+        // saves one malloc + memcpy. Caller frees the returned pointer as usual.
+        memmove(decompressed_buffer, decompressed_bytes, pixel_size);
+        return (unsigned char *)decompressed_buffer;
+    }
+
+    // RLE path: need a separate output buffer for the prefix-sum reconstruction.
+    unsigned char *reconstructed = malloc(pixel_size);
+    if (reconstructed != NULL)
+    {
+        pzp_extractAndReconstruct(decompressed_bytes, reconstructed, width, height, channelsIn, restoreRLEChannels);
+    }
 
     free(decompressed_buffer);
     return reconstructed;

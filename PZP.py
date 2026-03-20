@@ -1,14 +1,23 @@
 """
-PZP.py — Python wrapper for reading PZP image files via ctypes.
+PZP.py — Python wrapper for reading and writing PZP image files via ctypes.
 
 Usage:
     import PZP
-    img = PZP.read("image.pzp")          # numpy array, or dict of raw bytes
+
+    # Decompress
+    img  = PZP.read("image.pzp")         # numpy array, or dict of raw bytes
     meta = PZP.info("image.pzp")         # metadata dict without decoding pixels
+
+    # Compress
+    PZP.write("out.pzp", img)            # from numpy array (uint8 or uint16)
+    PZP.write("out.pzp", img, use_rle=True)  # enable delta pre-filter
+
+    # Without numpy — pass raw bytes explicitly
+    PZP.write("out.pzp", raw_bytes, width=640, height=360, bpp=8, channels=3)
 
 Returned numpy array shape:
     8-bit  → (height, width, channels)   dtype uint8
-    16-bit → (height, width, channels)   dtype uint16  (big-endian pairs, as stored in PNM)
+    16-bit → (height, width, channels)   dtype uint16  (native byte-order)
 
 If numpy is not available, read() returns a dict:
     {
@@ -18,6 +27,10 @@ If numpy is not available, read() returns a dict:
         "channels":     int,
         "bpp":          int,   # bits-per-pixel of the original image
     }
+
+Configuration flags (pass to write() as configuration=):
+    USE_COMPRESSION = 1   # always enabled; zstd entropy coding
+    USE_RLE         = 2   # delta pre-filter (improves ratio for smooth images)
 """
 
 import ctypes
@@ -61,6 +74,25 @@ _lib.pzp_decompress_file.argtypes = [
 
 _lib.pzp_free.restype  = None
 _lib.pzp_free.argtypes = [ctypes.c_void_p]
+
+# pzp_compress_file signature
+_lib.pzp_compress_file.restype  = ctypes.c_int
+_lib.pzp_compress_file.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),    # pixels
+    ctypes.c_uint,                     # width
+    ctypes.c_uint,                     # height
+    ctypes.c_uint,                     # bpp  (8 or 16)
+    ctypes.c_uint,                     # channels
+    ctypes.c_uint,                     # configuration
+    ctypes.c_char_p,                   # output_filename
+]
+
+# ---------------------------------------------------------------------------
+# Configuration flag constants (mirror of PZPFlags in pzp.h)
+# ---------------------------------------------------------------------------
+
+USE_COMPRESSION = 1
+USE_RLE         = 2
 
 # ---------------------------------------------------------------------------
 # Optional numpy support
@@ -164,6 +196,11 @@ def read(filename: str):
         else:
             raise ValueError(f"PZP: unsupported bit depth {be}")
 
+        # Squeeze the channel axis for single-channel images to match cv2's
+        # convention (grayscale → (H, W), not (H, W, 1)).
+        if ce == 1:
+            arr = arr[:, :, 0]
+
         # Return a writable copy so the caller can modify it freely
         return arr.copy()
 
@@ -184,3 +221,89 @@ def info(filename: str) -> dict:
     """
     _raw, meta = _decode(filename)
     return meta
+
+
+def write(filename: str, data, *,
+          width: int = 0, height: int = 0,
+          bpp: int = 0, channels: int = 0,
+          use_rle: bool = False,
+          configuration: int = USE_COMPRESSION) -> None:
+    """
+    Compress pixel data and write a .pzp file.
+
+    Parameters
+    ----------
+    filename : str
+        Output .pzp file path.
+    data : numpy ndarray  *or*  bytes / bytearray
+        Pixel data.
+        - ndarray (H, W)        → treated as 1-channel uint8 or uint16
+        - ndarray (H, W, C)     → C-channel uint8 or uint16
+        - bytes / bytearray     → raw interleaved bytes; width/height/bpp/channels
+                                  must all be supplied explicitly.
+    width, height, bpp, channels : int
+        Required when data is raw bytes; ignored when data is an ndarray
+        (dimensions are inferred from the array shape and dtype).
+    use_rle : bool
+        Enable the delta pre-filter (improves ratio for smooth / gradient images).
+        Adds USE_RLE to the configuration bitfield.
+    configuration : int
+        Full configuration bitfield.  USE_COMPRESSION (1) is always or'd in.
+        Prefer use_rle=True for the common case.
+
+    Raises
+    ------
+    ValueError  if the array dtype is unsupported or dimensions are missing.
+    RuntimeError if the C encoder returns an error.
+    """
+    # Always ensure USE_COMPRESSION is set
+    cfg = configuration | USE_COMPRESSION
+    if use_rle:
+        cfg |= USE_RLE
+
+    if _NUMPY and isinstance(data, np.ndarray):
+        arr = data
+
+        # Normalise shape to (H, W, C)
+        if arr.ndim == 2:
+            arr = arr[:, :, np.newaxis]
+        if arr.ndim != 3:
+            raise ValueError(f"PZP.write: expected 2-D or 3-D array, got shape {data.shape}")
+
+        h, w, c = arr.shape
+
+        if arr.dtype == np.uint8:
+            pixel_bpp = 8
+            raw = arr.tobytes()
+        elif arr.dtype == np.uint16:
+            # PZP/PNM byte order is big-endian; convert if the array is native-endian
+            pixel_bpp = 16
+            raw = arr.astype(">u2").tobytes()
+        else:
+            raise ValueError(
+                f"PZP.write: unsupported dtype {arr.dtype}. Use uint8 or uint16.")
+
+    else:
+        # Raw bytes path — caller must supply all metadata
+        if not (width and height and bpp and channels):
+            raise ValueError(
+                "PZP.write: width, height, bpp, and channels are required "
+                "when data is not a numpy array.")
+        if bpp not in (8, 16):
+            raise ValueError(f"PZP.write: bpp must be 8 or 16, got {bpp}")
+
+        w, h, pixel_bpp, c = width, height, bpp, channels
+        raw = bytes(data)
+
+    expected = w * h * c * (pixel_bpp // 8)
+    if len(raw) != expected:
+        raise ValueError(
+            f"PZP.write: pixel buffer is {len(raw)} bytes, "
+            f"expected {expected} ({w}×{h}×{c}ch×{pixel_bpp//8}B)")
+
+    buf   = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+    fname = filename.encode(sys.getfilesystemencoding())
+
+    rc = _lib.pzp_compress_file(buf, w, h, pixel_bpp, c, cfg, fname)
+    if rc == 0:
+        raise RuntimeError(f"PZP.write: compression failed for '{filename}'")

@@ -280,10 +280,8 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
-//This function is ChatGPT generated and is crappy and incorrect
 static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
-    fprintf(stderr,YELLOW "pzp_extractAndReconstruct_SSE2 is incorrect..\n" NORMAL);
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r   = reconstructed;
@@ -294,56 +292,78 @@ static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, un
         {
             case 1:
             {
-                __m128i prev = _mm_setzero_si128();
+                // Kogge-Stone prefix scan within each 16-byte block.
+                // Each step doubles the reach: shifts of 1, 2, 4, 8 cover all 16 positions.
+                // Cross-block carry is the last accumulated byte, broadcast to all lanes.
+                __m128i carry = _mm_setzero_si128();
                 unsigned int i = 0;
 
-                // Process 16 bytes at a time
                 for (; i + 15 < total_size; i += 16)
                 {
-                    __m128i current = _mm_loadu_si128((__m128i*)(src + i));
-                    __m128i shifted = _mm_slli_si128(current, 1);
-                    __m128i result = _mm_add_epi8(current, _mm_add_epi8(shifted, prev));
-                    _mm_storeu_si128((__m128i*)(r + i), result);
-                    prev = _mm_srli_si128(result, 15);
+                    __m128i v = _mm_loadu_si128((__m128i *)(src + i));
+
+                    // Within-block prefix sum
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 1));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
+
+                    // Add cross-block carry to every element
+                    v = _mm_add_epi8(v, carry);
+                    _mm_storeu_si128((__m128i *)(r + i), v);
+
+                    // Carry for next block: extract last byte and broadcast to all 16 lanes
+                    unsigned char last = (unsigned char)_mm_cvtsi128_si32(_mm_srli_si128(v, 15));
+                    carry = _mm_set1_epi8((char)last);
                 }
 
-                // Process remaining bytes
+                // Scalar tail (also handles total_size < 16)
                 for (; i < total_size; i++)
                 {
-                    r[i] = src[i] + r[i - 1];
+                    r[i] = src[i] + (i > 0 ? r[i - 1] : 0);
                 }
                 break;
             }
             case 2:
             {
-                __m128i prev = _mm_setzero_si128();
+                // Each channel accumulates independently with stride 2.
+                // Kogge-Stone with shifts 2, 4, 8 covers all 8 pixel pairs in 16 bytes.
+                // Carry = last pixel (2 bytes), broadcast to all 8 pixel positions.
+                __m128i carry = _mm_setzero_si128();
                 unsigned int i = 0;
 
-                // Process 8 pixels (16 bytes) at a time
                 for (; i + 7 < total_size; i += 8)
                 {
-                    __m128i current = _mm_loadu_si128((__m128i*)(src + i * 2));
-                    __m128i shifted = _mm_slli_si128(current, 2);
-                    __m128i result = _mm_add_epi16(current, _mm_add_epi16(shifted, prev));
-                    _mm_storeu_si128((__m128i*)(r + i * 2), result);
-                    prev = _mm_srli_si128(result, 14);
+                    __m128i v = _mm_loadu_si128((__m128i *)(src + i * 2));
+
+                    // Within-block prefix sum per channel (stride 2)
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
+                    v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
+
+                    // Add cross-block carry to every element
+                    v = _mm_add_epi8(v, carry);
+                    _mm_storeu_si128((__m128i *)(r + i * 2), v);
+
+                    // Carry: last 2 bytes (one pixel) broadcast to all 8 pixel positions.
+                    // _mm_set1_epi16 replicates a 16-bit pattern to all 8 epi16 lanes,
+                    // which is exactly the [ch0_acc, ch1_acc] pair repeated 8 times.
+                    int tmp = _mm_cvtsi128_si32(_mm_srli_si128(v, 14));
+                    carry = _mm_set1_epi16((short)(tmp & 0xFFFF));
                 }
 
-                // Process remaining pixels
+                // Scalar tail (also handles total_size < 8)
                 for (; i < total_size; i++)
                 {
-                    r[i * 2]     = src[i * 2]     + r[(i - 1) * 2];
-                    r[i * 2 + 1] = src[i * 2 + 1] + r[(i - 1) * 2 + 1];
+                    r[i * 2]     = src[i * 2]     + (i > 0 ? r[(i - 1) * 2]     : 0);
+                    r[i * 2 + 1] = src[i * 2 + 1] + (i > 0 ? r[(i - 1) * 2 + 1] : 0);
                 }
                 break;
             }
             case 3:
             {
-                // SSE2 is less efficient for 3-channel data due to alignment issues
-                // Fall back to the naive implementation for 3 channels
-                r[0] = src[0];
-                r[1] = src[1];
-                r[2] = src[2];
+                // 3-channel stride (3 bytes) doesn't align to SSE2 boundaries — scalar fallback.
+                r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
                 for (unsigned int i = 1; i < total_size; i++)
                 {
                     r   += 3;
@@ -356,11 +376,7 @@ static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, un
             }
             default:
             {
-                // Fall back to the naive implementation for other channel counts
-                for (unsigned int ch = 0; ch < channels; ch++)
-                {
-                    r[ch] = src[ch];
-                }
+                for (unsigned int ch = 0; ch < channels; ch++) { r[ch] = src[ch]; }
                 for (unsigned int i = 1; i < total_size; i++)
                 {
                     for (unsigned int ch = 0; ch < channels; ch++)
@@ -372,59 +388,9 @@ static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, un
             }
         }
     }
-    else // Non-RLE path
+    else // Non-RLE: data is already in final interleaved layout
     {
-        switch (channels)
-        {
-            case 1:
-                memcpy(reconstructed, src, total_size);
-                break;
-            case 2:
-            {
-                unsigned int i = 0;
-
-                // Process 16 bytes (8 pixels) at a time
-                for (; i + 7 < total_size; i += 8)
-                {
-                    __m128i current = _mm_loadu_si128((__m128i*)(src + i * 2));
-                    _mm_storeu_si128((__m128i*)(r + i * 2), current);
-                }
-
-                // Process remaining pixels
-                for (; i < total_size; i++)
-                {
-                    r[i * 2]     = src[i * 2];
-                    r[i * 2 + 1] = src[i * 2 + 1];
-                }
-                break;
-            }
-            case 3:
-            {
-                // Fall back to the naive implementation for 3 channels
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    *r = *src;
-                    r++; src++;
-                    *r = *src;
-                    r++; src++;
-                    *r = *src;
-                    r++; src++;
-                }
-                break;
-            }
-            default:
-            {
-                // Fall back to the naive implementation for other channel counts
-                for (unsigned int i = 0; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        reconstructed[i * channels + ch] = src[i * channels + ch];
-                    }
-                }
-                break;
-            }
-        }
+        memcpy(r, src, total_size * channels);
     }
 }
 
@@ -755,13 +721,8 @@ static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, u
 //-----------------------------------------------------------------------------------------------
 static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
-   // Force Naive implementation since AVX2 does not produce accurate results (yet)
-   pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-   return;
-
    #if INTEL_OPTIMIZATIONS
-     //pzp_extractAndReconstruct_SSE2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
-     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     pzp_extractAndReconstruct_SSE2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
    #endif // INTEL_OPTIMIZATIONS

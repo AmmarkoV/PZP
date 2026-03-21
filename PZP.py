@@ -120,8 +120,17 @@ except ImportError:
 
 def _decode(filename: str):
     """
-    Call the C decompressor and return (raw_bytes, meta_dict).
-    The raw buffer is freed before this function returns.
+    Call the C decompressor and return (raw_buf, meta_dict).
+
+    raw_buf is:
+      - a numpy uint8 ndarray of shape (n_bytes,) when numpy is available
+      - a bytes object otherwise
+    The C buffer is freed before this function returns.
+
+    Performance note: ctypes POINTER slicing (ptr[:n]) creates a Python list of
+    integer objects — O(n) Python-level work for large images.  Instead we cast
+    to a ctypes Array and use the buffer protocol, so the copy is a single
+    C-level memcpy regardless of image size.
     """
     filename_b = filename.encode(sys.getfilesystemencoding())
 
@@ -157,8 +166,19 @@ def _decode(filename: str):
     # Buffer size = width * height * channelsInternal * (bppInternal / 8)
     n_bytes = w * h * ci * (bi // 8)
 
-    # Copy out of C-owned memory before freeing
-    raw = bytes(ptr[:n_bytes])
+    # Fast copy: reinterpret the C pointer as a fixed-size Array so Python can
+    # use the buffer protocol (single C-level memcpy) instead of iterating.
+    addr  = ctypes.cast(ptr, ctypes.c_void_p).value
+    c_arr = (ctypes.c_ubyte * n_bytes).from_address(addr)
+
+    if _NUMPY:
+        # np.ctypeslib.as_array gives a zero-copy VIEW of C memory.
+        # .copy() triggers one C-level memcpy into a Python-owned buffer.
+        raw_buf = np.ctypeslib.as_array(c_arr).copy()
+    else:
+        # bytes() on a ctypes Array uses the buffer protocol → one C memcpy.
+        raw_buf = bytes(c_arr)
+
     _lib.pzp_free(ptr)
 
     meta = {
@@ -170,7 +190,7 @@ def _decode(filename: str):
         "ch_internal":    ci,
         "configuration":  config.value,
     }
-    return raw, meta
+    return raw_buf, meta
 
 
 # ---------------------------------------------------------------------------
@@ -194,22 +214,25 @@ def read(filename: str, *, return_flags: bool = False):
         When True, return a (array, flags) tuple instead of just the array.
         flags is an int bitfield (USE_COMPRESSION | USE_RLE | USE_PALETTE …).
     """
-    raw, meta = _decode(filename)
+    raw_buf, meta = _decode(filename)
 
-    w    = meta["width"]
-    h    = meta["height"]
-    be   = meta["bpp"]          # external bits-per-pixel (per channel)
-    ce   = meta["channels"]     # external channel count
+    w     = meta["width"]
+    h     = meta["height"]
+    be    = meta["bpp"]          # external bits-per-pixel (per channel)
+    ce    = meta["channels"]     # external channel count
     flags = meta["configuration"]
 
     if _NUMPY:
+        # raw_buf is already an owned numpy uint8 array (single memcpy in _decode).
+        # Reshape / reinterpret without any additional copy where possible.
         if be == 8:
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, ce)
+            # reshape is O(1) — returns a view of the already-owned buffer.
+            arr = raw_buf.reshape(h, w, ce)
         elif be == 16:
             # PNM stores 16-bit values big-endian; the PZP internal split
             # preserves that byte order (hi-byte channel first, lo-byte second).
-            arr = np.frombuffer(raw, dtype=">u2").reshape(h, w, ce)
-            arr = arr.astype(np.uint16)   # convert to native endian
+            # .view() is O(1); .astype() makes one copy to convert byte-order.
+            arr = raw_buf.view(dtype=">u2").reshape(h, w, ce).astype(np.uint16)
         else:
             raise ValueError(f"PZP: unsupported bit depth {be}")
 
@@ -218,13 +241,14 @@ def read(filename: str, *, return_flags: bool = False):
         if ce == 1:
             arr = arr[:, :, 0]
 
-        # Return a writable copy so the caller can modify it freely
-        result = arr.copy()
-        return (result, flags) if return_flags else result
+        # For 8-bit the array already owns its memory (from the copy in _decode).
+        # For 16-bit astype() already produced an owned array.
+        # Callers receive a writable, owned array in both cases.
+        return (arr, flags) if return_flags else arr
 
     # Fallback: no numpy
     result = {
-        "data":          raw,
+        "data":          raw_buf,
         "width":         w,
         "height":        h,
         "channels":      ce,

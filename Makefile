@@ -12,7 +12,12 @@ DPZP = dpzp
 SPZP = spzp
 LIBPZP = libpzp.so
 
-.PHONY: all clean test
+PREFIX  ?= /usr/local
+BINDIR  = $(PREFIX)/bin
+LIBDIR  = $(PREFIX)/lib
+INCDIR  = $(PREFIX)/include
+
+.PHONY: all clean test install uninstall
 
 all: $(PZP) $(DPZP) $(SPZP) $(LIBPZP)
 
@@ -64,6 +69,21 @@ stest: all $(OUTDIR)
 	./$(SPZP) decompress $(OUTDIR)/rgb8.pzp $(OUTDIR)/rgb8Recode.ppm 
 	./$(SPZP) compress samples/segment.ppm $(OUTDIR)/segment.pzp
 	./$(SPZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm 
+
+install: $(PZP) $(LIBPZP)
+	install -d $(DESTDIR)$(BINDIR)
+	install -d $(DESTDIR)$(LIBDIR)
+	install -d $(DESTDIR)$(INCDIR)
+	install -m 755 $(PZP) $(DESTDIR)$(BINDIR)/$(PZP)
+	install -m 644 $(LIBPZP) $(DESTDIR)$(LIBDIR)/$(LIBPZP)
+	install -m 644 pzp.h $(DESTDIR)$(INCDIR)/pzp.h
+	ldconfig $(DESTDIR)$(LIBDIR)
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(PZP)
+	rm -f $(DESTDIR)$(LIBDIR)/$(LIBPZP)
+	rm -f $(DESTDIR)$(INCDIR)/pzp.h
+	ldconfig $(DESTDIR)$(LIBDIR)
 
 debug: all $(OUTDIR)
 	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --track-origins=yes --num-callers=20 --track-fds=yes ./$(DPZP) compress samples/sample.ppm $(OUTDIR)/sample.pzp 2>log1.txt

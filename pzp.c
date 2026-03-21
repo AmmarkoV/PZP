@@ -243,7 +243,7 @@ int main(int argc, char *argv[])
 {
     if (argc != 4)
     {
-        fprintf(stderr, "Usage: %s <compress|decompress> <input_file> <output_prefix>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <compress|compress-palette|decompress> <input_file> <output_file>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -253,8 +253,9 @@ int main(int argc, char *argv[])
 
     unsigned int configuration = 0;
     int performCompression     = 0;
-    if (strcmp(operation, "compress") == 0) { performCompression=1; configuration = USE_COMPRESSION | USE_RLE; } else
-    if (strcmp(operation, "pack") == 0)     { performCompression=1; configuration = USE_COMPRESSION; }
+    if (strcmp(operation, "compress") == 0)         { performCompression=1; configuration = USE_COMPRESSION | USE_RLE; } else
+    if (strcmp(operation, "compress-palette") == 0) { performCompression=1; configuration = USE_COMPRESSION | USE_RLE | USE_PALETTE; } else
+    if (strcmp(operation, "pack") == 0)             { performCompression=1; configuration = USE_COMPRESSION; }
 
     if (performCompression)
     {
@@ -300,12 +301,8 @@ int main(int argc, char *argv[])
 
            pzp_split_channels(image, buffers, channelsInternal, width, height);
 
-           if (configuration & USE_RLE)
-           {
-            fprintf(stderr,"Using RLE for compression (mode %u)\n",configuration);
-            pzp_RLE_filter(buffers, channelsInternal, width, height);
-           }
-
+           // RLE filter and palette encoding are now handled inside pzp_compress_combined
+           // in the correct order: palette first, then delta filter.
            pzp_compress_combined(buffers, width,height, bitsperpixel,channels, bitsperpixelInternal, channelsInternal, configuration, output_commandline_parameter);
 
            //Deallocate intermediate buffers..

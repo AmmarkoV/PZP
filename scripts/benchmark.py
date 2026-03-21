@@ -236,10 +236,10 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
 
     original = load_image(src, imread_flag)
 
-    hdr = (f"  {'TARGET':<18}  {'COMPRESS':>10}  {'DECOMP (net)':>20}  "
+    hdr = (f"  {'TARGET':<28}  {'COMPRESS':>10}  {'DECOMP (net)':>20}  "
            f"{'PZP SIZE':>10}  {'RATIO':>6}  PIXELS")
     print(f"\n{hdr}")
-    print(f"  {'-'*18}  {'-'*10}  {'-'*20}  {'-'*10}  {'-'*6}  {'─'*30}")
+    print(f"  {'-'*28}  {'-'*10}  {'-'*20}  {'-'*10}  {'-'*6}  {'─'*30}")
 
     rows = []
     with tempfile.TemporaryDirectory(prefix="pzp_bench_") as tmp:
@@ -259,31 +259,43 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
         spawn_overhead_ms = measure_subprocess_overhead(
             next(iter(active_binaries.values())), runs=max(runs, 8))
 
-        for label, binary in active_binaries.items():
-            cmp_ms, (rc, _) = time_fn(
-                lambda: run_binary([binary, "compress", pnm_src, pzp_path]), runs)
-            if rc != 0:
-                print(f"  {label}  COMPRESS FAILED"); continue
+        # Modes to benchmark: standard (compress) and palette (compress-palette).
+        modes = [("compress", "")]
+        # Check if the first binary supports compress-palette.
+        _probe_path = os.path.join(tmp, "probe.pzp")
+        _probe_rc, _ = run_binary([next(iter(active_binaries.values())),
+                                   "compress-palette", pnm_src, _probe_path])
+        if _probe_rc == 0:
+            modes.append(("compress-palette", " [pal]"))
 
-            pzp_size = os.path.getsize(pzp_path)
-            ratio    = ratio_base / pzp_size
+        for compress_cmd, mode_tag in modes:
+            if mode_tag:
+                print(f"\n  {col('── palette mode' + ' ─'*27, CYAN)}")
+            for label, binary in active_binaries.items():
+                tag = label.rstrip() + mode_tag
+                cmp_ms, (rc, _) = time_fn(
+                    lambda: run_binary([binary, compress_cmd, pnm_src, pzp_path]), runs)
+                if rc != 0:
+                    print(f"  {tag}  COMPRESS FAILED"); continue
 
-            dmp_ms, (rc, _) = time_fn(
-                lambda: run_binary([binary, "decompress", pzp_path, out_ppm]), runs)
-            if rc != 0:
-                print(f"  {label}  DECOMPRESS FAILED"); continue
+                pzp_size = os.path.getsize(pzp_path)
+                ratio    = ratio_base / pzp_size
 
-            recon = load_image(out_ppm, imread_flag)
-            identical, max_diff, psnr = compare(original, recon)
-            px = pixel_label(identical, max_diff, psnr)
+                dmp_ms, (rc, _) = time_fn(
+                    lambda: run_binary([binary, "decompress", pzp_path, out_ppm]), runs)
+                if rc != 0:
+                    print(f"  {tag}  DECOMPRESS FAILED"); continue
 
-            # Net decode = measured time minus spawn overhead
-            net_ms = max(dmp_ms - spawn_overhead_ms, 0.0)
+                recon = load_image(out_ppm, imread_flag)
+                identical, max_diff, psnr = compare(original, recon)
+                px = pixel_label(identical, max_diff, psnr)
 
-            print(f"  {label}  {fmt_ms(cmp_ms)}  {fmt_ms(dmp_ms)}"
-                  f" ({fmt_ms(net_ms).strip()} net)  "
-                  f"{fmt_bytes(pzp_size):>10}  {ratio:5.2f}×  {px}")
-            rows.append((label, cmp_ms, net_ms, pzp_size, ratio, identical))
+                net_ms = max(dmp_ms - spawn_overhead_ms, 0.0)
+
+                print(f"  {tag:<28}  {fmt_ms(cmp_ms)}  {fmt_ms(dmp_ms)}"
+                      f" ({fmt_ms(net_ms).strip()} net)  "
+                      f"{fmt_bytes(pzp_size):>10}  {ratio:5.2f}×  {px}")
+                rows.append((tag, cmp_ms, net_ms, pzp_size, ratio, identical))
 
     # OpenCV native decode for the same image.
     # Compare against net (subprocess-overhead-corrected) PZP times so the

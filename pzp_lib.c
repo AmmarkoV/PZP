@@ -77,9 +77,7 @@ int pzp_compress_file(
 
     pzp_split_channels(pixels, buffers, channels_internal, width, height);
 
-    if (configuration & USE_RLE)
-        pzp_RLE_filter(buffers, channels_internal, width, height);
-
+    // RLE filter and palette encoding are handled inside pzp_compress_combined.
     pzp_compress_combined(buffers, width, height,
                           bpp, channels,
                           bpp_internal, channels_internal,

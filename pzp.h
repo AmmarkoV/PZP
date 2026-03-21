@@ -58,8 +58,8 @@ static const int headerSize =  sizeof(unsigned int) * 10;
 typedef enum
 {
     USE_COMPRESSION = 1 << 0,  // 0001
-    USE_RLE         = 1 << 1,  // 0010
-    TEST_FLAG1      = 1 << 2,  // 0100
+    USE_RLE         = 1 << 1,  // 0010 — delta/prefix-sum filter before zstd
+    USE_PALETTE     = 1 << 2,  // 0100 — per-channel palette indexing (best for images with few unique colors)
     TEST_FLAG2      = 1 << 3   // 1000
 } PZPFlags;
 
@@ -101,6 +101,79 @@ static unsigned int hash_checksum(const void *data, size_t dataSize)
     return (h1 ^ (h2 >> 3)) + (h3 ^ (h4 << 5));
 }
 
+
+// ─── Per-channel palette helpers ────────────────────────────────────────────
+
+/* Build a sorted palette per channel from the split (planar) buffers, then
+   re-encode each buffer in-place: pixel value → palette index (0-based).
+   palette[ch][i] = the i-th unique value in channel ch (ascending order).
+   counts[ch]     = number of unique values in channel ch (1-256).
+   Returns the total serialised byte count for all palettes
+   (sum over channels of: 1 byte count-field + counts[ch] bytes values). */
+static unsigned int pzp_palette_build_and_encode(
+        unsigned char **buffers, unsigned int pixels, unsigned int channels,
+        unsigned char palette[8][256], unsigned int counts[8])
+{
+    unsigned int total_bytes = 0;
+    for (unsigned int ch = 0; ch < channels; ch++)
+    {
+        unsigned char present[256] = {0};
+        for (unsigned int i = 0; i < pixels; i++) present[buffers[ch][i]] = 1;
+
+        unsigned char inv[256];
+        unsigned int cnt = 0;
+        for (unsigned int v = 0; v < 256; v++)
+            if (present[v]) { inv[v] = (unsigned char)cnt; palette[ch][cnt++] = (unsigned char)v; }
+
+        counts[ch] = cnt;
+        total_bytes += 1 + cnt; /* 1 byte (count-1 field) + cnt bytes values */
+
+        for (unsigned int i = 0; i < pixels; i++) buffers[ch][i] = inv[buffers[ch][i]];
+    }
+    return total_bytes;
+}
+
+/* Serialize palette data to dst. Returns bytes written. */
+static unsigned int pzp_palette_write(
+        unsigned char *dst, unsigned int channels,
+        unsigned char palette[8][256], unsigned int counts[8])
+{
+    unsigned int off = 0;
+    for (unsigned int ch = 0; ch < channels; ch++)
+    {
+        dst[off++] = (unsigned char)(counts[ch] - 1); /* stored as count-1 so 256 fits in 1 byte */
+        memcpy(dst + off, palette[ch], counts[ch]);
+        off += counts[ch];
+    }
+    return off;
+}
+
+/* Parse palette data from src. Returns bytes consumed. */
+static unsigned int pzp_palette_read(
+        const unsigned char *src, unsigned int channels,
+        unsigned char palette[8][256], unsigned int counts[8])
+{
+    unsigned int off = 0;
+    for (unsigned int ch = 0; ch < channels; ch++)
+    {
+        counts[ch] = (unsigned int)src[off++] + 1;
+        memcpy(palette[ch], src + off, counts[ch]);
+        off += counts[ch];
+    }
+    return off;
+}
+
+/* In-place palette lookup on interleaved pixel data: index → original value. */
+static void pzp_palette_apply(
+        unsigned char *data, unsigned int pixels, unsigned int channels,
+        unsigned char palette[8][256])
+{
+    for (unsigned int i = 0; i < pixels; i++)
+        for (unsigned int ch = 0; ch < channels; ch++)
+            data[i * channels + ch] = palette[ch][data[i * channels + ch]];
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 
 static void * pzp_read_file_to_memory(const char *filename, size_t *fileSize)
 {
@@ -186,49 +259,59 @@ static void pzp_compress_combined(unsigned char **buffers,
                               unsigned int bitsperpixelInternal, unsigned int channelsInternal, unsigned int configuration,
                               const char *output_filename)
 {
-    FILE *output = fopen(output_filename, "wb");
-    if (!output)
+    // ── Step 1: palette encoding (must precede delta filter) ─────────────────
+    // Operates on the original pixel values in the planar buffers[].
+    unsigned char palette[8][256];
+    unsigned int  palette_counts[8];
+    unsigned int  paletteDataBytes = 0;
+
+    if (configuration & USE_PALETTE)
     {
-        fail("File error");
+        paletteDataBytes = pzp_palette_build_and_encode(
+                buffers, width * height, channelsInternal, palette, palette_counts);
+        fprintf(stderr, "Palette mode: %u channels, palette data %u bytes\n",
+                channelsInternal, paletteDataBytes);
+        for (unsigned int ch = 0; ch < channelsInternal; ch++)
+            fprintf(stderr, "  ch%u: %u unique values\n", ch, palette_counts[ch]);
     }
 
-    unsigned int combined_buffer_size = (width * height * (bitsperpixelInternal/8)* channelsInternal) + headerSize;
+    // ── Step 2: delta / RLE filter (on palette indices if USE_PALETTE) ───────
+    if (configuration & USE_RLE)
+    {
+        fprintf(stderr, "Using RLE for compression (mode %u)\n", configuration);
+        pzp_RLE_filter(buffers, channelsInternal, width, height);
+    }
 
-    unsigned int dataSize = combined_buffer_size;       //width * height;
-    fwrite(&dataSize, sizeof(unsigned int), 1, output); // Store size for decompression
+    // ── Step 3: build the combined uncompressed blob ──────────────────────────
+    unsigned int pixel_data_size   = width * height * (bitsperpixelInternal / 8) * channelsInternal;
+    unsigned int combined_buffer_size = headerSize + paletteDataBytes + pixel_data_size;
 
-    //printf("Write size: %d bytes\n", dataSize);
+    FILE *output = fopen(output_filename, "wb");
+    if (!output) { fail("File error"); }
+
+    unsigned int dataSize = combined_buffer_size;
+    fwrite(&dataSize, sizeof(unsigned int), 1, output);
 
     size_t max_compressed_size = ZSTD_compressBound(combined_buffer_size);
     void *compressed_buffer = malloc(max_compressed_size);
-    if (!compressed_buffer)
-    {
-        fail("Memory allocation failed");
-    }
+    if (!compressed_buffer) { fail("Memory allocation failed"); }
 
-    unsigned char *combined_buffer_raw = (unsigned char *) malloc(combined_buffer_size);
-    if (!combined_buffer_raw)
-    {
-        fail("Memory allocation failed");
-    }
+    unsigned char *combined_buffer_raw = (unsigned char *)malloc(combined_buffer_size);
+    if (!combined_buffer_raw) { fail("Memory allocation failed"); }
 
-    // Store header information
-    //---------------------------------------------------------------------------------------------------
-    unsigned int *memStartAsUINT             = (unsigned int*) combined_buffer_raw;
-    //---------------------------------------------------------------------------------------------------
-    unsigned int *headerTarget               = memStartAsUINT + 0; // Move by 1, not sizeof(unsigned int)
-    unsigned int *bitsperpixelTarget         = memStartAsUINT + 1; // Move by 1, not sizeof(unsigned int)
-    unsigned int *channelsTarget             = memStartAsUINT + 2; // Move by 1, not sizeof(unsigned int)
-    unsigned int *widthTarget                = memStartAsUINT + 3; // Move by 1, not sizeof(unsigned int)
-    unsigned int *heightTarget               = memStartAsUINT + 4; // Move by 1, not sizeof(unsigned int)
-    unsigned int *bitsperpixelInternalTarget = memStartAsUINT + 5; // Move by 1, not sizeof(unsigned int)
-    unsigned int *channelsInternalTarget     = memStartAsUINT + 6; // Move by 1, not sizeof(unsigned int)
-    unsigned int *checksumTarget             = memStartAsUINT + 7; // Move by 1, not sizeof(unsigned int)
-    unsigned int *compressionModeTarget      = memStartAsUINT + 8; // Move by 1, not sizeof(unsigned int)
-    unsigned int *unusedTarget               = memStartAsUINT + 9; // Move by 1, not sizeof(unsigned int)
-    //---------------------------------------------------------------------------------------------------
+    // ── Step 4: write header ──────────────────────────────────────────────────
+    unsigned int *memStartAsUINT             = (unsigned int *)combined_buffer_raw;
+    unsigned int *headerTarget               = memStartAsUINT + 0;
+    unsigned int *bitsperpixelTarget         = memStartAsUINT + 1;
+    unsigned int *channelsTarget             = memStartAsUINT + 2;
+    unsigned int *widthTarget                = memStartAsUINT + 3;
+    unsigned int *heightTarget               = memStartAsUINT + 4;
+    unsigned int *bitsperpixelInternalTarget = memStartAsUINT + 5;
+    unsigned int *channelsInternalTarget     = memStartAsUINT + 6;
+    unsigned int *checksumTarget             = memStartAsUINT + 7;
+    unsigned int *compressionModeTarget      = memStartAsUINT + 8;
+    unsigned int *paletteDataSizeTarget      = memStartAsUINT + 9; /* formerly "unused" */
 
-    //Store data to their target location
     *headerTarget               = convert_header(pzp_header);
     *bitsperpixelTarget         = bitsperpixelExternal;
     *channelsTarget             = channelsExternal;
@@ -237,29 +320,36 @@ static void pzp_compress_combined(unsigned char **buffers,
     *bitsperpixelInternalTarget = bitsperpixelInternal;
     *channelsInternalTarget     = channelsInternal;
     *compressionModeTarget      = configuration;
-    *unusedTarget               = 0; //<- Just so that it is not random
+    *paletteDataSizeTarget      = paletteDataBytes;
 
-    // Store separate image planes so that they get better compressed :P
-    unsigned char *combined_buffer = combined_buffer_raw + headerSize;
-    for (int i = 0; i < width*height; i++)
+    // ── Step 5: write palette prefix (if any) then interleaved pixel/index data
+    unsigned char *write_ptr = combined_buffer_raw + headerSize;
+    if (paletteDataBytes > 0)
     {
-        for (unsigned int ch = 0; ch < channelsInternal; ch++)
-        {
-            combined_buffer[i * channelsInternal + ch] = buffers[ch][i];
-        }
+        pzp_palette_write(write_ptr, channelsInternal, palette, palette_counts);
+        write_ptr += paletteDataBytes;
     }
 
-    //Calculate the checksum of the combined buffer
-    *checksumTarget = hash_checksum(combined_buffer,width*height*channelsInternal);
+    // Interleave planar buffers → pixel/index data
+    for (unsigned int i = 0; i < width * height; i++)
+        for (unsigned int ch = 0; ch < channelsInternal; ch++)
+            write_ptr[i * channelsInternal + ch] = buffers[ch][i];
+
+    // Checksum covers only the index/pixel data (not the palette prefix).
+    *checksumTarget = hash_checksum(write_ptr, pixel_data_size);
 
     #if PZP_VERBOSE
-    fprintf(stderr, "Storing %ux%ux%u@%ubit/",width,height,channelsExternal,bitsperpixelExternal);
-    fprintf(stderr, "%u@%ubit",channelsInternal,bitsperpixelInternal);
-    fprintf(stderr, " | mode %u | CRC:0x%X\n", configuration, *checksumTarget);
-    #endif // PZP_VERBOSE
+    fprintf(stderr, "Storing %ux%ux%u@%ubit/%u@%ubit | mode %u | palette %u B | CRC:0x%X\n",
+            width, height, channelsExternal, bitsperpixelExternal,
+            channelsInternal, bitsperpixelInternal,
+            configuration, paletteDataBytes, *checksumTarget);
+    #endif
 
-
-    size_t compressed_size = ZSTD_compress(compressed_buffer, max_compressed_size, combined_buffer_raw, combined_buffer_size, 1);
+    // ── Step 6: ZSTD compress — use higher level when palette mode is active ──
+    int zstd_level = (configuration & USE_PALETTE) ? 19 : 1;
+    size_t compressed_size = ZSTD_compress(
+            compressed_buffer, max_compressed_size,
+            combined_buffer_raw, combined_buffer_size, zstd_level);
     if (ZSTD_isError(compressed_size))
     {
         fprintf(stderr, "Zstd compression error: %s\n", ZSTD_getErrorName(compressed_size));
@@ -267,8 +357,8 @@ static void pzp_compress_combined(unsigned char **buffers,
     }
 
     #if PZP_VERBOSE
-    fprintf(stderr,"Compression Ratio : %0.2f\n", (float) dataSize/compressed_size);
-    #endif // PZP_VERBOSE
+    fprintf(stderr, "Compression Ratio : %0.2f\n", (float)dataSize / compressed_size);
+    #endif
 
     fwrite(compressed_buffer, 1, compressed_size, output);
 
@@ -812,16 +902,17 @@ static unsigned char* pzp_decompress_combined_from_memory(
     unsigned int *channelsInSource        = memStartAsUINT + 6;
     unsigned int *checksumSource          = memStartAsUINT + 7;
     unsigned int *compressionConfigSource = memStartAsUINT + 8;
-    //unsigned int *unusedSource            = memStartAsUINT + 9;
+    unsigned int *paletteDataSizeSource   = memStartAsUINT + 9;
 
     // Move from mapped header memory to our local variables
-    unsigned int bitsperpixelExt = *bitsperpixelExtSource;
-    unsigned int channelsExt     = *channelsExtSource;
-    unsigned int width           = *widthSource;
-    unsigned int height          = *heightSource;
-    unsigned int bitsperpixelIn  = *bitsperpixelInSource;
-    unsigned int channelsIn      = *channelsInSource;
-    unsigned int compressionCfg  = *compressionConfigSource;
+    unsigned int bitsperpixelExt  = *bitsperpixelExtSource;
+    unsigned int channelsExt      = *channelsExtSource;
+    unsigned int width            = *widthSource;
+    unsigned int height           = *heightSource;
+    unsigned int bitsperpixelIn   = *bitsperpixelInSource;
+    unsigned int channelsIn       = *channelsInSource;
+    unsigned int compressionCfg   = *compressionConfigSource;
+    unsigned int paletteDataBytes = *paletteDataSizeSource;
 
 #if PZP_VERBOSE
     fprintf(stderr, "Detected %ux%ux%u@%ubit/", width, height, channelsExt, bitsperpixelExt);
@@ -846,11 +937,19 @@ static unsigned char* pzp_decompress_combined_from_memory(
     *channelsInternalOutput     = channelsIn;
     *configuration              = compressionCfg;
 
-    // Copy decompressed data into the reconstructed buffers
-    unsigned char *decompressed_bytes = (unsigned char *)decompressed_buffer + headerSize;
+    // After the 40-byte header comes optional palette data, then the pixel/index data.
+    unsigned char *after_header = (unsigned char *)decompressed_buffer + headerSize;
+    unsigned char *index_data   = after_header + paletteDataBytes;
 
-    // Fix: validate checksum to detect data corruption
-    unsigned int computedChecksum = hash_checksum(decompressed_bytes, width * height * channelsIn);
+    // Parse palette (if present) before checksum so we can validate index data.
+    unsigned char palette[8][256];
+    unsigned int  palette_counts[8];
+    if (compressionCfg & USE_PALETTE)
+        pzp_palette_read(after_header, channelsIn, palette, palette_counts);
+
+    // Checksum covers the index/pixel data only (not the palette prefix).
+    size_t pixel_size = (size_t)width * height * (bitsperpixelIn / 8) * channelsIn;
+    unsigned int computedChecksum = hash_checksum(index_data, pixel_size);
     if (computedChecksum != *checksumSource)
     {
         free(decompressed_buffer);
@@ -860,25 +959,30 @@ static unsigned char* pzp_decompress_combined_from_memory(
     }
 
     unsigned int restoreRLEChannels = compressionCfg & USE_RLE;
-    size_t pixel_size = (size_t)width * height * (bitsperpixelIn / 8) * channelsIn;
 
+    // ── Non-RLE path ──────────────────────────────────────────────────────────
     if (!restoreRLEChannels)
     {
-        // Non-RLE: pixel data is already in final layout inside decompressed_buffer.
-        // Shift it to the front of the allocation and return directly —
-        // saves one malloc + memcpy. Caller frees the returned pointer as usual.
-        memmove(decompressed_buffer, decompressed_bytes, pixel_size);
+        memmove(decompressed_buffer, index_data, pixel_size);
+        if (compressionCfg & USE_PALETTE)
+            pzp_palette_apply((unsigned char *)decompressed_buffer,
+                              width * height, channelsIn, palette);
         return (unsigned char *)decompressed_buffer;
     }
 
-    // RLE path: need a separate output buffer for the prefix-sum reconstruction.
+    // ── RLE path ──────────────────────────────────────────────────────────────
     unsigned char *reconstructed = malloc(pixel_size);
-    if (reconstructed != NULL)
+    if (reconstructed == NULL)
     {
-        pzp_extractAndReconstruct(decompressed_bytes, reconstructed, width, height, channelsIn, restoreRLEChannels);
+        free(decompressed_buffer);
+        return NULL;
     }
-
+    pzp_extractAndReconstruct(index_data, reconstructed, width, height, channelsIn, restoreRLEChannels);
     free(decompressed_buffer);
+
+    if (compressionCfg & USE_PALETTE)
+        pzp_palette_apply(reconstructed, width * height, channelsIn, palette);
+
     return reconstructed;
 }
 

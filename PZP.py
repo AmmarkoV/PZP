@@ -9,8 +9,15 @@ Usage:
     meta = PZP.info("image.pzp")         # metadata dict without decoding pixels
 
     # Compress
-    PZP.write("out.pzp", img)            # from numpy array (uint8 or uint16)
-    PZP.write("out.pzp", img, use_rle=True)  # enable delta pre-filter
+    PZP.write("out.pzp", img)                            # default: zstd only
+    PZP.write("out.pzp", img, use_rle=True)              # + delta pre-filter
+    PZP.write("out.pzp", img, use_palette=True)          # + palette indexing
+    PZP.write("out.pzp", img, use_rle=True, use_palette=True)  # all filters
+
+    # Inspect which flags were used when the file was written
+    arr, flags = PZP.read("image.pzp", return_flags=True)
+    if flags & PZP.USE_PALETTE:
+        print("palette mode")
 
     # Without numpy — pass raw bytes explicitly
     PZP.write("out.pzp", raw_bytes, width=640, height=360, bpp=8, channels=3)
@@ -31,6 +38,8 @@ If numpy is not available, read() returns a dict:
 Configuration flags (pass to write() as configuration=):
     USE_COMPRESSION = 1   # always enabled; zstd entropy coding
     USE_RLE         = 2   # delta pre-filter (improves ratio for smooth images)
+    USE_PALETTE     = 4   # per-channel palette indexing (best for images with few
+                          # unique values per channel, e.g. segmentation maps)
 """
 
 import ctypes
@@ -93,6 +102,7 @@ _lib.pzp_compress_file.argtypes = [
 
 USE_COMPRESSION = 1
 USE_RLE         = 2
+USE_PALETTE     = 4
 
 # ---------------------------------------------------------------------------
 # Optional numpy support
@@ -167,7 +177,7 @@ def _decode(filename: str):
 # Public API
 # ---------------------------------------------------------------------------
 
-def read(filename: str):
+def read(filename: str, *, return_flags: bool = False):
     """
     Decompress a PZP file and return the pixel data.
 
@@ -177,13 +187,20 @@ def read(filename: str):
 
     Without numpy: returns dict with keys 'data', 'width', 'height',
                    'channels', 'bpp'.
+
+    Parameters
+    ----------
+    return_flags : bool
+        When True, return a (array, flags) tuple instead of just the array.
+        flags is an int bitfield (USE_COMPRESSION | USE_RLE | USE_PALETTE …).
     """
     raw, meta = _decode(filename)
 
-    w  = meta["width"]
-    h  = meta["height"]
-    be = meta["bpp"]          # external bits-per-pixel (per channel)
-    ce = meta["channels"]     # external channel count
+    w    = meta["width"]
+    h    = meta["height"]
+    be   = meta["bpp"]          # external bits-per-pixel (per channel)
+    ce   = meta["channels"]     # external channel count
+    flags = meta["configuration"]
 
     if _NUMPY:
         if be == 8:
@@ -202,16 +219,19 @@ def read(filename: str):
             arr = arr[:, :, 0]
 
         # Return a writable copy so the caller can modify it freely
-        return arr.copy()
+        result = arr.copy()
+        return (result, flags) if return_flags else result
 
     # Fallback: no numpy
-    return {
-        "data":     raw,
-        "width":    w,
-        "height":   h,
-        "channels": ce,
-        "bpp":      be,
+    result = {
+        "data":          raw,
+        "width":         w,
+        "height":        h,
+        "channels":      ce,
+        "bpp":           be,
+        "configuration": flags,
     }
+    return (result, flags) if return_flags else result
 
 
 def info(filename: str) -> dict:
@@ -227,6 +247,7 @@ def write(filename: str, data, *,
           width: int = 0, height: int = 0,
           bpp: int = 0, channels: int = 0,
           use_rle: bool = False,
+          use_palette: bool = False,
           configuration: int = USE_COMPRESSION) -> None:
     """
     Compress pixel data and write a .pzp file.
@@ -247,9 +268,13 @@ def write(filename: str, data, *,
     use_rle : bool
         Enable the delta pre-filter (improves ratio for smooth / gradient images).
         Adds USE_RLE to the configuration bitfield.
+    use_palette : bool
+        Enable per-channel palette indexing.  Best for images with few unique
+        values per channel (e.g. segmentation maps, label images).
+        Adds USE_PALETTE to the configuration bitfield.
     configuration : int
         Full configuration bitfield.  USE_COMPRESSION (1) is always or'd in.
-        Prefer use_rle=True for the common case.
+        Prefer the convenience booleans (use_rle, use_palette) for common cases.
 
     Raises
     ------
@@ -260,6 +285,8 @@ def write(filename: str, data, *,
     cfg = configuration | USE_COMPRESSION
     if use_rle:
         cfg |= USE_RLE
+    if use_palette:
+        cfg |= USE_PALETTE
 
     if _NUMPY and isinstance(data, np.ndarray):
         arr = data

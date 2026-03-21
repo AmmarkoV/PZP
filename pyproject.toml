@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pzp"
+version = "0.1.0"
+description = "Python bindings for the PZP lossless image codec"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.8"
+# numpy is optional; the package works without it (returns raw bytes)
+dependencies = []
+
+[project.optional-dependencies]
+numpy = ["numpy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pzp = ["libpzp.so", "libpzp.dylib", "pzp.dll"]

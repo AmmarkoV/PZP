@@ -36,7 +36,7 @@ for file in "$INPUT_DIR"/*.{jpg,jpeg,png,bmp,tiff,tif}; do
     fi
 
     # Compress using pzp
-    ./pzp compress temporary.ppm "$OUTPUT_DIR/$FILENAME_NO_EXT.pzp"
+    ./pzp compress-palette temporary.ppm "$OUTPUT_DIR/$FILENAME_NO_EXT.pzp"
     if [ $? -ne 0 ]; then
         echo "Error: pzp compression failed for $file"
         exit 4

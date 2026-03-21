@@ -52,10 +52,11 @@ BINARIES = {
 
 # Built-in sample files: name → (cv2 imread flag, description)
 SAMPLES = {
-    "sample.ppm":  (cv2.IMREAD_COLOR,                           "256×256  3ch  8-bit  PPM"),
-    "segment.ppm": (cv2.IMREAD_COLOR,                           "480×640  3ch  8-bit  PPM"),
-    "rgb8.pnm":    (cv2.IMREAD_COLOR,                           "640×360  3ch  8-bit  PNM"),
-    "depth16.pnm": (cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR, "640×360  1ch 16-bit  PNM"),
+    "sample.ppm":   (cv2.IMREAD_COLOR,                           "256×256  3ch  8-bit  PPM"),
+    "segment.ppm":  (cv2.IMREAD_COLOR,                           "480×640  3ch  8-bit  PPM"),
+    "segment.png":  (cv2.IMREAD_COLOR,                           "480×640  3ch  8-bit  PNG"),
+    "rgb8.pnm":     (cv2.IMREAD_COLOR,                           "640×360  3ch  8-bit  PNM"),
+    "depth16.pnm":  (cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR,  "640×360  1ch 16-bit  PNM"),
 }
 
 # Files that have equivalent other-format siblings for cross-format timing
@@ -63,6 +64,9 @@ EQUIVALENT_FORMATS = {
     "rgb8.pnm": [
         ("PNG", os.path.join(SAMPLES_DIR, "rgb8.png")),
         ("JPG", os.path.join(SAMPLES_DIR, "rgb8.jpg")),
+    ],
+    "segment.png": [
+        ("PPM", os.path.join(SAMPLES_DIR, "segment.ppm")),
     ],
 }
 
@@ -181,6 +185,26 @@ def discover_files(source_dir, max_files=None):
 # Sample-mode benchmark (original behaviour)
 # ─────────────────────────────────────────────────────────────────────────────
 
+PNM_EXTENSIONS = {".ppm", ".pnm", ".pgm"}
+
+
+def _ensure_pnm(src, imread_flag, tmp):
+    """Return (path_for_pzp, pnm_size, converted).
+
+    If *src* is already a PNM/PPM/PGM it is returned unchanged.
+    Otherwise the image is decoded by OpenCV and written to a temp PPM so
+    that the PZP binary (which has no libpng/libjpeg dependency) can read it.
+    """
+    if os.path.splitext(src)[1].lower() in PNM_EXTENSIONS:
+        return src, os.path.getsize(src), False
+    ppm_path = os.path.join(tmp, "src_converted.ppm")
+    img = cv2.imread(src, imread_flag)
+    if img is None:
+        raise RuntimeError(f"cv2.imread failed: {src}")
+    cv2.imwrite(ppm_path, img)
+    return ppm_path, os.path.getsize(ppm_path), True
+
+
 def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
     src      = os.path.join(SAMPLES_DIR, sample_name)
     raw_size = os.path.getsize(src)
@@ -198,17 +222,26 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
 
     rows = []
     with tempfile.TemporaryDirectory(prefix="pzp_bench_") as tmp:
+        # Pre-convert to PPM once if the source is PNG/JPG (PZP has no
+        # libpng/libjpeg dependency, so it can only read PNM/PPM/PGM).
+        pnm_src, pnm_size, was_converted = _ensure_pnm(src, imread_flag, tmp)
+        if was_converted:
+            print(col(f"  [note] converted to temp PPM for PZP binary  "
+                      f"({fmt_bytes(raw_size)} → {fmt_bytes(pnm_size)})", CYAN))
+        # Ratio is always reported vs the uncompressed pixel data (PPM form).
+        ratio_base = pnm_size
+
         pzp_path = os.path.join(tmp, "bench.pzp")
         out_ppm  = os.path.join(tmp, "bench_out.ppm")
 
         for label, binary in active_binaries.items():
             cmp_ms, (rc, _) = time_fn(
-                lambda: run_binary([binary, "compress", src, pzp_path]), runs)
+                lambda: run_binary([binary, "compress", pnm_src, pzp_path]), runs)
             if rc != 0:
                 print(f"  {label}  COMPRESS FAILED"); continue
 
             pzp_size = os.path.getsize(pzp_path)
-            ratio    = raw_size / pzp_size
+            ratio    = ratio_base / pzp_size
 
             dmp_ms, (rc, _) = time_fn(
                 lambda: run_binary([binary, "decompress", pzp_path, out_ppm]), runs)
@@ -224,13 +257,28 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
             rows.append((label, cmp_ms, dmp_ms, pzp_size, ratio, identical))
 
     # OpenCV native decode for the same image
+    best_pzp_ms   = min((r[2] for r in rows), default=None)
+    best_pzp_label = (min(rows, key=lambda r: r[2])[0].strip()
+                      if rows else "pzp")
+
+    def speedup_label(fmt_ms_val):
+        """Percentage by which best-PZP decompress is faster than fmt_ms_val.
+        Positive = PZP is faster; negative = PZP is slower."""
+        if best_pzp_ms is None or fmt_ms_val == 0:
+            return ""
+        pct = (fmt_ms_val - best_pzp_ms) / fmt_ms_val * 100
+        if pct >= 0:
+            return col(f"+{pct:.0f}% vs {best_pzp_label}", GREEN)
+        else:
+            return col(f"{pct:.0f}% vs {best_pzp_label}", RED)
+
     print()
-    print(f"  {'FORMAT':<18}  {'DECODE':>10}  PIXELS vs original")
-    print(f"  {'-'*18}  {'-'*10}  {'─'*40}")
+    print(f"  {'FORMAT':<18}  {'DECODE':>10}  {'PZP SPEEDUP':>13}  PIXELS vs original")
+    print(f"  {'-'*18}  {'-'*10}  {'-'*13}  {'─'*40}")
 
     ext = os.path.splitext(sample_name)[1].upper().lstrip(".")
     cv_ms, _ = time_fn(lambda: load_image(src, imread_flag), runs * 2)
-    print(f"  cv2  {ext:<13}  {fmt_ms(cv_ms)}  (ground truth)")
+    print(f"  cv2  {ext:<13}  {fmt_ms(cv_ms)}  {speedup_label(cv_ms):>13}  (ground truth)")
 
     for fmt_label, fmt_path in EQUIVALENT_FORMATS.get(sample_name, []):
         if not os.path.exists(fmt_path):
@@ -238,7 +286,8 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
         eq_ms, _ = time_fn(lambda p=fmt_path: load_image(p), runs * 2)
         eq_img = load_image(fmt_path)
         identical, max_diff, psnr = compare(original, eq_img)
-        print(f"  cv2  {fmt_label:<13}  {fmt_ms(eq_ms)}  {pixel_label(identical, max_diff, psnr)}")
+        print(f"  cv2  {fmt_label:<13}  {fmt_ms(eq_ms)}  {speedup_label(eq_ms):>13}  "
+              f"{pixel_label(identical, max_diff, psnr)}")
 
     print()
     return rows

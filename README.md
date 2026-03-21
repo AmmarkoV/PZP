@@ -1,6 +1,7 @@
 # PZP — Portable Zipped PNM
 
-An experimental, minimal, header-only image compression library written in C.
+An experimental, minimal, header-only image compression library written in C,
+with Python bindings and a pip-installable package.
 
 ---
 
@@ -13,11 +14,43 @@ better compression than raw PNM/PPM, and a simpler implementation than PNG.
 Goals:
 1. Header-only C implementation (`pzp.h`) — drop `#include "pzp.h"` and go
 2. Supports 8-bit and 16-bit Monochrome / RGB images
-3. Decode speed competitive with PNG
+3. Decode speed faster than PNG for real-world datasets
 4. Compression ratio better than PNG on many image types
-5. Python bindings via ctypes (`PZP.py`) for use in data-loading pipelines
+5. Optional per-channel palette indexing for label / segmentation maps
+6. Python bindings via ctypes — installable with `pip`
 
 Similar projects: [QOI](https://github.com/phoboslab/qoi), [ZPNG](https://github.com/catid/Zpng)
+
+---
+
+## Performance
+
+Benchmarked against `cv2.imread` (libpng) on 500 COCO val2017 panoptic
+segmentation images (3-channel uint8 RGB label maps, varying resolutions).
+All times are in-process (no subprocess overhead) using `libpzp.so` + ctypes.
+
+```
+Pass   PNG total   PZP total    PNG/img    PZP/img         Δ
+------------------------------------------------------------
+   1     1152.8ms      513.0ms     2.306ms     1.026ms  +55.5%
+   2     1147.2ms      510.4ms     2.294ms     1.021ms  +55.5%
+   3     1141.2ms      500.6ms     2.282ms     1.001ms  +56.1%
+------------------------------------------------------------
+best     1141.2ms      500.6ms     2.282ms     1.001ms  +56.1%
+
+  Best PNG total : 1141.2 ms  (2.282 ms/img)
+  Best PZP total :  500.6 ms  (1.001 ms/img)
+  Winner         : PZP  (2.28× faster, 56% improvement)
+
+  PNG size : 4.1 MB
+  PZP size : 2.0 MB  (ratio=2.08×, saving=52%)
+```
+
+PZP is **2.28× faster** to load than PNG and **52% smaller** on disk for this
+dataset. The speedup comes from zstd's faster decompressor compared to zlib
+(used by PNG) combined with PZP's simple flat binary layout. Segmentation maps
+benefit most because their limited palette of label values compresses
+extremely well with zstd.
 
 ---
 
@@ -28,22 +61,33 @@ Similar projects: [QOI](https://github.com/phoboslab/qoi), [ZPNG](https://github
 [ N bytes  ] zstd-compressed payload:
     [ 40 bytes ] header  (10 × uint32)
                    magic · bpp_ext · channels_ext · width · height
-                   bpp_int · channels_int · checksum · config · reserved
-    [ W×H×C bytes ] interleaved pixel data (8-bit internal channels)
+                   bpp_int · channels_int · checksum · config · palette_bytes
+    [ P bytes  ] palette data (optional, when USE_PALETTE is set)
+    [ W×H×C bytes ] interleaved pixel / index data
 ```
 
 16-bit images are stored as two 8-bit internal channels per original channel
-(high byte plane / low byte plane), which improves zstd's compression ratio.
+(high-byte plane / low-byte plane), which improves zstd's compression ratio.
 
-An optional delta pre-filter (`USE_RLE`) can be enabled at compression time
-to further improve ratios on smooth / gradient images.
+### Compression modes
+
+| Flag | Value | Effect |
+|---|---|---|
+| `USE_COMPRESSION` | 1 | zstd entropy coding (always set) |
+| `USE_RLE` | 2 | Left-pixel delta pre-filter — improves ratio on smooth / gradient images |
+| `USE_PALETTE` | 4 | Per-channel palette indexing — best for images with few unique values per channel (e.g. segmentation maps) |
+
+Flags can be combined with `|`.  The recommended combination for smooth images
+is `USE_COMPRESSION | USE_RLE`; for label maps `USE_COMPRESSION | USE_RLE | USE_PALETTE`.
 
 ---
 
 ## Dependencies
 
-```
-sudo apt install libzstd-dev
+```bash
+sudo apt install libzstd-dev    # Ubuntu / Debian
+sudo dnf install libzstd-devel  # Fedora / RHEL
+brew install zstd               # macOS
 ```
 
 ---
@@ -51,67 +95,109 @@ sudo apt install libzstd-dev
 ## Building
 
 ```bash
-make              # release (pzp), SIMD/AVX2 (spzp), debug (dpzp), shared lib (libpzp.so)
-make test         # compress + decompress the bundled samples and verify output
+make              # builds all targets: pzp, spzp, dpzp, libpzp.so
+make libpzp.so    # shared library only (needed for Python bindings)
+make test         # compress + decompress all bundled samples, verify output
 make debug        # valgrind memory-check run
+make clean        # remove all build artefacts
 ```
+
+### Build targets
 
 | Target | Binary | Flags |
 |---|---|---|
 | release | `pzp` | `-O3 -march=native` |
-| SIMD | `spzp` | `-O3 -mavx2 -DINTEL_OPTIMIZATIONS` |
+| SIMD/AVX2 | `spzp` | `-O3 -mavx2 -DINTEL_OPTIMIZATIONS` |
 | debug | `dpzp` | `-O0 -g3` |
 | shared lib | `libpzp.so` | release flags + `-shared -fPIC` |
+
+### System install / uninstall
+
+```bash
+sudo make install              # → /usr/local/bin, /usr/local/lib, /usr/local/include
+sudo make install PREFIX=/usr  # custom prefix
+sudo make uninstall            # remove all installed files
+```
+
+`DESTDIR` is supported for packaging (`.deb`, `.rpm`, etc.):
+
+```bash
+make install DESTDIR=/tmp/pkg PREFIX=/usr
+```
 
 ---
 
 ## Command-line usage
 
-```bash
-# Compress
-./pzp compress input.ppm  output.pzp
-./pzp compress input.pnm  output.pzp   # 16-bit supported
+The `pzp` binary reads and writes PNM/PPM files (P5 grayscale, P6 colour).
 
-# Decompress
-./pzp decompress output.pzp reconstructed.ppm
+```bash
+# Compress (zstd + delta filter)
+./pzp compress      input.ppm  output.pzp
+./pzp compress      input.pnm  output.pzp   # 16-bit depth supported
+
+# Compress with palette mode (best for segmentation / label maps)
+./pzp compress-palette  input.ppm  output.pzp
+
+# Pack (zstd only, no delta filter)
+./pzp pack          input.ppm  output.pzp
+
+# Decompress (any mode — flags are stored in the file)
+./pzp decompress    output.pzp  reconstructed.ppm
+```
+
+PNG and JPEG source files must be converted to PNM/PPM first (the binary has
+no libpng / libjpeg dependency by design):
+
+```bash
+convert photo.png photo.ppm       # ImageMagick
+ffmpeg -i photo.jpg photo.ppm     # FFmpeg
 ```
 
 ---
 
 ## C API (`pzp.h`)
 
-Include the header and link against zstd (`-lzstd`).
+Include the header and link with `-lzstd`.  All functions are `static` inline;
+no separate compilation step is needed.
 
 ### Decompress from file
 
 ```c
 unsigned char *pzp_decompress_combined(
     const char   *input_filename,
-    unsigned int *width,  unsigned int *height,
-    unsigned int *bpp_ext,     unsigned int *channels_ext,
-    unsigned int *bpp_int,     unsigned int *channels_int,
+    unsigned int *width,         unsigned int *height,
+    unsigned int *bpp_ext,       unsigned int *channels_ext,
+    unsigned int *bpp_int,       unsigned int *channels_int,
     unsigned int *configuration);
 
 // Returns a malloc'd pixel buffer — caller must free().
-// NULL on error.
+// Returns NULL on error.
 ```
 
-### Decompress from memory
+### Decompress from memory (zero-copy file loading)
 
 ```c
 unsigned char *pzp_decompress_combined_from_memory(
-    const void   *file_data,  size_t file_size,
-    unsigned int *width,  unsigned int *height,
-    unsigned int *bpp_ext,     unsigned int *channels_ext,
-    unsigned int *bpp_int,     unsigned int *channels_int,
+    const void   *file_data,     size_t file_size,
+    unsigned int *width,         unsigned int *height,
+    unsigned int *bpp_ext,       unsigned int *channels_ext,
+    unsigned int *bpp_int,       unsigned int *channels_int,
     unsigned int *configuration);
 ```
 
 ### Compress
 
-Compression is driven by `pzp_compress_combined()` — see `pzp.h` for the full
-internal API.  The recommended entry point for library consumers is the
-exported C function in `pzp_lib.c` (see below).
+```c
+// Internal entry point — use the exported API below for new code.
+void pzp_compress_combined(
+    unsigned char **buffers,      // planar per-channel pixel data
+    unsigned int width,           unsigned int height,
+    unsigned int bpp_ext,         unsigned int channels_ext,
+    unsigned int bpp_int,         unsigned int channels_int,
+    unsigned int configuration,   // PZPFlags bitfield
+    const char  *output_filename);
+```
 
 ### Configuration flags
 
@@ -119,6 +205,7 @@ exported C function in `pzp_lib.c` (see below).
 typedef enum {
     USE_COMPRESSION = 1 << 0,  // zstd entropy coding (always set)
     USE_RLE         = 1 << 1,  // delta pre-filter
+    USE_PALETTE     = 1 << 2,  // per-channel palette indexing
 } PZPFlags;
 ```
 
@@ -126,30 +213,29 @@ typedef enum {
 
 ## Shared library (`libpzp.so`) and exported C API
 
-`pzp_lib.c` exposes a stable ABI suitable for ctypes / FFI:
+`pzp_lib.c` exposes a stable ABI for ctypes / FFI consumers:
 
 ```c
-// Decompress a .pzp file → malloc'd pixel buffer (caller frees with pzp_free)
+// Decompress a .pzp file → malloc'd pixel buffer (caller frees with pzp_free).
 unsigned char *pzp_decompress_file(
-    const char *filename,
-    unsigned int *width,  unsigned int *height,
-    unsigned int *bpp_ext,  unsigned int *channels_ext,
-    unsigned int *bpp_int,  unsigned int *channels_int,
+    const char   *filename,
+    unsigned int *width,         unsigned int *height,
+    unsigned int *bpp_ext,       unsigned int *channels_ext,
+    unsigned int *bpp_int,       unsigned int *channels_int,
     unsigned int *configuration);
 
-// Compress raw pixel data → .pzp file.  Returns 1 on success, 0 on failure.
+// Compress raw interleaved pixel data → .pzp file.
+// Returns 1 on success, 0 on failure.
 int pzp_compress_file(
     const unsigned char *pixels,
-    unsigned int width,  unsigned int height,
-    unsigned int bpp,        // 8 or 16
+    unsigned int width,          unsigned int height,
+    unsigned int bpp,            // 8 or 16
     unsigned int channels,
-    unsigned int configuration,
-    const char *output_filename);
+    unsigned int configuration,  // PZPFlags bitfield
+    const char  *output_filename);
 
 void pzp_free(void *ptr);
 ```
-
-Build the shared library with:
 
 ```bash
 make libpzp.so
@@ -157,64 +243,166 @@ make libpzp.so
 
 ---
 
-## Python bindings (`PZP.py`)
+## Python package (`pzp`)
 
-Requires `libpzp.so` in the same directory and numpy (optional but recommended).
+The Python package wraps `libpzp.so` via ctypes with zero additional
+dependencies (numpy is optional but recommended).
+
+### Installation
+
+**Editable install (development):**
+
+```bash
+# 1. Build the C library
+make libpzp.so
+
+# 2. Install the Python package in editable mode
+pip install -e .
+```
+
+**Build and install a wheel:**
+
+```bash
+pip wheel . --no-deps -w dist/
+pip install dist/pzp-*.whl
+```
+
+The wheel bundles `libpzp.so` — no separate `make` step is needed on the
+target machine as long as it has `libzstd` installed.
+
+**System-wide C install + Python package:**
+
+```bash
+sudo make install        # installs pzp binary and libpzp.so to /usr/local
+pip install -e .         # or pip install dist/pzp-*.whl
+```
 
 ### Read (decompress)
 
 ```python
-import PZP
+import pzp
 
-img  = PZP.read("image.pzp")   # numpy array (H, W, C) uint8
-                                 # or (H, W) uint16 for 16-bit grayscale
-meta = PZP.info("image.pzp")   # dict: width, height, bpp, channels, …
+img  = pzp.read("image.pzp")   # numpy array (H, W, C) uint8
+                                 # or (H, W) for single-channel
+meta = pzp.info("image.pzp")   # dict: width, height, bpp, channels, configuration, …
+
+# Inspect which flags the file was compressed with
+img, flags = pzp.read("image.pzp", return_flags=True)
+if flags & pzp.USE_PALETTE:
+    print("palette mode")
+if flags & pzp.USE_RLE:
+    print("delta filter")
 ```
 
-Returned array shapes match cv2 conventions:
-- 8-bit colour  → `(H, W, C)` `uint8`
-- 16-bit colour → `(H, W, C)` `uint16`
-- grayscale     → `(H, W)` (channel axis squeezed, any bit depth)
+Returned array shapes match OpenCV conventions:
+
+| Image type | Shape | dtype |
+|---|---|---|
+| 8-bit colour | `(H, W, C)` | `uint8` |
+| 16-bit colour | `(H, W, C)` | `uint16` |
+| 8-bit grayscale | `(H, W)` | `uint8` |
+| 16-bit grayscale | `(H, W)` | `uint16` |
 
 ### Write (compress)
 
 ```python
-import PZP, cv2
+import pzp
+import cv2
 
-# From a numpy array
+# From a numpy array (uint8 or uint16)
 img = cv2.imread("photo.ppm")
-PZP.write("photo.pzp", img)                # default: USE_COMPRESSION only
-PZP.write("photo.pzp", img, use_rle=True)  # add delta pre-filter
+pzp.write("photo.pzp", img)                              # zstd only
+pzp.write("photo.pzp", img, use_rle=True)                # + delta pre-filter
+pzp.write("photo.pzp", img, use_palette=True)            # + palette indexing
+pzp.write("photo.pzp", img, use_rle=True,
+                             use_palette=True)            # all filters
 
 # 16-bit grayscale
 depth = cv2.imread("depth.pnm", cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
-PZP.write("depth.pzp", depth)
+pzp.write("depth.pzp", depth)
 
 # From raw bytes (all metadata required)
-PZP.write("out.pzp", raw_bytes, width=640, height=360, bpp=8, channels=3)
+pzp.write("out.pzp", raw_bytes, width=640, height=360, bpp=8, channels=3)
+
+# Full bitfield control
+pzp.write("out.pzp", img, configuration=pzp.USE_COMPRESSION | pzp.USE_RLE)
 ```
 
 ### Configuration constants
 
 ```python
-PZP.USE_COMPRESSION  # = 1  (always active)
-PZP.USE_RLE          # = 2  (delta pre-filter)
+pzp.USE_COMPRESSION  # = 1  always active
+pzp.USE_RLE          # = 2  delta pre-filter
+pzp.USE_PALETTE      # = 4  per-channel palette indexing
 ```
 
 ### Without numpy
 
-`read()` falls back to a plain dict:
+`read()` returns a plain dict when numpy is not installed:
 
 ```python
-{"data": bytes, "width": int, "height": int, "channels": int, "bpp": int}
+{
+    "data":          bytes,
+    "width":         int,
+    "height":        int,
+    "channels":      int,
+    "bpp":           int,
+    "configuration": int,
+}
 ```
 
 ---
 
-## Benchmark script
+## Batch encoding and benchmarking scripts
 
-`scripts/benchmark.py` times compression, decompression, and pixel-level
-correctness across all build targets and formats.
+### Encode a directory of images to PZP
+
+`scripts/encode_directory.py` encodes every PNG (or other format) in a source
+directory to a matching PZP file in a target directory, in parallel.
+
+```bash
+# Standard compression
+python3 scripts/encode_directory.py test/segment_val2017 test/segment_val2017PZP
+
+# With RLE + palette (best ratio for segmentation maps)
+python3 scripts/encode_directory.py test/segment_val2017 test/segment_val2017PZP \
+    --rle --palette
+
+# Control source format and parallelism
+python3 scripts/encode_directory.py samples/ output/ --ext ppm --workers 8
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--rle` | off | Enable delta pre-filter |
+| `--palette` | off | Enable palette indexing |
+| `--workers N` | CPU count | Parallel encoding processes |
+| `--ext EXT` | `png` | Source file extension |
+
+### Compare load speed: PNG vs PZP
+
+`scripts/compare_load_speed.py` loads every matched pair from two directories
+(one PNG, one PZP) using `cv2.imread` and `pzp.read` respectively, reporting
+total time, per-image time, and winner across multiple passes.
+
+```bash
+python3 scripts/compare_load_speed.py \
+    test/segment_val2017 test/segment_val2017PZP \
+    --max 500 --passes 3
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--max N` | all | Load at most N pairs |
+| `--warmup N` | 1 | Untimed warm-up passes |
+| `--passes N` | 3 | Timed measurement passes |
+| `--no-verify` | off | Skip pixel-identity check |
+
+### General benchmark (samples + directory mode)
+
+`scripts/benchmark.py` times all build targets (`pzp`, `spzp`, `dpzp`) and
+compares them against PNG and JPEG for the bundled samples or any source
+directory.
 
 ```bash
 source venv/bin/activate
@@ -223,50 +411,58 @@ source venv/bin/activate
 python3 scripts/benchmark.py
 python3 scripts/benchmark.py --no-debug --runs 3
 
-# Directory mode — any folder of images
+# Directory mode — pre-encoded PZP directory
 python3 scripts/benchmark.py \
     --source-dir test/segment_val2017 \
     --pzp-dir    test/segment_val2017PZP \
     --compare 30
 
-# Compress from scratch, limit to 500 files
+# Directory mode — compress from scratch, limit files
 python3 scripts/benchmark.py \
     --source-dir test/segment_val2017 \
     --max-files 500 --no-debug
 ```
 
-**Flags**
-
 | Flag | Default | Description |
 |---|---|---|
-| `--source-dir DIR` | — | Directory of source images (directory mode) |
-| `--pzp-dir DIR` | — | Pre-existing `.pzp` files to benchmark decompression of |
+| `--source-dir DIR` | — | Source image directory |
+| `--pzp-dir DIR` | — | Pre-existing `.pzp` directory |
 | `--max-files N` | all | Process at most N files |
-| `--compare N` | 20 | Random files to pixel-verify in directory mode |
+| `--compare N` | 20 | Files to pixel-verify |
 | `--runs N` | 5 | Timing repetitions (sample mode) |
-| `--no-debug` | off | Skip `dpzp` (slow) |
+| `--no-debug` | off | Skip `dpzp` (slow valgrind target) |
 | `--no-build` | off | Skip `make all` |
 
-PNG source files are automatically converted to PPM before compression since
-the PZP binary reads PNM/PPM only.  Both `raw/PZP` (vs uncompressed PPM) and
-`PNG/PZP` (vs original source format) ratios are reported.
+PNG and JPEG sources are automatically pre-converted to PPM for the PZP binary
+(which reads PNM/PPM only), keeping the comparison fair.
 
 ---
 
 ## SIMD / optimisation notes
 
-The decode path (`pzp_extractAndReconstruct`) has three implementations:
+The decode path (`pzp_extractAndReconstruct`) selects an implementation at
+compile time:
 
-| Implementation | Selected when |
-|---|---|
-| `_Naive` | default (no flags) |
-| `_SSE2` | `-DINTEL_OPTIMIZATIONS` (Kogge-Stone prefix scan) |
-| `_AVX2` | defined but currently disabled (known bugs) |
+| Implementation | Compiled when | Notes |
+|---|---|---|
+| `_Naive` | default | Portable scalar |
+| `_SSE2` | `-DINTEL_OPTIMIZATIONS` | Kogge-Stone prefix scan (16 bytes/iter) |
+| `_AVX2` | `-DINTEL_OPTIMIZATIONS` | Kogge-Stone prefix scan (32 bytes/iter) |
 
-The non-RLE decode path always uses a single `memcpy` regardless of channel
-count.  For the RLE (delta) path, the SSE2 implementation uses a Kogge-Stone
-parallel prefix scan with cross-block carry propagation for 1-channel and
-2-channel images; 3-channel and wider fall back to scalar.
+The SSE2 / AVX2 implementations use a two-step carry propagation to work
+around the lane-isolation constraint of `_mm256_slli_si256` / `_mm_slli_si128`:
+an intra-lane Kogge-Stone scan followed by an explicit cross-lane carry
+broadcast.  1-channel and 2-channel images use SIMD prefix sums; 3-channel
+images use a scalar loop (stride-3 serial dependency makes SIMD not worthwhile
+at typical image sizes).
 
-For large datasets the dominant cost is usually subprocess startup when calling
-the binary.  Use `PZP.py` (ctypes, in-process) for lowest latency.
+The non-RLE decode path uses a single `memcpy` regardless of channel count.
+
+### Python-side performance note
+
+The Python `pzp.read()` implementation uses `ctypes.Array.from_address()` to
+wrap the C-allocated buffer as a fixed-size ctypes Array, then copies to a
+numpy array via `np.ctypeslib.as_array(...).copy()`.  This performs a single
+C-level `memcpy` — avoiding the O(n) Python-level iteration that would occur
+with naive POINTER slicing (`ptr[:n]`), which was the original bottleneck
+causing 12× slower load times before this fix.

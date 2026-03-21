@@ -280,6 +280,26 @@ static void pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
+static void pzp_prefix_sum_sse2(unsigned char *src, unsigned char *dst, unsigned int size)
+{
+    __m128i carry = _mm_setzero_si128();
+    unsigned int i = 0;
+    for (; i + 15 < size; i += 16)
+    {
+        __m128i v = _mm_loadu_si128((__m128i *)(src + i));
+        v = _mm_add_epi8(v, _mm_slli_si128(v, 1));
+        v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
+        v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
+        v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
+        v = _mm_add_epi8(v, carry);
+        _mm_storeu_si128((__m128i *)(dst + i), v);
+        unsigned char last = (unsigned char)_mm_cvtsi128_si32(_mm_srli_si128(v, 15));
+        carry = _mm_set1_epi8((char)last);
+    }
+    for (; i < size; i++)
+        dst[i] = src[i] + (i > 0 ? dst[i - 1] : 0);
+}
+
 static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
@@ -292,36 +312,7 @@ static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, un
         {
             case 1:
             {
-                // Kogge-Stone prefix scan within each 16-byte block.
-                // Each step doubles the reach: shifts of 1, 2, 4, 8 cover all 16 positions.
-                // Cross-block carry is the last accumulated byte, broadcast to all lanes.
-                __m128i carry = _mm_setzero_si128();
-                unsigned int i = 0;
-
-                for (; i + 15 < total_size; i += 16)
-                {
-                    __m128i v = _mm_loadu_si128((__m128i *)(src + i));
-
-                    // Within-block prefix sum
-                    v = _mm_add_epi8(v, _mm_slli_si128(v, 1));
-                    v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
-                    v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
-                    v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
-
-                    // Add cross-block carry to every element
-                    v = _mm_add_epi8(v, carry);
-                    _mm_storeu_si128((__m128i *)(r + i), v);
-
-                    // Carry for next block: extract last byte and broadcast to all 16 lanes
-                    unsigned char last = (unsigned char)_mm_cvtsi128_si32(_mm_srli_si128(v, 15));
-                    carry = _mm_set1_epi8((char)last);
-                }
-
-                // Scalar tail (also handles total_size < 16)
-                for (; i < total_size; i++)
-                {
-                    r[i] = src[i] + (i > 0 ? r[i - 1] : 0);
-                }
+                pzp_prefix_sum_sse2(src, r, total_size);
                 break;
             }
             case 2:
@@ -362,15 +353,13 @@ static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, un
             }
             case 3:
             {
-                // 3-channel stride (3 bytes) doesn't align to SSE2 boundaries — scalar fallback.
+                // Scalar prefix sum for 3-channel interleaved data.
                 r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
                 for (unsigned int i = 1; i < total_size; i++)
                 {
-                    r   += 3;
-                    src += 3;
-                    r[0] = src[0] + r[-3];
-                    r[1] = src[1] + r[-2];
-                    r[2] = src[2] + r[-1];
+                    r[i*3]   = src[i*3]   + r[(i-1)*3];
+                    r[i*3+1] = src[i*3+1] + r[(i-1)*3+1];
+                    r[i*3+2] = src[i*3+2] + r[(i-1)*3+2];
                 }
                 break;
             }
@@ -597,17 +586,13 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 break;
             }
             case 3: {
-                // Handle RLE for 3 channels (scalar fallback)
-                r[0] = src[0];
-                r[1] = src[1];
-                r[2] = src[2];
+                // Scalar prefix sum for 3-channel interleaved data.
+                r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
                 for (unsigned int i = 1; i < total_size; ++i)
                 {
-                    r += 3;
-                    src += 3;
-                    r[0] = src[0] + r[-3];
-                    r[1] = src[1] + r[-2];
-                    r[2] = src[2] + r[-1];
+                    r[i*3]   = src[i*3]   + r[(i-1)*3];
+                    r[i*3+1] = src[i*3+1] + r[(i-1)*3+1];
+                    r[i*3+2] = src[i*3+2] + r[(i-1)*3+2];
                 }
                 break;
             }

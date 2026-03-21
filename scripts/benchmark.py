@@ -105,6 +105,27 @@ def build():
     print(col("  Build OK\n", GREEN))
 
 
+_subprocess_overhead_ms = None
+
+def measure_subprocess_overhead(binary, runs=10):
+    """Estimate fork+exec+load overhead by timing a no-op decompress-like call."""
+    global _subprocess_overhead_ms
+    if _subprocess_overhead_ms is not None:
+        return _subprocess_overhead_ms
+    # Use /dev/null as a nonexistent input — binary exits quickly with an error,
+    # but that's fine: we just want the spawn + library-load time.
+    elapsed = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        subprocess.run([binary, "decompress", "/dev/null", "/dev/null"],
+                       capture_output=True)
+        elapsed.append(time.perf_counter() - t0)
+    # Drop the first (cold) call; use median of the rest to be robust.
+    warm = sorted(elapsed[1:])
+    _subprocess_overhead_ms = warm[len(warm) // 2] * 1e3
+    return _subprocess_overhead_ms
+
+
 def time_fn(fn, runs):
     """Return (mean_ms, last_result)."""
     result, elapsed = None, []
@@ -215,10 +236,10 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
 
     original = load_image(src, imread_flag)
 
-    hdr = (f"  {'TARGET':<18}  {'COMPRESS':>10}  {'DECOMPRESS':>10}  "
+    hdr = (f"  {'TARGET':<18}  {'COMPRESS':>10}  {'DECOMP (net)':>20}  "
            f"{'PZP SIZE':>10}  {'RATIO':>6}  PIXELS")
     print(f"\n{hdr}")
-    print(f"  {'-'*18}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*6}  {'─'*30}")
+    print(f"  {'-'*18}  {'-'*10}  {'-'*20}  {'-'*10}  {'-'*6}  {'─'*30}")
 
     rows = []
     with tempfile.TemporaryDirectory(prefix="pzp_bench_") as tmp:
@@ -233,6 +254,10 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
 
         pzp_path = os.path.join(tmp, "bench.pzp")
         out_ppm  = os.path.join(tmp, "bench_out.ppm")
+
+        # Measure subprocess overhead once (fork+exec+libzstd load, no real work).
+        spawn_overhead_ms = measure_subprocess_overhead(
+            next(iter(active_binaries.values())), runs=max(runs, 8))
 
         for label, binary in active_binaries.items():
             cmp_ms, (rc, _) = time_fn(
@@ -252,17 +277,23 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
             identical, max_diff, psnr = compare(original, recon)
             px = pixel_label(identical, max_diff, psnr)
 
-            print(f"  {label}  {fmt_ms(cmp_ms)}  {fmt_ms(dmp_ms)}  "
-                  f"{fmt_bytes(pzp_size):>10}  {ratio:5.2f}×  {px}")
-            rows.append((label, cmp_ms, dmp_ms, pzp_size, ratio, identical))
+            # Net decode = measured time minus spawn overhead
+            net_ms = max(dmp_ms - spawn_overhead_ms, 0.0)
 
-    # OpenCV native decode for the same image
+            print(f"  {label}  {fmt_ms(cmp_ms)}  {fmt_ms(dmp_ms)}"
+                  f" ({fmt_ms(net_ms).strip()} net)  "
+                  f"{fmt_bytes(pzp_size):>10}  {ratio:5.2f}×  {px}")
+            rows.append((label, cmp_ms, net_ms, pzp_size, ratio, identical))
+
+    # OpenCV native decode for the same image.
+    # Compare against net (subprocess-overhead-corrected) PZP times so the
+    # comparison is apples-to-apples with in-process cv2 decode.
     best_pzp_ms   = min((r[2] for r in rows), default=None)
     best_pzp_label = (min(rows, key=lambda r: r[2])[0].strip()
                       if rows else "pzp")
 
     def speedup_label(fmt_ms_val):
-        """Percentage by which best-PZP decompress is faster than fmt_ms_val.
+        """Percentage by which best-PZP net decompress is faster than fmt_ms_val.
         Positive = PZP is faster; negative = PZP is slower."""
         if best_pzp_ms is None or fmt_ms_val == 0:
             return ""
@@ -272,7 +303,9 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
         else:
             return col(f"{pct:.0f}% vs {best_pzp_label}", RED)
 
-    print()
+    spawn_note = col(f"(subprocess spawn overhead: {spawn_overhead_ms:.1f} ms subtracted from PZP times)",
+                     CYAN)
+    print(f"\n  {spawn_note}")
     print(f"  {'FORMAT':<18}  {'DECODE':>10}  {'PZP SPEEDUP':>13}  PIXELS vs original")
     print(f"  {'-'*18}  {'-'*10}  {'-'*13}  {'─'*40}")
 

@@ -125,6 +125,48 @@ sudo make uninstall            # remove all installed files
 make install DESTDIR=/tmp/pkg PREFIX=/usr
 ```
 
+### Desktop integration (thumbnails)
+
+`make install-desktop` registers `.pzp` as a recognised image type on
+freedesktop.org-compatible desktops (LXQt, XFCE, GNOME, KDE) and installs a
+thumbnailer so file managers display previews automatically.
+
+```bash
+# 1. Install the C library and binary first
+sudo make install
+
+# 2. Install MIME type + thumbnailer
+sudo make install-desktop
+
+# 3. Install the Python thumbnailer dependency
+pip install Pillow   # or: sudo apt install python3-pil
+
+# 4. Restart the thumbnail daemon to pick up the new handler
+pkill tumbler; tumbler &   # or log out / log in
+```
+
+What `install-desktop` puts on the system:
+
+| File | Destination | Purpose |
+|---|---|---|
+| `data/pzp.xml` | `PREFIX/share/mime/packages/pzp.xml` | Registers `image/x-pzp` MIME type; detected by the zstd magic bytes at offset 4 |
+| `data/pzp.thumbnailer` | `PREFIX/share/thumbnailers/pzp.thumbnailer` | Tells `tumbler` to call `pzp-thumbnailer` for `.pzp` files |
+| `scripts/pzp-thumbnailer` | `PREFIX/bin/pzp-thumbnailer` | Decompresses `.pzp` → resizes → saves PNG thumbnail |
+
+To install per-user (no `sudo` required):
+
+```bash
+make install-desktop PREFIX=~/.local
+update-mime-database ~/.local/share/mime
+pkill tumbler; tumbler &
+```
+
+To remove:
+
+```bash
+sudo make uninstall-desktop
+```
+
 ---
 
 ## Command-line usage

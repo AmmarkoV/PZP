@@ -12,12 +12,14 @@ DPZP = dpzp
 SPZP = spzp
 LIBPZP = libpzp.so
 
-PREFIX  ?= /usr/local
-BINDIR  = $(PREFIX)/bin
-LIBDIR  = $(PREFIX)/lib
-INCDIR  = $(PREFIX)/include
+PREFIX      ?= /usr/local
+BINDIR       = $(PREFIX)/bin
+LIBDIR       = $(PREFIX)/lib
+INCDIR       = $(PREFIX)/include
+MIMEDIR      = $(PREFIX)/share/mime/packages
+THUMBDIR     = $(PREFIX)/share/thumbnailers
 
-.PHONY: all clean test install uninstall
+.PHONY: all clean test install uninstall install-desktop uninstall-desktop
 
 all: $(PZP) $(DPZP) $(SPZP) $(LIBPZP)
 
@@ -84,6 +86,22 @@ uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/$(LIBPZP)
 	rm -f $(DESTDIR)$(INCDIR)/pzp.h
 	ldconfig $(DESTDIR)$(LIBDIR)
+
+install-desktop: install
+	install -d $(DESTDIR)$(MIMEDIR)
+	install -d $(DESTDIR)$(THUMBDIR)
+	install -m 644 data/pzp.xml        $(DESTDIR)$(MIMEDIR)/pzp.xml
+	install -m 644 data/pzp.thumbnailer $(DESTDIR)$(THUMBDIR)/pzp.thumbnailer
+	install -m 755 scripts/pzp-thumbnailer $(DESTDIR)$(BINDIR)/pzp-thumbnailer
+	update-mime-database   $(DESTDIR)$(PREFIX)/share/mime
+	update-desktop-database $(DESTDIR)$(PREFIX)/share/applications 2>/dev/null || true
+
+uninstall-desktop:
+	rm -f $(DESTDIR)$(MIMEDIR)/pzp.xml
+	rm -f $(DESTDIR)$(THUMBDIR)/pzp.thumbnailer
+	rm -f $(DESTDIR)$(BINDIR)/pzp-thumbnailer
+	update-mime-database   $(DESTDIR)$(PREFIX)/share/mime
+	update-desktop-database $(DESTDIR)$(PREFIX)/share/applications 2>/dev/null || true
 
 debug: all $(OUTDIR)
 	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --track-origins=yes --num-callers=20 --track-fds=yes ./$(DPZP) compress samples/sample.ppm $(OUTDIR)/sample.pzp 2>log1.txt

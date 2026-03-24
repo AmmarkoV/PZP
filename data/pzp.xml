@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="image/x-pzp">
+    <comment>PZP compressed image</comment>
+    <comment xml:lang="en">PZP compressed image</comment>
+    <!-- File starts with a 4-byte uncompressed size, then a zstd stream.
+         The zstd magic (0xFD2FB528, LE) is reliable at offset 4. -->
+    <magic priority="60">
+      <match type="little32" value="0xFD2FB528" offset="4"/>
+    </magic>
+    <glob pattern="*.pzp" weight="100"/>
+    <icon name="image-x-generic"/>
+    <generic-icon name="image-x-generic"/>
+  </mime-type>
+</mime-info>

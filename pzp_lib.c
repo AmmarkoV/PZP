@@ -109,6 +109,41 @@ unsigned int pzp_container_frame_count(const char *filename)
 }
 
 /*
+ * pzp_container_get_loop_count — return the animation loop_count (0 = forever).
+ * Returns 1 on error.
+ */
+unsigned int pzp_container_get_loop_count(const char *filename)
+{
+    PZPContainerHeader hdr;
+    PZPFrameEntry *entries = NULL;
+    if (!pzp_container_get_info(filename, &hdr, &entries))
+        return 1;
+    unsigned int lc = hdr.loop_count;
+    free(entries);
+    return lc;
+}
+
+/*
+ * pzp_container_get_delays — fill delays_out[0..max_frames-1] with per-frame
+ * delay_ms values.  Returns actual frame_count, or 0 on error.
+ */
+int pzp_container_get_delays(
+        const char   *filename,
+        unsigned int *delays_out,
+        unsigned int  max_frames)
+{
+    PZPContainerHeader hdr;
+    PZPFrameEntry *entries = NULL;
+    if (!pzp_container_get_info(filename, &hdr, &entries))
+        return 0;
+    unsigned int n = hdr.frame_count < max_frames ? hdr.frame_count : max_frames;
+    for (unsigned int i = 0; i < n; i++)
+        delays_out[i] = entries[i].delay_ms;
+    free(entries);
+    return (int)hdr.frame_count;
+}
+
+/*
  * pzp_container_get_frame — decompress frame frame_index from a container.
  * Same return convention as pzp_decompress_file; caller frees with pzp_free().
  */

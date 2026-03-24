@@ -100,6 +100,16 @@ _lib.pzp_compress_file.argtypes = [
 _lib.pzp_container_frame_count.restype  = ctypes.c_uint
 _lib.pzp_container_frame_count.argtypes = [ctypes.c_char_p]
 
+_lib.pzp_container_get_loop_count.restype  = ctypes.c_uint
+_lib.pzp_container_get_loop_count.argtypes = [ctypes.c_char_p]
+
+_lib.pzp_container_get_delays.restype  = ctypes.c_int
+_lib.pzp_container_get_delays.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_uint),  # delays_out
+    ctypes.c_uint,                  # max_frames
+]
+
 _lib.pzp_container_get_frame.restype  = ctypes.POINTER(ctypes.c_ubyte)
 _lib.pzp_container_get_frame.argtypes = [
     ctypes.c_char_p,               # filename
@@ -430,6 +440,23 @@ def frame_count(filename: str) -> int:
     """Return the number of frames in a PZP container (1 for single-frame files)."""
     return _lib.pzp_container_frame_count(
         filename.encode(sys.getfilesystemencoding()))
+
+
+def get_loop_count(filename: str) -> int:
+    """Return the animation loop count (0 = loop forever)."""
+    return _lib.pzp_container_get_loop_count(
+        filename.encode(sys.getfilesystemencoding()))
+
+
+def get_delays(filename: str) -> list:
+    """Return a list of per-frame delay values in milliseconds."""
+    n = frame_count(filename)
+    if n == 0:
+        return []
+    arr = (ctypes.c_uint * n)()
+    _lib.pzp_container_get_delays(
+        filename.encode(sys.getfilesystemencoding()), arr, n)
+    return list(arr)
 
 
 def read_frame(filename: str, index: int = 0, *, return_flags: bool = False):

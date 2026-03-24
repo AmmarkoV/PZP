@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+pzp-player — play back an animated .pzp file with optional embedded audio.
+
+Usage:
+    pzp-player <file.pzp> [--scale FACTOR] [--fps FPS]
+
+Keys:
+    Q / Esc        quit
+    Space          pause / resume
+    Left / Right   step one frame (while paused)
+    R              restart from frame 0
+
+Dependencies:
+    libpzp.so   installed via  sudo make install  (or built in repo root)
+    numpy        pip install numpy
+    pygame       pip install pygame
+"""
+
+import argparse
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+# ── Locate the PZP Python module ─────────────────────────────────────────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent))  # repo root (dev mode)
+
+try:
+    import PZP
+except ImportError:
+    print("pzp-player: PZP module not found.\n"
+          "  Run from the PZP repo root, or install the package with:\n"
+          "    pip install -e .", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import numpy as np
+except ImportError:
+    print("pzp-player: numpy is required.  pip install numpy", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import pygame
+except ImportError:
+    print("pzp-player: pygame is required.  pip install pygame", file=sys.stderr)
+    sys.exit(1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_DELAY_MS = 100   # fallback when a frame's stored delay is 0
+
+
+# ── Frame conversion ──────────────────────────────────────────────────────────
+
+def _to_rgb8(arr: np.ndarray) -> np.ndarray:
+    """
+    Normalise any frame array to (H, W, 3) uint8 suitable for pygame.
+    - 16-bit → scaled to 0-255
+    - 1-channel greyscale → replicated to 3 channels
+    - 4-channel RGBA → drop alpha
+    """
+    if arr.dtype == np.uint16:
+        arr = (arr.astype(np.float32) * (255.0 / 65535.0)).astype(np.uint8)
+
+    if arr.ndim == 2:                       # (H, W)
+        arr = np.stack([arr, arr, arr], axis=2)
+    elif arr.shape[2] == 1:                 # (H, W, 1)
+        arr = np.repeat(arr, 3, axis=2)
+    elif arr.shape[2] == 4:                 # (H, W, 4) RGBA
+        arr = np.ascontiguousarray(arr[:, :, :3])
+
+    return np.ascontiguousarray(arr, dtype=np.uint8)
+
+
+def _make_surface(arr: np.ndarray) -> "pygame.Surface":
+    """Convert (H, W, 3) uint8 ndarray → pygame Surface (zero-copy buffer path)."""
+    h, w = arr.shape[:2]
+    return pygame.image.frombuffer(arr.tobytes(), (w, h), "RGB")
+
+
+# ── Asset loading ─────────────────────────────────────────────────────────────
+
+def load_animation(path: str):
+    """
+    Load all frames and optional embedded audio from a PZP container.
+
+    Returns
+    -------
+    surfaces   : list of pygame.Surface (pre-converted, original resolution)
+    delays     : list of int (ms per frame; 0 replaced by DEFAULT_DELAY_MS)
+    loop_count : int  (0 = loop forever)
+    audio_tmp  : str path of a temp audio file, or None
+    """
+    n = PZP.frame_count(path)
+    if n == 0:
+        raise RuntimeError(f"No frames found in {path!r}")
+
+    raw_delays = PZP.get_delays(path)
+    loop_count = PZP.get_loop_count(path)
+
+    print(f"  {n} frame(s)  |  loop={'∞' if loop_count == 0 else loop_count}  "
+          f"|  delays={raw_delays} ms")
+
+    surfaces = []
+    for i in range(n):
+        arr = PZP.read_frame(path, i)
+        surfaces.append(_make_surface(_to_rgb8(arr)))
+        print(f"\r  loading frame {i + 1}/{n} …", end="", flush=True)
+    print()
+
+    delays = [d if d > 0 else DEFAULT_DELAY_MS for d in raw_delays]
+
+    # ── Extract embedded audio to a temp file ─────────────────────────────────
+    audio_tmp = None
+    audio_data, audio_fmt = PZP.get_audio(path)
+    if audio_data:
+        ext_map = {"WAVE": ".wav", "MPEG": ".mp3", "OGGX": ".ogg", "FLAC": ".flac"}
+        ext = ext_map.get(audio_fmt, ".wav")
+        fd, audio_tmp = tempfile.mkstemp(suffix=ext, prefix="pzp_audio_")
+        with os.fdopen(fd, "wb") as f:
+            f.write(audio_data)
+        print(f"  audio: {len(audio_data)} bytes  format={audio_fmt}")
+
+    return surfaces, delays, loop_count, audio_tmp
+
+
+# ── Playback ──────────────────────────────────────────────────────────────────
+
+def play(path: str, scale: float = 1.0, override_fps: float = 0.0):
+    surfaces, delays, loop_count, audio_tmp = load_animation(path)
+
+    # Window dimensions
+    ref_w, ref_h = surfaces[0].get_size()
+    win_w = max(1, int(ref_w * scale))
+    win_h = max(1, int(ref_h * scale))
+
+    pygame.init()
+    pygame.display.set_caption(f"PZP Player — {Path(path).name}")
+    screen = pygame.display.set_mode((win_w, win_h))
+    clock  = pygame.time.Clock()
+
+    # Scale surfaces if needed
+    if scale != 1.0:
+        surfaces = [pygame.transform.smoothscale(s, (win_w, win_h)) for s in surfaces]
+
+    # ── Audio ─────────────────────────────────────────────────────────────────
+    audio_ok = False
+    if audio_tmp:
+        try:
+            pygame.mixer.init()
+            pygame.mixer.music.load(audio_tmp)
+            # loop_count==0 → repeat=-1 (infinite); else repeat loop_count-1 times
+            # (pygame plays once + repeats, so pass loop_count-1 for exact count)
+            repeats = -1 if loop_count == 0 else max(loop_count - 1, 0)
+            pygame.mixer.music.play(repeats)
+            audio_ok = True
+        except pygame.error as exc:
+            print(f"  warning: audio playback failed — {exc}", file=sys.stderr)
+
+    # ── State ─────────────────────────────────────────────────────────────────
+    total   = len(surfaces)
+    idx     = 0
+    loops   = 0
+    paused  = False
+    running = True
+    last_ms = pygame.time.get_ticks()
+
+    def current_delay():
+        if override_fps > 0.0:
+            return int(1000.0 / override_fps)
+        return delays[idx]
+
+    print(f"\n  [Space=pause  ←/→=step  R=restart  Q/Esc=quit]")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+
+                elif event.key == pygame.K_SPACE:
+                    paused = not paused
+                    if audio_ok:
+                        pygame.mixer.music.pause() if paused else pygame.mixer.music.unpause()
+
+                elif event.key == pygame.K_RIGHT and paused:
+                    idx = (idx + 1) % total
+
+                elif event.key == pygame.K_LEFT and paused:
+                    idx = (idx - 1) % total
+
+                elif event.key == pygame.K_r:
+                    idx = 0
+                    loops = 0
+                    last_ms = pygame.time.get_ticks()
+                    if audio_ok:
+                        repeats = -1 if loop_count == 0 else max(loop_count - 1, 0)
+                        pygame.mixer.music.rewind()
+                        pygame.mixer.music.play(repeats)
+
+        # Draw current frame
+        screen.blit(surfaces[idx], (0, 0))
+        pygame.display.flip()
+
+        # Advance frame
+        if not paused:
+            now     = pygame.time.get_ticks()
+            elapsed = now - last_ms
+            if elapsed >= current_delay():
+                last_ms = now
+                idx    += 1
+                if idx >= total:
+                    idx   = 0
+                    loops += 1
+                    if loop_count > 0 and loops >= loop_count:
+                        # hold last frame until window is closed
+                        paused = True
+
+        clock.tick(500)   # high tick rate for sub-ms accuracy on short delays
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    pygame.quit()
+    if audio_tmp:
+        try:
+            os.unlink(audio_tmp)
+        except OSError:
+            pass
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="pzp-player",
+        description="Play back an animated .pzp file with optional embedded audio.")
+    parser.add_argument("file",
+                        help="Input .pzp file")
+    parser.add_argument("--scale", type=float, default=1.0, metavar="FACTOR",
+                        help="Window scale factor (default: 1.0)")
+    parser.add_argument("--fps", type=float, default=0.0, metavar="FPS",
+                        help="Override playback speed in fps "
+                             "(default: use per-frame delays stored in the file)")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.file):
+        print(f"pzp-player: file not found: {args.file!r}", file=sys.stderr)
+        sys.exit(1)
+
+    play(args.file, scale=args.scale, override_fps=args.fps)
+
+
+if __name__ == "__main__":
+    main()

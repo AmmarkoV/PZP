@@ -39,7 +39,9 @@ extern "C"
 //#warning "Intel Optimizations Enabled"
 #endif // INTEL_OPTIMIZATIONS
 
+#ifndef PZP_VERBOSE
 #define PZP_VERBOSE 0
+#endif
 
 static const char pzp_version[]="v0.02";
 static const char pzp_header[4]={"PZP0"};
@@ -412,9 +414,18 @@ static unsigned char *pzp_compress_frame_to_memory(
     *out_size = sizeof(unsigned int) + comp_size;
 
     #if PZP_VERBOSE
-    fprintf(stderr, "Frame %ux%ux%u@%ubit | mode %u | palette %u B | ratio %.2f\n",
-            width, height, ch_ext, bpp_ext, configuration, paletteDataBytes,
-            (float)payload_size / (float)comp_size);
+    {
+        const char *mode_str = "";
+        if ((configuration & USE_INTER_DELTA) && (configuration & USE_RLE))  mode_str = " rle+idelta";
+        else if (configuration & USE_INTER_DELTA)                             mode_str = " idelta";
+        else if (configuration & USE_RLE)                                     mode_str = " rle";
+        fprintf(stderr,
+            "  compress: %u B → %zu B  ratio=%.2f×%s%s\n",
+            payload_size, comp_size,
+            (float)payload_size / (float)comp_size,
+            (configuration & USE_PALETTE) ? " palette" : "",
+            mode_str);
+    }
     #endif
 
     unsigned char *shrunk = (unsigned char *)realloc(frame_buf, *out_size);
@@ -476,6 +487,15 @@ static void pzp_container_write(
     unsigned char **prev_orig   = NULL;
     unsigned int    prev_ch_int = 0, prev_w = 0, prev_h = 0;
 
+#if PZP_VERBOSE
+    /* Accumulators for the end-of-container summary. */
+    size_t       _vb_key_comp = 0,   _vb_dlt_comp = 0;
+    unsigned long _vb_key_raw = 0,   _vb_dlt_raw  = 0;
+    unsigned int  _vb_n_key   = 0,   _vb_n_dlt    = 0;
+    fprintf(stderr, "\n── PZP encode: %u frame(s) ──────────────────────────────\n",
+            frame_count);
+#endif
+
     for (unsigned int f = 0; f < frame_count; f++)
     {
         unsigned int cfg    = configurations[f];
@@ -522,6 +542,40 @@ static void pzp_container_write(
                     all_buffers[f][c][px] -= prev_orig[c][px];
         }
 
+#if PZP_VERBOSE
+        /* ── Per-frame header ── */
+        fprintf(stderr, "Frame %u/%u [%s] %ux%ux%u@%ubit\n",
+                f, frame_count - 1,
+                do_delta ? "DELTA   " : "KEYFRAME",
+                w, h, ch_exts[f], bpp_exts[f]);
+
+        /* ── Delta statistics (computed on post-subtraction, pre-palette buffers) ── */
+        if (do_delta)
+        {
+            unsigned long zeros = 0, small5 = 0;
+            double sum_abs = 0.0;
+            int max_abs = 0;
+            unsigned long total_s = (unsigned long)ch_int * pixels;
+            for (unsigned int c = 0; c < ch_int; c++)
+                for (unsigned int px = 0; px < pixels; px++)
+                {
+                    int d = (int)(signed char)all_buffers[f][c][px];
+                    if (d == 0)        zeros++;
+                    if (d >= -5 && d <= 5) small5++;
+                    int a = d < 0 ? -d : d;
+                    sum_abs += a;
+                    if (a > max_abs) max_abs = a;
+                }
+            fprintf(stderr,
+                "  delta stats: unchanged=%.1f%%  near-zero(±5)=%.1f%%"
+                "  MAD=%.2f  max|Δ|=%d\n",
+                100.0 * (double)zeros  / (double)total_s,
+                100.0 * (double)small5 / (double)total_s,
+                sum_abs / (double)total_s,
+                max_abs);
+        }
+#endif
+
         frame_bufs[f] = pzp_compress_frame_to_memory(
                 all_buffers[f],
                 widths[f], heights[f],
@@ -551,6 +605,14 @@ static void pzp_container_write(
             free(frame_bufs); free(frame_sizes); free(frame_offsets);
             fail("pzp_container_write: frame compression failed");
         }
+
+#if PZP_VERBOSE
+        {
+            unsigned long raw_b = (unsigned long)ch_int * pixels;
+            if (do_delta) { _vb_dlt_comp += frame_sizes[f]; _vb_dlt_raw += raw_b; _vb_n_dlt++; }
+            else          { _vb_key_comp += frame_sizes[f]; _vb_key_raw += raw_b; _vb_n_key++; }
+        }
+#endif
     }
 
     if (prev_orig)
@@ -558,6 +620,34 @@ static void pzp_container_write(
         for (unsigned int c = 0; c < prev_ch_int; c++) free(prev_orig[c]);
         free(prev_orig);
     }
+
+#if PZP_VERBOSE
+    /* ── End-of-container summary ── */
+    fprintf(stderr, "\n── Encoding summary ─────────────────────────────────────\n");
+    if (_vb_n_key > 0)
+        fprintf(stderr, "  Keyframes    : %u  compressed %zu B  avg %.0f B/frame  ratio %.2f×\n",
+                _vb_n_key, _vb_key_comp,
+                (double)_vb_key_comp / _vb_n_key,
+                (double)_vb_key_raw  / (double)_vb_key_comp);
+    if (_vb_n_dlt > 0)
+        fprintf(stderr, "  Delta frames : %u  compressed %zu B  avg %.0f B/frame  ratio %.2f×\n",
+                _vb_n_dlt, _vb_dlt_comp,
+                (double)_vb_dlt_comp / _vb_n_dlt,
+                (double)_vb_dlt_raw  / (double)_vb_dlt_comp);
+    if (_vb_n_key > 0 && _vb_n_dlt > 0)
+    {
+        double avg_key = (double)_vb_key_comp / _vb_n_key;
+        double avg_dlt = (double)_vb_dlt_comp / _vb_n_dlt;
+        double ratio   = avg_dlt / avg_key;
+        fprintf(stderr,
+            "  Delta vs keyframe avg size: %.2f×  → delta is %s\n",
+            ratio,
+            ratio < 0.95 ? "BETTER  ✓" :
+            ratio < 1.05 ? "roughly equal" :
+                           "WORSE  ✗  (consider --no-delta for this content)");
+    }
+    fprintf(stderr, "─────────────────────────────────────────────────────────\n");
+#endif
 
     /* ── compute absolute byte offsets ── */
     unsigned int idx_bytes   = frame_count * (unsigned int)frameEntrySize;

@@ -4,7 +4,7 @@ encode_animation_with_sound.py — encode a GIF + audio file into a .pzp contain
 
 Usage:
     encode_animation_with_sound.py <animation.gif> <audio.(wav|mp3|ogg|flac)> [output.pzp]
-                                   [--rle] [--palette] [--loop N] [--fps FPS]
+                                   [--rle] [--palette] [--delta] [--loop N] [--fps FPS]
 
 Arguments:
     animation.gif   Input GIF (animated or static).
@@ -12,8 +12,10 @@ Arguments:
     output.pzp      Output path.  Defaults to <gif_stem>.pzp beside the GIF.
 
 Options:
-    --rle           Enable delta pre-filter (good for smooth / photographic frames).
-    --palette       Enable per-channel palette (good for limited-colour frames).
+    --rle           Enable intra-frame delta pre-filter (good for smooth / photographic frames).
+    --palette       Enable per-channel palette (good for limited-colour frames like GIFs).
+    --delta         Enable inter-frame delta (only beneficial when consecutive frames are
+                    very similar: slow pan, slight shake, static background).
     --loop N        Override loop count (0 = loop forever; default: read from GIF).
     --fps FPS       Override per-frame delay (default: read from GIF).
 
@@ -129,6 +131,7 @@ def encode(gif_path: str, audio_path: str, output_path: str,
     print(f"Audio : {audio_path}")
     print(f"Output: {output_path}")
 
+
     # ── Read GIF ──────────────────────────────────────────────────────────────
     frames, delays, loop_count = read_gif(gif_path, fps_override)
 
@@ -179,7 +182,8 @@ def main():
     parser.add_argument("--palette", action="store_true",
                         help="Enable per-channel palette encoding")
     parser.add_argument("--delta", action="store_true",
-                        help="Enable inter-frame delta (store frame[N]-frame[N-1])")
+                        help="Enable inter-frame delta — only use when consecutive frames "
+                             "are very similar (slow motion, static background)")
     parser.add_argument("--loop", type=int, default=-1, metavar="N",
                         help="Override loop count (0=forever; default: read from GIF)")
     parser.add_argument("--fps", type=float, default=0.0, metavar="FPS",

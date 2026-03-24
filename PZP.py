@@ -136,6 +136,12 @@ _lib.pzp_container_read_audio.argtypes = [
     ctypes.POINTER(ctypes.c_uint), # format_out
 ]
 
+_lib.pzp_thread_init_export.restype  = None
+_lib.pzp_thread_init_export.argtypes = []
+
+_lib.pzp_thread_cleanup_export.restype  = None
+_lib.pzp_thread_cleanup_export.argtypes = []
+
 _lib.pzp_write_frames.restype  = ctypes.c_int
 _lib.pzp_write_frames.argtypes = [
     ctypes.c_char_p,                                # output_filename
@@ -176,6 +182,49 @@ _AUDIO_FORMAT_MAP = {
     "ogg":  AUDIO_OGG,
     "flac": AUDIO_FLAC,
 }
+
+# ---------------------------------------------------------------------------
+# Thread lifecycle
+# ---------------------------------------------------------------------------
+
+def thread_init() -> None:
+    """Eagerly create the per-thread ZSTD decompression context.
+
+    Call once at the start of each worker thread (e.g. in a
+    ``threading.Thread`` target or a ``multiprocessing`` initialiser).
+    Without this the context is allocated lazily on the first decompress
+    call, which is fine but causes a small alloc spike at that point.
+
+    Example — DataLoader worker initialiser::
+
+        import PZP
+        loader = DataLoader(dataset, num_workers=4,
+                            worker_init_fn=lambda _: PZP.thread_init())
+    """
+    _lib.pzp_thread_init_export()
+
+
+def thread_cleanup() -> None:
+    """Free the per-thread ZSTD decompression context.
+
+    Call at thread exit to allow leak-sanitisers (valgrind, LSAN) to
+    see a clean shutdown.  Safe to call from the main thread too.
+
+    Example — explicit cleanup in a worker thread::
+
+        import threading, PZP
+
+        def worker():
+            PZP.thread_init()
+            try:
+                ...  # decompress frames
+            finally:
+                PZP.thread_cleanup()
+
+        t = threading.Thread(target=worker)
+    """
+    _lib.pzp_thread_cleanup_export()
+
 
 # ---------------------------------------------------------------------------
 # Optional numpy support

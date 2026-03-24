@@ -63,6 +63,34 @@ static const int containerHeaderSize = sizeof(unsigned int) * 12;
 /* Per-frame index entry: 4 × uint32 = 16 bytes */
 static const int frameEntrySize = sizeof(unsigned int) * 4;
 
+// ---------------------------------------------------------------------------
+// Per-thread ZSTD decompression context
+//
+// Reusing a ZSTD_DCtx across calls avoids the ~6 KB alloc/init/free overhead
+// that ZSTD_decompress() pays on every call.  All pzp decompression paths
+// share this context automatically via lazy init.
+//
+// Optional explicit lifecycle API for worker threads:
+//   pzp_thread_init()    — eagerly create the context at thread startup
+//   pzp_thread_cleanup() — free it at thread exit (prevents valgrind noise)
+// ---------------------------------------------------------------------------
+static _Thread_local ZSTD_DCtx *_pzp_zstd_dctx = NULL;
+
+static inline void pzp_thread_init(void)
+{
+    if (!_pzp_zstd_dctx)
+        _pzp_zstd_dctx = ZSTD_createDCtx();
+}
+
+static inline void pzp_thread_cleanup(void)
+{
+    if (_pzp_zstd_dctx)
+    {
+        ZSTD_freeDCtx(_pzp_zstd_dctx);
+        _pzp_zstd_dctx = NULL;
+    }
+}
+
 
 #define NORMAL   "\033[0m"
 #define BLACK   "\033[30m"      /* Black */
@@ -1613,7 +1641,10 @@ static unsigned char* pzp_decompress_combined_from_memory(
         return 0;
     }
 
-    size_t actual_decompressed_size = ZSTD_decompress(decompressed_buffer, decompressed_size, compressed_buffer, compressed_size);
+    pzp_thread_init();  // no-op if already initialised
+    size_t actual_decompressed_size = _pzp_zstd_dctx
+        ? ZSTD_decompressDCtx(_pzp_zstd_dctx, decompressed_buffer, decompressed_size, compressed_buffer, compressed_size)
+        : ZSTD_decompress(decompressed_buffer, decompressed_size, compressed_buffer, compressed_size);
     if (ZSTD_isError(actual_decompressed_size))
     {
         free(decompressed_buffer);

@@ -31,6 +31,21 @@ void pzp_free(void *ptr)
     free(ptr);
 }
 
+/* ── Thread lifecycle ──────────────────────────────────────────────────────── */
+
+/*
+ * Call pzp_thread_init() at the start of each worker thread to eagerly
+ * allocate the per-thread ZSTD decompression context.  Without this the
+ * context is created lazily on the first decompress call, which is fine
+ * but causes a small alloc spike there instead.
+ *
+ * Call pzp_thread_cleanup() at thread exit so valgrind / leak-sanitisers
+ * see a clean shutdown.  The main thread's context is also freed if you
+ * call this there.
+ */
+void pzp_thread_init_export(void)    { pzp_thread_init(); }
+void pzp_thread_cleanup_export(void) { pzp_thread_cleanup(); }
+
 /* ── Single-frame compressor ───────────────────────────────────────────────── */
 
 /*

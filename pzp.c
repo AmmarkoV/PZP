@@ -342,7 +342,7 @@ static void print_usage(const char *prog)
         "  %s decompress      <input.pzp>  <output.pnm>\n"
         "  %s info            <file.pzp>\n"
         "  %s extract-frame   <file.pzp>  <output.pnm> <frame_index>\n"
-        "  %s pack-frames     <output.pzp> <loop_count> <delay_ms> <frame1.pnm> [frame2.pnm ...]\n"
+        "  %s pack-frames     <output.pzp> <loop_count> <delay_ms> [--delta] <frame1.pnm> [frame2.pnm ...]\n"
         "  %s attach-audio    <input.pzp>  <audio_file> <output.pzp>\n"
         "  %s attach-meta     <input.pzp>  <metadata>   <output.pzp>\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog);
@@ -492,14 +492,25 @@ int main(int argc, char *argv[])
 
     else if (strcmp(operation, "pack-frames") == 0)
     {
-        /* pzp pack-frames <output.pzp> <loop_count> <delay_ms> <frame1> [frame2 ...] */
+        /* pzp pack-frames <output.pzp> <loop_count> <delay_ms> [--delta] <frame1> [frame2 ...] */
         if (argc < 6) { print_usage(argv[0]); return EXIT_FAILURE; }
 
         const char   *output_path  = argv[2];
         unsigned int  loop_count   = (unsigned int)atoi(argv[3]);
         unsigned int  global_delay = (unsigned int)atoi(argv[4]);
-        unsigned int  frame_count  = (unsigned int)(argc - 5);
-        const char  **frame_paths  = (const char **)(argv + 5);
+
+        /* Optional --delta flag before the frame list. */
+        int use_delta = 0;
+        int frames_argv_start = 5;
+        if (argc > 5 && strcmp(argv[5], "--delta") == 0)
+        {
+            use_delta = 1;
+            frames_argv_start = 6;
+        }
+        if (argc <= frames_argv_start) { print_usage(argv[0]); return EXIT_FAILURE; }
+
+        unsigned int  frame_count  = (unsigned int)(argc - frames_argv_start);
+        const char  **frame_paths  = (const char **)(argv + frames_argv_start);
 
         /* Per-frame arrays */
         unsigned char    ***all_buffers   = (unsigned char ***)calloc(frame_count, sizeof(unsigned char **));
@@ -543,7 +554,7 @@ int main(int argc, char *argv[])
             ch_exts[f]  = ch;
             bpp_ints[f] = (bpp == 16) ? 8 : bpp;
             ch_ints[f]  = (bpp == 16) ? ch * 2 : ch;
-            cfgs[f]     = USE_COMPRESSION | USE_RLE;
+            cfgs[f]     = USE_COMPRESSION | USE_RLE | (use_delta ? USE_INTER_DELTA : 0);
             delays[f]   = global_delay;
 
             all_buffers[f] = (unsigned char **)calloc(ch_ints[f], sizeof(unsigned char *));

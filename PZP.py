@@ -159,9 +159,10 @@ _lib.pzp_write_frames.argtypes = [
 # Configuration flag constants (mirror of PZPFlags in pzp.h)
 # ---------------------------------------------------------------------------
 
-USE_COMPRESSION = 1
-USE_RLE         = 2
-USE_PALETTE     = 4
+USE_COMPRESSION  = 1
+USE_RLE          = 2
+USE_PALETTE      = 4
+USE_INTER_DELTA  = 8   # inter-frame delta: frame[N] stores frame[N] - frame[N-1]
 
 # Audio format four-char tags (mirror of PZP_AUDIO_* in pzp.h)
 AUDIO_WAVE = 0x57415645  # "WAVE"
@@ -563,6 +564,7 @@ def write_container(filename: str, frames, *,
                     loop_count: int = 0,
                     use_rle: bool = False,
                     use_palette: bool = False,
+                    use_inter_delta: bool = False,
                     configuration: int = USE_COMPRESSION,
                     metadata=None,
                     audio=None,
@@ -591,8 +593,9 @@ def write_container(filename: str, frames, *,
         Audio format hint: 'WAVE', 'MP3'/'MPEG', 'OGG', 'FLAC'. Default 'WAVE'.
     """
     cfg = configuration | USE_COMPRESSION
-    if use_rle:     cfg |= USE_RLE
-    if use_palette: cfg |= USE_PALETTE
+    if use_rle:          cfg |= USE_RLE
+    if use_palette:      cfg |= USE_PALETTE
+    if use_inter_delta:  cfg |= USE_INTER_DELTA
 
     n = len(frames)
     if n == 0:

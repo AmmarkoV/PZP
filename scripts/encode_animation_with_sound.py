@@ -122,7 +122,7 @@ def read_audio(audio_path: str):
 
 
 def encode(gif_path: str, audio_path: str, output_path: str,
-           use_rle: bool, use_palette: bool,
+           use_rle: bool, use_palette: bool, use_inter_delta: bool,
            loop_override: int, fps_override: float):
 
     print(f"GIF   : {gif_path}")
@@ -148,12 +148,13 @@ def encode(gif_path: str, audio_path: str, output_path: str,
     # ── Encode ────────────────────────────────────────────────────────────────
     PZP.write_container(
         output_path, frames,
-        delays      = delays,
-        loop_count  = loop_count,
-        use_rle     = use_rle,
-        use_palette = use_palette,
-        audio       = audio_data,
-        audio_format= audio_fmt,
+        delays          = delays,
+        loop_count      = loop_count,
+        use_rle         = use_rle,
+        use_palette     = use_palette,
+        use_inter_delta = use_inter_delta,
+        audio           = audio_data,
+        audio_format    = audio_fmt,
     )
 
     size = os.path.getsize(output_path)
@@ -174,9 +175,11 @@ def main():
     parser.add_argument("output", nargs="?", default=None,
                         help="Output .pzp path (default: <gif_stem>.pzp)")
     parser.add_argument("--rle", action="store_true",
-                        help="Enable delta pre-filter")
+                        help="Enable intra-frame delta pre-filter")
     parser.add_argument("--palette", action="store_true",
                         help="Enable per-channel palette encoding")
+    parser.add_argument("--delta", action="store_true",
+                        help="Enable inter-frame delta (store frame[N]-frame[N-1])")
     parser.add_argument("--loop", type=int, default=-1, metavar="N",
                         help="Override loop count (0=forever; default: read from GIF)")
     parser.add_argument("--fps", type=float, default=0.0, metavar="FPS",
@@ -196,10 +199,11 @@ def main():
         output = str(Path(args.gif).with_suffix(".pzp"))
 
     encode(args.gif, args.audio, output,
-           use_rle     = args.rle,
-           use_palette = args.palette,
-           loop_override = args.loop,
-           fps_override  = args.fps)
+           use_rle         = args.rle,
+           use_palette     = args.palette,
+           use_inter_delta = args.delta,
+           loop_override   = args.loop,
+           fps_override    = args.fps)
 
 
 if __name__ == "__main__":

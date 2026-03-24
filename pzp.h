@@ -64,10 +64,10 @@ static const int frameEntrySize = sizeof(unsigned int) * 4;
 // Define flags using bitwise shift for clarity
 typedef enum
 {
-    USE_COMPRESSION = 1 << 0,  // 0001
-    USE_RLE         = 1 << 1,  // 0010 — delta/prefix-sum filter before zstd
-    USE_PALETTE     = 1 << 2,  // 0100 — per-channel palette indexing (best for images with few unique colors)
-    TEST_FLAG2      = 1 << 3   // 1000
+    USE_COMPRESSION  = 1 << 0,  // 0001 — zstd entropy coding (always on)
+    USE_RLE          = 1 << 1,  // 0010 — intra-frame delta filter before zstd
+    USE_PALETTE      = 1 << 2,  // 0100 — per-channel palette indexing
+    USE_INTER_DELTA  = 1 << 3   // 1000 — inter-frame delta: store frame[N] - frame[N-1]
 } PZPFlags;
 
 // ─── Container format constants ──────────────────────────────────────────────
@@ -461,9 +461,9 @@ static void pzp_container_write(
         unsigned int   audio_format)
 {
     /* ── encode all frames to heap buffers ── */
-    unsigned char **frame_bufs  = (unsigned char **)malloc(frame_count * sizeof(unsigned char *));
-    size_t         *frame_sizes = (size_t *)        malloc(frame_count * sizeof(size_t));
-    unsigned int   *frame_offsets = (unsigned int *)malloc(frame_count * sizeof(unsigned int));
+    unsigned char **frame_bufs    = (unsigned char **)malloc(frame_count * sizeof(unsigned char *));
+    size_t         *frame_sizes   = (size_t *)        malloc(frame_count * sizeof(size_t));
+    unsigned int   *frame_offsets = (unsigned int *)  malloc(frame_count * sizeof(unsigned int));
 
     if (!frame_bufs || !frame_sizes || !frame_offsets)
     {
@@ -471,21 +471,92 @@ static void pzp_container_write(
         fail("pzp_container_write: allocation failed");
     }
 
+    /* Reference buffers for USE_INTER_DELTA: prev_orig[c] holds the ORIGINAL
+       planar channel data of frame (f-1), saved before any in-place transforms. */
+    unsigned char **prev_orig   = NULL;
+    unsigned int    prev_ch_int = 0, prev_w = 0, prev_h = 0;
+
     for (unsigned int f = 0; f < frame_count; f++)
     {
+        unsigned int cfg    = configurations[f];
+        unsigned int ch_int = ch_ints[f];
+        unsigned int w      = widths[f], h = heights[f];
+        unsigned int pixels = w * h;
+
+        /* Frame 0 is always a keyframe. */
+        if (f == 0) cfg &= ~(unsigned int)USE_INTER_DELTA;
+
+        /* Delta only valid when previous frame exists with identical layout. */
+        int do_delta = (f > 0)
+                    && (cfg & USE_INTER_DELTA)
+                    && (prev_orig   != NULL)
+                    && (prev_ch_int == ch_int)
+                    && (prev_w == w) && (prev_h == h);
+        if (!do_delta) cfg &= ~(unsigned int)USE_INTER_DELTA;
+
+        /* Copy the CURRENT original channel data before any modification so it
+           can serve as the reference for the next frame. */
+        unsigned char **cur_orig = (unsigned char **)malloc(ch_int * sizeof(unsigned char *));
+        int orig_ok = (cur_orig != NULL);
+        if (orig_ok)
+        {
+            for (unsigned int c = 0; c < ch_int && orig_ok; c++)
+            {
+                cur_orig[c] = (unsigned char *)malloc(pixels);
+                if (cur_orig[c]) memcpy(cur_orig[c], all_buffers[f][c], pixels);
+                else             orig_ok = 0;
+            }
+        }
+        if (!orig_ok && cur_orig)
+        {
+            for (unsigned int c = 0; c < ch_int; c++) free(cur_orig[c]);
+            free(cur_orig);
+            cur_orig = NULL;
+        }
+
+        /* Subtract previous frame's channel data in-place (wrapping byte math). */
+        if (do_delta)
+        {
+            for (unsigned int c = 0; c < ch_int; c++)
+                for (unsigned int px = 0; px < pixels; px++)
+                    all_buffers[f][c][px] -= prev_orig[c][px];
+        }
+
         frame_bufs[f] = pzp_compress_frame_to_memory(
                 all_buffers[f],
                 widths[f], heights[f],
                 bpp_exts[f], ch_exts[f],
                 bpp_ints[f], ch_ints[f],
-                configurations[f],
+                cfg,
                 &frame_sizes[f]);
+
+        /* Advance the reference window. */
+        if (prev_orig)
+        {
+            for (unsigned int c = 0; c < prev_ch_int; c++) free(prev_orig[c]);
+            free(prev_orig);
+        }
+        prev_orig   = cur_orig;
+        prev_ch_int = ch_int;
+        prev_w = w; prev_h = h;
+
         if (!frame_bufs[f])
         {
             for (unsigned int j = 0; j < f; j++) free(frame_bufs[j]);
+            if (prev_orig)
+            {
+                for (unsigned int c = 0; c < prev_ch_int; c++) free(prev_orig[c]);
+                free(prev_orig);
+            }
             free(frame_bufs); free(frame_sizes); free(frame_offsets);
             fail("pzp_container_write: frame compression failed");
         }
+    }
+
+    if (prev_orig)
+    {
+        for (unsigned int c = 0; c < prev_ch_int; c++) free(prev_orig[c]);
+        free(prev_orig);
     }
 
     /* ── compute absolute byte offsets ── */
@@ -1244,12 +1315,30 @@ static unsigned char *pzp_container_read_frame_from_memory(
     }
 
     const void *frame_data = (const unsigned char *)file_data + e.frame_offset;
-    return pzp_decompress_combined_from_memory(
+    unsigned char *out = pzp_decompress_combined_from_memory(
             frame_data, e.compressed_size,
-            width, height,
-            bpp_ext, ch_ext,
-            bpp_int, ch_int,
-            configuration);
+            width, height, bpp_ext, ch_ext, bpp_int, ch_int, configuration);
+    if (!out) return NULL;
+
+    /* If this frame was encoded as a delta, reconstruct by adding frame[N-1]. */
+    if ((*configuration & USE_INTER_DELTA) && frame_index > 0)
+    {
+        unsigned int pw = 0, ph = 0, pbe = 0, pce = 0, pbi = 0, pci = 0, pcfg = 0;
+        unsigned char *prev = pzp_container_read_frame_from_memory(
+                file_data, file_size, frame_index - 1,
+                &pw, &ph, &pbe, &pce, &pbi, &pci, &pcfg);
+        if (prev && pw == *width && ph == *height && pci == *ch_int)
+        {
+            /* Internal buffers are always 8-bit planar; plain byte addition
+               reconstructs the original pixel values (wrapping mod 256). */
+            size_t n = (size_t)(*width) * (*height) * (*ch_int);
+            for (size_t i = 0; i < n; i++)
+                out[i] += prev[i];
+        }
+        free(prev);
+    }
+
+    return out;
 }
 
 /*

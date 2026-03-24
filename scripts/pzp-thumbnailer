@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+pzp-thumbnailer — generate a freedesktop thumbnail from a .pzp file.
+
+Called by tumbler (and compatible daemons) as:
+    pzp-thumbnailer <input-path> <output-path> <size>
+
+<input-path>  absolute path to the .pzp file
+<output-path> absolute path where the PNG thumbnail must be written
+<size>        maximum dimension in pixels (e.g. 128, 256)
+
+Exit codes: 0 = success, 1 = error (tumbler will not cache the result).
+
+Dependencies:
+    libpzp.so   installed via  sudo make install
+    Pillow       pip install Pillow   (or  python3-pil from your distro)
+"""
+
+import ctypes
+import os
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Locate libpzp.so
+# ---------------------------------------------------------------------------
+
+def _find_lib() -> str:
+    candidates = [
+        "/usr/local/lib/libpzp.so",
+        "/usr/lib/libpzp.so",
+        str(Path(__file__).resolve().parent.parent / "libpzp.so"),  # dev tree
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise OSError(
+        "libpzp.so not found. Install with:\n"
+        "    make libpzp.so && sudo make install"
+    )
+
+
+_lib = ctypes.CDLL(_find_lib())
+_lib.pzp_decompress_file.restype  = ctypes.POINTER(ctypes.c_ubyte)
+_lib.pzp_decompress_file.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_uint),  # width
+    ctypes.POINTER(ctypes.c_uint),  # height
+    ctypes.POINTER(ctypes.c_uint),  # bpp_ext
+    ctypes.POINTER(ctypes.c_uint),  # channels_ext
+    ctypes.POINTER(ctypes.c_uint),  # bpp_int
+    ctypes.POINTER(ctypes.c_uint),  # channels_int
+    ctypes.POINTER(ctypes.c_uint),  # configuration
+]
+_lib.pzp_free.restype  = None
+_lib.pzp_free.argtypes = [ctypes.c_void_p]
+
+# ---------------------------------------------------------------------------
+# Decompress
+# ---------------------------------------------------------------------------
+
+def _decompress(path: str):
+    """Return (pixel_bytes, width, height, channels, bpp) or raise."""
+    w   = ctypes.c_uint(0)
+    h   = ctypes.c_uint(0)
+    be  = ctypes.c_uint(0)
+    ce  = ctypes.c_uint(0)
+    bi  = ctypes.c_uint(0)
+    ci  = ctypes.c_uint(0)
+    cfg = ctypes.c_uint(0)
+
+    ptr = _lib.pzp_decompress_file(
+        path.encode(sys.getfilesystemencoding()),
+        ctypes.byref(w), ctypes.byref(h),
+        ctypes.byref(be), ctypes.byref(ce),
+        ctypes.byref(bi), ctypes.byref(ci),
+        ctypes.byref(cfg),
+    )
+    if not ptr:
+        raise RuntimeError(f"pzp_decompress_file failed for {path!r}")
+
+    width    = w.value
+    height   = h.value
+    bpp_ext  = be.value
+    ch_ext   = ce.value
+    bpp_int  = bi.value
+    ch_int   = ci.value
+
+    n_bytes = width * height * ch_int * (bpp_int // 8)
+    addr    = ctypes.cast(ptr, ctypes.c_void_p).value
+    c_arr   = (ctypes.c_ubyte * n_bytes).from_address(addr)
+    raw     = bytes(c_arr)
+    _lib.pzp_free(ptr)
+
+    return raw, width, height, ch_ext, bpp_ext
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) < 3:
+        print(f"Usage: {sys.argv[0]} <input.pzp> <output.png> [size]",
+              file=sys.stderr)
+        sys.exit(1)
+
+    input_path  = sys.argv[1]
+    output_path = sys.argv[2]
+    size        = int(sys.argv[3]) if len(sys.argv) > 3 else 128
+
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        print("pzp-thumbnailer: Pillow (PIL) is required. "
+              "Install with: pip install Pillow", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        raw, width, height, channels, bpp = _decompress(input_path)
+    except Exception as exc:
+        print(f"pzp-thumbnailer: decompress error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        dtype = np.uint8 if bpp == 8 else ">u2"
+        arr   = np.frombuffer(raw, dtype=dtype)
+
+        if channels == 1:
+            arr = arr.reshape(height, width)
+            mode = "L"
+        elif channels == 3:
+            arr = arr.reshape(height, width, 3)
+            mode = "RGB"
+        elif channels == 4:
+            arr = arr.reshape(height, width, 4)
+            mode = "RGBA"
+        else:
+            # Unsupported channel count — treat as greyscale by taking ch 0
+            arr = arr.reshape(height, width, channels)[:, :, 0]
+            mode = "L"
+
+        # Convert 16-bit to 8-bit for the thumbnail (scale to 0-255)
+        if bpp == 16:
+            arr = (arr.astype(np.float32) / 65535.0 * 255.0).astype(np.uint8)
+
+        img = Image.fromarray(arr, mode=mode)
+        img.thumbnail((size, size), Image.LANCZOS)
+
+        # Thumbnails must be saved as PNG per the freedesktop spec
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        img.save(output_path, "PNG")
+
+    except Exception as exc:
+        print(f"pzp-thumbnailer: image error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

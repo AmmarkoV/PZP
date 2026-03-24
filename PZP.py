@@ -96,6 +96,55 @@ _lib.pzp_compress_file.argtypes = [
     ctypes.c_char_p,                   # output_filename
 ]
 
+# Container API signatures
+_lib.pzp_container_frame_count.restype  = ctypes.c_uint
+_lib.pzp_container_frame_count.argtypes = [ctypes.c_char_p]
+
+_lib.pzp_container_get_frame.restype  = ctypes.POINTER(ctypes.c_ubyte)
+_lib.pzp_container_get_frame.argtypes = [
+    ctypes.c_char_p,               # filename
+    ctypes.c_uint,                 # frame_index
+    ctypes.POINTER(ctypes.c_uint), # width
+    ctypes.POINTER(ctypes.c_uint), # height
+    ctypes.POINTER(ctypes.c_uint), # bpp_ext
+    ctypes.POINTER(ctypes.c_uint), # channels_ext
+    ctypes.POINTER(ctypes.c_uint), # bpp_int
+    ctypes.POINTER(ctypes.c_uint), # channels_int
+    ctypes.POINTER(ctypes.c_uint), # configuration
+]
+
+_lib.pzp_container_read_metadata.restype  = ctypes.POINTER(ctypes.c_ubyte)
+_lib.pzp_container_read_metadata.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_uint), # bytes_out
+]
+
+_lib.pzp_container_read_audio.restype  = ctypes.POINTER(ctypes.c_ubyte)
+_lib.pzp_container_read_audio.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_uint), # bytes_out
+    ctypes.POINTER(ctypes.c_uint), # format_out
+]
+
+_lib.pzp_write_frames.restype  = ctypes.c_int
+_lib.pzp_write_frames.argtypes = [
+    ctypes.c_char_p,                                # output_filename
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)), # pixel_arrays
+    ctypes.c_uint,                                  # frame_count
+    ctypes.POINTER(ctypes.c_uint),                  # widths
+    ctypes.POINTER(ctypes.c_uint),                  # heights
+    ctypes.POINTER(ctypes.c_uint),                  # bpps
+    ctypes.POINTER(ctypes.c_uint),                  # channels_arr
+    ctypes.POINTER(ctypes.c_uint),                  # configurations
+    ctypes.POINTER(ctypes.c_uint),                  # delay_ms_arr
+    ctypes.c_uint,                                  # loop_count
+    ctypes.POINTER(ctypes.c_ubyte),                 # metadata (nullable)
+    ctypes.c_uint,                                  # metadata_bytes
+    ctypes.POINTER(ctypes.c_ubyte),                 # audio (nullable)
+    ctypes.c_uint,                                  # audio_bytes
+    ctypes.c_uint,                                  # audio_format
+]
+
 # ---------------------------------------------------------------------------
 # Configuration flag constants (mirror of PZPFlags in pzp.h)
 # ---------------------------------------------------------------------------
@@ -103,6 +152,19 @@ _lib.pzp_compress_file.argtypes = [
 USE_COMPRESSION = 1
 USE_RLE         = 2
 USE_PALETTE     = 4
+
+# Audio format four-char tags (mirror of PZP_AUDIO_* in pzp.h)
+AUDIO_WAVE = 0x57415645  # "WAVE"
+AUDIO_MPEG = 0x4D504547  # "MPEG"
+AUDIO_OGG  = 0x4F474758  # "OGGX"
+AUDIO_FLAC = 0x464C4143  # "FLAC"
+
+_AUDIO_FORMAT_MAP = {
+    "wav":  AUDIO_WAVE, "wave": AUDIO_WAVE,
+    "mp3":  AUDIO_MPEG, "mpeg": AUDIO_MPEG,
+    "ogg":  AUDIO_OGG,
+    "flac": AUDIO_FLAC,
+}
 
 # ---------------------------------------------------------------------------
 # Optional numpy support
@@ -358,3 +420,226 @@ def write(filename: str, data, *,
     rc = _lib.pzp_compress_file(buf, w, h, pixel_bpp, c, cfg, fname)
     if rc == 0:
         raise RuntimeError(f"PZP.write: compression failed for '{filename}'")
+
+
+# ---------------------------------------------------------------------------
+# Container API
+# ---------------------------------------------------------------------------
+
+def frame_count(filename: str) -> int:
+    """Return the number of frames in a PZP container (1 for single-frame files)."""
+    return _lib.pzp_container_frame_count(
+        filename.encode(sys.getfilesystemencoding()))
+
+
+def read_frame(filename: str, index: int = 0, *, return_flags: bool = False):
+    """
+    Decompress frame `index` from a multi-frame PZP container.
+    Returns the same types as read().
+    """
+    filename_b = filename.encode(sys.getfilesystemencoding())
+    width   = ctypes.c_uint(0)
+    height  = ctypes.c_uint(0)
+    bpp_ext = ctypes.c_uint(0)
+    ch_ext  = ctypes.c_uint(0)
+    bpp_int = ctypes.c_uint(0)
+    ch_int  = ctypes.c_uint(0)
+    config  = ctypes.c_uint(0)
+
+    ptr = _lib.pzp_container_get_frame(
+        filename_b, index,
+        ctypes.byref(width),   ctypes.byref(height),
+        ctypes.byref(bpp_ext), ctypes.byref(ch_ext),
+        ctypes.byref(bpp_int), ctypes.byref(ch_int),
+        ctypes.byref(config),
+    )
+    if not ptr:
+        raise RuntimeError(f"PZP: failed to read frame {index} from '{filename}'")
+
+    w, h, be, ce, bi, ci = (width.value, height.value,
+                             bpp_ext.value, ch_ext.value,
+                             bpp_int.value, ch_int.value)
+    n_bytes = w * h * ci * (bi // 8)
+    addr    = ctypes.cast(ptr, ctypes.c_void_p).value
+    c_arr   = (ctypes.c_ubyte * n_bytes).from_address(addr)
+
+    if _NUMPY:
+        raw_buf = np.ctypeslib.as_array(c_arr).copy()
+    else:
+        raw_buf = bytes(c_arr)
+
+    _lib.pzp_free(ptr)
+
+    flags = config.value
+    if _NUMPY:
+        if be == 8:
+            arr = raw_buf.reshape(h, w, ce)
+        elif be == 16:
+            arr = raw_buf.view(dtype=">u2").reshape(h, w, ce).astype(np.uint16)
+        else:
+            raise ValueError(f"PZP: unsupported bit depth {be}")
+        if ce == 1:
+            arr = arr[:, :, 0]
+        return (arr, flags) if return_flags else arr
+    else:
+        result = {"data": raw_buf, "width": w, "height": h,
+                  "channels": ce, "bpp": be, "configuration": flags}
+        return (result, flags) if return_flags else result
+
+
+def get_metadata(filename: str):
+    """
+    Return the metadata blob from a PZP container as bytes, or None if absent.
+    """
+    bytes_out = ctypes.c_uint(0)
+    ptr = _lib.pzp_container_read_metadata(
+        filename.encode(sys.getfilesystemencoding()),
+        ctypes.byref(bytes_out),
+    )
+    if not ptr:
+        return None
+    n     = bytes_out.value
+    addr  = ctypes.cast(ptr, ctypes.c_void_p).value
+    c_arr = (ctypes.c_ubyte * n).from_address(addr)
+    data  = bytes(c_arr)
+    _lib.pzp_free(ptr)
+    return data
+
+
+def get_audio(filename: str):
+    """
+    Return (audio_bytes, format_str) from a PZP container, or (None, None) if absent.
+    format_str is one of 'WAVE', 'MPEG', 'OGGX', 'FLAC'.
+    """
+    bytes_out  = ctypes.c_uint(0)
+    format_out = ctypes.c_uint(0)
+    ptr = _lib.pzp_container_read_audio(
+        filename.encode(sys.getfilesystemencoding()),
+        ctypes.byref(bytes_out),
+        ctypes.byref(format_out),
+    )
+    if not ptr:
+        return None, None
+    n     = bytes_out.value
+    addr  = ctypes.cast(ptr, ctypes.c_void_p).value
+    c_arr = (ctypes.c_ubyte * n).from_address(addr)
+    data  = bytes(c_arr)
+    _lib.pzp_free(ptr)
+    fmt_int = format_out.value
+    fmt_str = (chr((fmt_int >> 24) & 0xFF) + chr((fmt_int >> 16) & 0xFF) +
+               chr((fmt_int >>  8) & 0xFF) + chr(fmt_int & 0xFF))
+    return data, fmt_str
+
+
+def write_container(filename: str, frames, *,
+                    delays=None,
+                    loop_count: int = 0,
+                    use_rle: bool = False,
+                    use_palette: bool = False,
+                    configuration: int = USE_COMPRESSION,
+                    metadata=None,
+                    audio=None,
+                    audio_format: str = "WAVE") -> None:
+    """
+    Compress multiple frames and write a PZP container file.
+
+    Parameters
+    ----------
+    filename : str
+        Output .pzp path.
+    frames : list of numpy ndarray  or  list of (bytes, width, height, bpp, channels)
+        Pixel data for each frame.  ndarray shapes follow the same convention
+        as write() — (H, W) for single-channel, (H, W, C) for multi-channel.
+    delays : list of int, optional
+        Per-frame display delay in milliseconds.  None = all zeros.
+    loop_count : int
+        Animation loop count; 0 = loop forever.
+    use_rle, use_palette, configuration
+        Same meaning as write(); applied uniformly to all frames.
+    metadata : bytes or str, optional
+        Opaque metadata blob to embed.  str is UTF-8 encoded.
+    audio : bytes, optional
+        Raw audio file bytes to embed.
+    audio_format : str
+        Audio format hint: 'WAVE', 'MP3'/'MPEG', 'OGG', 'FLAC'. Default 'WAVE'.
+    """
+    cfg = configuration | USE_COMPRESSION
+    if use_rle:     cfg |= USE_RLE
+    if use_palette: cfg |= USE_PALETTE
+
+    n = len(frames)
+    if n == 0:
+        raise ValueError("PZP.write_container: frames list is empty")
+
+    pixel_bufs = []
+    widths  = (ctypes.c_uint * n)()
+    heights = (ctypes.c_uint * n)()
+    bpps    = (ctypes.c_uint * n)()
+    chans   = (ctypes.c_uint * n)()
+    cfgs    = (ctypes.c_uint * n)()
+    delays_arr = (ctypes.c_uint * n)(*([0] * n if delays is None else delays))
+
+    for i, frame in enumerate(frames):
+        if _NUMPY and isinstance(frame, np.ndarray):
+            arr = frame
+            if arr.ndim == 2:
+                arr = arr[:, :, np.newaxis]
+            if arr.ndim != 3:
+                raise ValueError(
+                    f"PZP.write_container: frame {i} has unsupported shape {frame.shape}")
+            h, w, c = arr.shape
+            if arr.dtype == np.uint8:
+                bpp = 8
+                raw = arr.tobytes()
+            elif arr.dtype == np.uint16:
+                bpp = 16
+                raw = arr.astype(">u2").tobytes()
+            else:
+                raise ValueError(
+                    f"PZP.write_container: frame {i} dtype {arr.dtype} unsupported")
+        else:
+            # Tuple form: (bytes, width, height, bpp, channels)
+            raw, w, h, bpp, c = frame
+
+        pixel_bufs.append((ctypes.c_ubyte * len(raw)).from_buffer_copy(raw))
+        widths[i] = w
+        heights[i] = h
+        bpps[i] = bpp
+        chans[i] = c
+        cfgs[i] = cfg
+
+    ptr_arr = (ctypes.POINTER(ctypes.c_ubyte) * n)(
+        *[ctypes.cast(pb, ctypes.POINTER(ctypes.c_ubyte)) for pb in pixel_bufs]
+    )
+
+    # Metadata
+    meta_buf = ctypes.cast(None, ctypes.POINTER(ctypes.c_ubyte))
+    meta_len = 0
+    if metadata is not None:
+        if isinstance(metadata, str):
+            metadata = metadata.encode("utf-8")
+        _mb = (ctypes.c_ubyte * len(metadata)).from_buffer_copy(metadata)
+        meta_buf = ctypes.cast(_mb, ctypes.POINTER(ctypes.c_ubyte))
+        meta_len = len(metadata)
+
+    # Audio
+    audio_buf = ctypes.cast(None, ctypes.POINTER(ctypes.c_ubyte))
+    audio_len = 0
+    audio_fmt = 0
+    if audio is not None:
+        _ab = (ctypes.c_ubyte * len(audio)).from_buffer_copy(audio)
+        audio_buf = ctypes.cast(_ab, ctypes.POINTER(ctypes.c_ubyte))
+        audio_len = len(audio)
+        audio_fmt = _AUDIO_FORMAT_MAP.get(audio_format.lower().lstrip("."),
+                                          AUDIO_WAVE)
+
+    fname = filename.encode(sys.getfilesystemencoding())
+    rc = _lib.pzp_write_frames(
+        fname, ptr_arr, n,
+        widths, heights, bpps, chans, cfgs, delays_arr,
+        loop_count,
+        meta_buf, meta_len,
+        audio_buf, audio_len, audio_fmt,
+    )
+    if rc == 0:
+        raise RuntimeError(f"PZP.write_container: failed to write '{filename}'")

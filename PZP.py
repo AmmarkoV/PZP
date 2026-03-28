@@ -169,6 +169,7 @@ USE_COMPRESSION  = 1
 USE_RLE          = 2
 USE_PALETTE      = 4
 USE_INTER_DELTA  = 8   # inter-frame delta: frame[N] stores frame[N] - frame[N-1]
+USE_LZ4          = 16  # use LZ4 instead of ZSTD (faster decompress, larger output)
 
 # Audio format four-char tags (mirror of PZP_AUDIO_* in pzp.h)
 AUDIO_WAVE = 0x57415645  # "WAVE"
@@ -394,6 +395,7 @@ def write(filename: str, data, *,
           bpp: int = 0, channels: int = 0,
           use_rle: bool = False,
           use_palette: bool = False,
+          use_lz4: bool = False,
           configuration: int = USE_COMPRESSION) -> None:
     """
     Compress pixel data and write a .pzp file.
@@ -418,9 +420,13 @@ def write(filename: str, data, *,
         Enable per-channel palette indexing.  Best for images with few unique
         values per channel (e.g. segmentation maps, label images).
         Adds USE_PALETTE to the configuration bitfield.
+    use_lz4 : bool
+        Use LZ4 instead of ZSTD.  LZ4 decompresses faster but produces
+        larger output than ZSTD.  Adds USE_LZ4 to the configuration bitfield.
     configuration : int
         Full configuration bitfield.  USE_COMPRESSION (1) is always or'd in.
-        Prefer the convenience booleans (use_rle, use_palette) for common cases.
+        Prefer the convenience booleans (use_rle, use_palette, use_lz4) for
+        common cases.
 
     Raises
     ------
@@ -433,6 +439,8 @@ def write(filename: str, data, *,
         cfg |= USE_RLE
     if use_palette:
         cfg |= USE_PALETTE
+    if use_lz4:
+        cfg |= USE_LZ4
 
     if _NUMPY and isinstance(data, np.ndarray):
         arr = data
@@ -614,6 +622,7 @@ def write_container(filename: str, frames, *,
                     use_rle: bool = False,
                     use_palette: bool = False,
                     use_inter_delta: bool = False,
+                    use_lz4: bool = False,
                     configuration: int = USE_COMPRESSION,
                     metadata=None,
                     audio=None,
@@ -632,8 +641,11 @@ def write_container(filename: str, frames, *,
         Per-frame display delay in milliseconds.  None = all zeros.
     loop_count : int
         Animation loop count; 0 = loop forever.
-    use_rle, use_palette, configuration
+    use_rle, use_palette, use_lz4, configuration
         Same meaning as write(); applied uniformly to all frames.
+    use_lz4 : bool
+        Use LZ4 instead of ZSTD for frame compression.  LZ4 decompresses
+        faster but produces larger output than ZSTD.
     metadata : bytes or str, optional
         Opaque metadata blob to embed.  str is UTF-8 encoded.
     audio : bytes, optional
@@ -645,6 +657,7 @@ def write_container(filename: str, frames, *,
     if use_rle:          cfg |= USE_RLE
     if use_palette:      cfg |= USE_PALETTE
     if use_inter_delta:  cfg |= USE_INTER_DELTA
+    if use_lz4:          cfg |= USE_LZ4
 
     n = len(frames)
     if n == 0:

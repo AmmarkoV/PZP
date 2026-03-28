@@ -336,15 +336,19 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s compress        <input.pnm>  <output.pzp>\n"
-        "  %s compress-palette <input.pnm> <output.pzp>\n"
-        "  %s pack            <input.pnm>  <output.pzp>\n"
+        "  %s compress        <input.pnm>  <output.pzp>  [--lz4]\n"
+        "  %s compress-palette <input.pnm> <output.pzp>  [--lz4]\n"
+        "  %s pack            <input.pnm>  <output.pzp>  [--lz4]\n"
         "  %s decompress      <input.pzp>  <output.pnm>\n"
         "  %s info            <file.pzp>\n"
         "  %s extract-frame   <file.pzp>  <output.pnm> <frame_index>\n"
-        "  %s pack-frames     <output.pzp> <loop_count> <delay_ms> [--delta] <frame1.pnm> [frame2.pnm ...]\n"
+        "  %s pack-frames     <output.pzp> <loop_count> <delay_ms> [--delta] [--lz4] <frame1.pnm> [frame2.pnm ...]\n"
         "  %s attach-audio    <input.pzp>  <audio_file> <output.pzp>\n"
-        "  %s attach-meta     <input.pzp>  <metadata>   <output.pzp>\n",
+        "  %s attach-meta     <input.pzp>  <metadata>   <output.pzp>\n"
+        "\n"
+        "Codec flags:\n"
+        "  --lz4    Use LZ4 instead of ZSTD (faster decompress, larger output)\n"
+        "  --delta  Inter-frame delta encoding (better ratio for slow-motion content)\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
@@ -366,11 +370,14 @@ int main(int argc, char *argv[])
         strcmp(operation, "compress-palette") == 0 ||
         strcmp(operation, "pack")             == 0)
     {
-        if (argc != 4) { print_usage(argv[0]); return EXIT_FAILURE; }
+        /* Optional --lz4 flag: pzp compress <in> <out> [--lz4] */
+        int use_lz4 = (argc == 5 && strcmp(argv[4], "--lz4") == 0);
+        if (argc != 4 && !use_lz4) { print_usage(argv[0]); return EXIT_FAILURE; }
 
         unsigned int configuration = USE_COMPRESSION | USE_RLE;
         if (strcmp(operation, "compress-palette") == 0) configuration |= USE_PALETTE;
         if (strcmp(operation, "pack")             == 0) configuration  = USE_COMPRESSION;
+        if (use_lz4)                                    configuration |= USE_LZ4;
 
         if (!compress_pnm_to_pzp(argv[2], argv[3], configuration))
             return EXIT_FAILURE;
@@ -499,13 +506,17 @@ int main(int argc, char *argv[])
         unsigned int  loop_count   = (unsigned int)atoi(argv[3]);
         unsigned int  global_delay = (unsigned int)atoi(argv[4]);
 
-        /* Optional --delta flag before the frame list. */
+        /* Optional --delta / --lz4 flags before the frame list (any order). */
         int use_delta = 0;
+        int use_lz4   = 0;
         int frames_argv_start = 5;
-        if (argc > 5 && strcmp(argv[5], "--delta") == 0)
+        while (frames_argv_start < argc &&
+               (strcmp(argv[frames_argv_start], "--delta") == 0 ||
+                strcmp(argv[frames_argv_start], "--lz4")   == 0))
         {
-            use_delta = 1;
-            frames_argv_start = 6;
+            if (strcmp(argv[frames_argv_start], "--delta") == 0) use_delta = 1;
+            if (strcmp(argv[frames_argv_start], "--lz4")   == 0) use_lz4   = 1;
+            frames_argv_start++;
         }
         if (argc <= frames_argv_start) { print_usage(argv[0]); return EXIT_FAILURE; }
 
@@ -554,7 +565,9 @@ int main(int argc, char *argv[])
             ch_exts[f]  = ch;
             bpp_ints[f] = (bpp == 16) ? 8 : bpp;
             ch_ints[f]  = (bpp == 16) ? ch * 2 : ch;
-            cfgs[f]     = USE_COMPRESSION | USE_RLE | (use_delta ? USE_INTER_DELTA : 0);
+            cfgs[f]     = USE_COMPRESSION | USE_RLE
+                        | (use_delta ? USE_INTER_DELTA : 0)
+                        | (use_lz4   ? USE_LZ4         : 0);
             delays[f]   = global_delay;
 
             all_buffers[f] = (unsigned char **)calloc(ch_ints[f], sizeof(unsigned char *));

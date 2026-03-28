@@ -85,7 +85,7 @@ is `USE_COMPRESSION | USE_RLE`; for label maps `USE_COMPRESSION | USE_RLE | USE_
 ## Dependencies
 
 ```bash
-sudo apt install libzstd-dev    # Ubuntu / Debian
+sudo apt install libzstd-dev liblz4-dev   # Ubuntu / Debian
 sudo dnf install libzstd-devel  # Fedora / RHEL
 brew install zstd               # macOS
 ```

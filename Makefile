@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -lzstd -lm
+CFLAGS = -lzstd -llz4 -lm
 SIMD_FLAGS = -DINTEL_OPTIMIZATIONS -D_GNU_SOURCE  -O3 -mavx2 -march=native -mtune=native  -fPIE -fPIC
 RELEASE_FLAGS= -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
 DEBUG_FLAGS = -D_GNU_SOURCE -O0 -g3 -fno-omit-frame-pointer -Wstrict-overflow -fPIE -fPIC

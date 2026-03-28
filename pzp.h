@@ -31,6 +31,8 @@ extern "C"
 
 #include <zstd.h>
 //sudo apt install libzstd-dev
+#include <lz4.h>
+//sudo apt install liblz4-dev
 
 #if INTEL_OPTIMIZATIONS
 #include <immintrin.h>  // AVX intrinsics
@@ -104,8 +106,16 @@ typedef enum
     USE_COMPRESSION  = 1 << 0,  // 0001 — zstd entropy coding (always on)
     USE_RLE          = 1 << 1,  // 0010 — intra-frame delta filter before zstd
     USE_PALETTE      = 1 << 2,  // 0100 — per-channel palette indexing
-    USE_INTER_DELTA  = 1 << 3   // 1000 — inter-frame delta: store frame[N] - frame[N-1]
+    USE_INTER_DELTA  = 1 << 3,  // 1000 — inter-frame delta: store frame[N] - frame[N-1]
+    USE_LZ4          = 1 << 4   // 10000 — use LZ4 instead of ZSTD (faster decompress on ramdisk)
 } PZPFlags;
+
+/* Bit 31 of the 4-byte frame-prefix uint32 encodes the codec.
+ * Bit 31 = 0: ZSTD (all existing files — backward compatible)
+ * Bit 31 = 1: LZ4
+ * Bits 0–30 hold the uncompressed payload size (max ~2 GB). */
+#define PZP_CODEC_LZ4_FLAG  0x80000000u
+#define PZP_CODEC_SIZE_MASK 0x7FFFFFFFu
 
 // ─── Container format constants ──────────────────────────────────────────────
 
@@ -425,27 +435,56 @@ static unsigned char *pzp_compress_frame_to_memory(
 
     h[7] = hash_checksum(write_ptr, pixel_data_size);
 
-    /* ── zstd compress ── */
-    int    zstd_level = (configuration & USE_PALETTE) ? 19 : 1;
-    size_t max_comp   = ZSTD_compressBound(payload_size);
+    /* ── compress (LZ4 or ZSTD) ── */
+    /* result layout: [4-byte prefix][compressed bytes]
+     * prefix bit 31 = codec: 0=ZSTD, 1=LZ4  (PZP_CODEC_LZ4_FLAG)
+     * prefix bits 0-30 = uncompressed payload size (PZP_CODEC_SIZE_MASK) */
+    size_t max_comp;
+    unsigned char *frame_buf;
+    size_t comp_size;
 
-    /* result layout: [4-byte uncompressed_size][compressed bytes] */
-    unsigned char *frame_buf = (unsigned char *)malloc(sizeof(unsigned int) + max_comp);
-    if (!frame_buf) { free(payload); return NULL; }
-
-    size_t comp_size = ZSTD_compress(
-            frame_buf + sizeof(unsigned int), max_comp,
-            payload, payload_size, zstd_level);
-    free(payload);
-
-    if (ZSTD_isError(comp_size))
+    if (configuration & USE_LZ4)
     {
-        fprintf(stderr, "pzp: zstd error: %s\n", ZSTD_getErrorName(comp_size));
-        free(frame_buf);
-        return NULL;
+        max_comp  = (size_t)LZ4_compressBound((int)payload_size);
+        frame_buf = (unsigned char *)malloc(sizeof(unsigned int) + max_comp);
+        if (!frame_buf) { free(payload); return NULL; }
+
+        int lz4_written = LZ4_compress_default(
+                (const char *)payload, (char *)(frame_buf + sizeof(unsigned int)),
+                (int)payload_size, (int)max_comp);
+        free(payload);
+
+        if (lz4_written <= 0)
+        {
+            fprintf(stderr, "pzp: lz4 compression failed\n");
+            free(frame_buf);
+            return NULL;
+        }
+        comp_size = (size_t)lz4_written;
+        unsigned int prefix = (unsigned int)payload_size | PZP_CODEC_LZ4_FLAG;
+        memcpy(frame_buf, &prefix, sizeof(unsigned int));
+    }
+    else
+    {
+        int    zstd_level = (configuration & USE_PALETTE) ? 19 : 1;
+        max_comp  = ZSTD_compressBound(payload_size);
+        frame_buf = (unsigned char *)malloc(sizeof(unsigned int) + max_comp);
+        if (!frame_buf) { free(payload); return NULL; }
+
+        comp_size = ZSTD_compress(
+                frame_buf + sizeof(unsigned int), max_comp,
+                payload, payload_size, zstd_level);
+        free(payload);
+
+        if (ZSTD_isError(comp_size))
+        {
+            fprintf(stderr, "pzp: zstd error: %s\n", ZSTD_getErrorName(comp_size));
+            free(frame_buf);
+            return NULL;
+        }
+        memcpy(frame_buf, &payload_size, sizeof(unsigned int));
     }
 
-    memcpy(frame_buf, &payload_size, sizeof(unsigned int));
     *out_size = sizeof(unsigned int) + comp_size;
 
     #if PZP_VERBOSE
@@ -1621,9 +1660,12 @@ static unsigned char* pzp_decompress_combined_from_memory(
     /* ── Legacy inner-frame format ──────────────────────────────────────── */
     const unsigned char *input_ptr = (const unsigned char *)file_data;
 
-    // Read stored size
-    unsigned int dataSize;
-    memcpy(&dataSize, input_ptr, sizeof(unsigned int));
+    // Read stored size prefix (bit 31 = codec: 0=ZSTD, 1=LZ4; bits 0-30 = uncompressed size)
+    unsigned int size_prefix;
+    memcpy(&size_prefix, input_ptr, sizeof(unsigned int));
+
+    int codec_is_lz4 = (size_prefix & PZP_CODEC_LZ4_FLAG) != 0;
+    unsigned int dataSize = size_prefix & PZP_CODEC_SIZE_MASK;
 
     if (dataSize == 0 || dataSize > 100000000)
     { // sanity check
@@ -1641,15 +1683,32 @@ static unsigned char* pzp_decompress_combined_from_memory(
         return 0;
     }
 
-    pzp_thread_init();  // no-op if already initialised
-    size_t actual_decompressed_size = _pzp_zstd_dctx
-        ? ZSTD_decompressDCtx(_pzp_zstd_dctx, decompressed_buffer, decompressed_size, compressed_buffer, compressed_size)
-        : ZSTD_decompress(decompressed_buffer, decompressed_size, compressed_buffer, compressed_size);
-    if (ZSTD_isError(actual_decompressed_size))
+    size_t actual_decompressed_size;
+    if (codec_is_lz4)
     {
-        free(decompressed_buffer);
-        fprintf(stderr, "Zstd decompression error: %s\n", ZSTD_getErrorName(actual_decompressed_size));
-        return 0;
+        int lz4_result = LZ4_decompress_safe(
+                (const char *)compressed_buffer, (char *)decompressed_buffer,
+                (int)compressed_size, (int)decompressed_size);
+        if (lz4_result < 0)
+        {
+            free(decompressed_buffer);
+            fprintf(stderr, "LZ4 decompression error: %d\n", lz4_result);
+            return 0;
+        }
+        actual_decompressed_size = (size_t)lz4_result;
+    }
+    else
+    {
+        pzp_thread_init();  // no-op if already initialised
+        actual_decompressed_size = _pzp_zstd_dctx
+            ? ZSTD_decompressDCtx(_pzp_zstd_dctx, decompressed_buffer, decompressed_size, compressed_buffer, compressed_size)
+            : ZSTD_decompress(decompressed_buffer, decompressed_size, compressed_buffer, compressed_size);
+        if (ZSTD_isError(actual_decompressed_size))
+        {
+            free(decompressed_buffer);
+            fprintf(stderr, "Zstd decompression error: %s\n", ZSTD_getErrorName(actual_decompressed_size));
+            return 0;
+        }
     }
 
     if (actual_decompressed_size != decompressed_size)

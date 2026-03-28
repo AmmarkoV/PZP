@@ -259,22 +259,34 @@ def benchmark_sample(sample_name, imread_flag, runs, active_binaries):
         spawn_overhead_ms = measure_subprocess_overhead(
             next(iter(active_binaries.values())), runs=max(runs, 8))
 
-        # Modes to benchmark: standard (compress) and palette (compress-palette).
-        modes = [("compress", "")]
-        # Check if the first binary supports compress-palette.
+        # Modes to benchmark: standard, lz4, palette, palette+lz4.
+        # Each entry: (compress_cmd, extra_flags, mode_tag, section_label)
         _probe_path = os.path.join(tmp, "probe.pzp")
-        _probe_rc, _ = run_binary([next(iter(active_binaries.values())),
-                                   "compress-palette", pnm_src, _probe_path])
-        if _probe_rc == 0:
-            modes.append(("compress-palette", " [pal]"))
+        first_bin   = next(iter(active_binaries.values()))
+        modes = [("compress", [], "", None)]
 
-        for compress_cmd, mode_tag in modes:
-            if mode_tag:
-                print(f"\n  {col('── palette mode' + ' ─'*27, CYAN)}")
+        _probe_rc, _ = run_binary([first_bin, "compress", pnm_src, _probe_path, "--lz4"])
+        if _probe_rc == 0:
+            modes.append(("compress", ["--lz4"], " [lz4]", "── lz4 mode"))
+
+        _probe_rc, _ = run_binary([first_bin, "compress-palette", pnm_src, _probe_path])
+        if _probe_rc == 0:
+            modes.append(("compress-palette", [], " [pal]", "── palette mode"))
+            _probe_rc, _ = run_binary([first_bin, "compress-palette",
+                                       pnm_src, _probe_path, "--lz4"])
+            if _probe_rc == 0:
+                modes.append(("compress-palette", ["--lz4"], " [pal+lz4]",
+                               "── palette + lz4 mode"))
+
+        for compress_cmd, extra_flags, mode_tag, section_label in modes:
+            if section_label:
+                dashes = "─" * (43 - len(section_label))
+                print(f"\n  {col(section_label + ' ' + dashes, CYAN)}")
             for label, binary in active_binaries.items():
                 tag = label.rstrip() + mode_tag
                 cmp_ms, (rc, _) = time_fn(
-                    lambda: run_binary([binary, compress_cmd, pnm_src, pzp_path]), runs)
+                    lambda c=compress_cmd, ef=extra_flags: run_binary(
+                        [binary, c, pnm_src, pzp_path] + ef), runs)
                 if rc != 0:
                     print(f"  {tag}  COMPRESS FAILED"); continue
 
@@ -488,78 +500,93 @@ def benchmark_directory(source_dir, pzp_dir, active_binaries, max_files, compare
         total_ppm = sum(ppm_sizes)
         total_src = sum(src_sizes)
 
-        for label, binary in active_binaries.items():
-            pzp_paths = [os.path.join(tmp, f"c_{i}.pzp") for i in range(n)]
-            out_ppms  = [os.path.join(tmp, f"d_{i}.ppm") for i in range(n)]
+        compress_modes = [("compress", [], "")]
+        # Probe lz4 support using the first binary and first source file.
+        _lz4_probe_out = os.path.join(tmp, "probe_lz4.pzp")
+        _lz4_probe_rc, _ = run_binary([
+            next(iter(active_binaries.values())),
+            "compress", ppm_paths[0], _lz4_probe_out, "--lz4"])
+        if _lz4_probe_rc == 0:
+            compress_modes.append(("compress", ["--lz4"], " [lz4]"))
 
-            # Compress all (from the PPM form)
-            t0 = time.perf_counter()
-            ok_compress = []
-            for ppm_p, pzp_p in zip(ppm_paths, pzp_paths):
-                rc, _ = run_binary([binary, "compress", ppm_p, pzp_p])
-                ok_compress.append(rc == 0 and os.path.exists(pzp_p))
-            comp_ms = (time.perf_counter() - t0) * 1e3
+        for compress_cmd, compress_flags, compress_mode_tag in compress_modes:
+            if compress_mode_tag:
+                dashes = "─" * (43 - len("── lz4 mode"))
+                print(f"\n  {col('── lz4 mode ' + dashes, CYAN)}")
 
-            pzp_sizes_ok  = [os.path.getsize(p) for p, ok in zip(pzp_paths, ok_compress) if ok]
-            ppm_sizes_ok  = [s for s, ok in zip(ppm_sizes, ok_compress) if ok]
-            src_sizes_ok  = [s for s, ok in zip(src_sizes, ok_compress) if ok]
-            n_ok_c        = sum(ok_compress)
-            total_pzp     = sum(pzp_sizes_ok)
+            for label, binary in active_binaries.items():
+                pzp_paths = [os.path.join(tmp, f"c_{i}.pzp") for i in range(n)]
+                out_ppms  = [os.path.join(tmp, f"d_{i}.ppm") for i in range(n)]
 
-            ratios_vs_ppm = [pp / pz for pp, pz in zip(ppm_sizes_ok, pzp_sizes_ok) if pz > 0]
-            ratios_vs_src = [ss / pz for ss, pz in zip(src_sizes_ok, pzp_sizes_ok) if pz > 0]
-            ratios_scratch = ratios_vs_ppm
+                # Compress all (from the PPM form)
+                t0 = time.perf_counter()
+                ok_compress = []
+                for ppm_p, pzp_p in zip(ppm_paths, pzp_paths):
+                    rc, _ = run_binary([binary, compress_cmd, ppm_p, pzp_p] + compress_flags)
+                    ok_compress.append(rc == 0 and os.path.exists(pzp_p))
+                comp_ms = (time.perf_counter() - t0) * 1e3
 
-            r_ppm = sum(ppm_sizes_ok) / total_pzp if total_pzp else 0
-            r_src = sum(src_sizes_ok) / total_pzp if total_pzp else 0
-            overall_r = r_ppm
+                pzp_sizes_ok  = [os.path.getsize(p) for p, ok in zip(pzp_paths, ok_compress) if ok]
+                ppm_sizes_ok  = [s for s, ok in zip(ppm_sizes, ok_compress) if ok]
+                src_sizes_ok  = [s for s, ok in zip(src_sizes, ok_compress) if ok]
+                n_ok_c        = sum(ok_compress)
+                total_pzp     = sum(pzp_sizes_ok)
 
-            # Decompress all successfully compressed files
-            t0 = time.perf_counter()
-            for pzp_p, out_p, ok in zip(pzp_paths, out_ppms, ok_compress):
-                if ok:
-                    run_binary([binary, "decompress", pzp_p, out_p])
-            decomp_ms = (time.perf_counter() - t0) * 1e3
+                ratios_vs_ppm = [pp / pz for pp, pz in zip(ppm_sizes_ok, pzp_sizes_ok) if pz > 0]
+                ratios_vs_src = [ss / pz for ss, pz in zip(src_sizes_ok, pzp_sizes_ok) if pz > 0]
+                ratios_scratch = ratios_vs_ppm
 
-            # Pixel comparison on random subset (compare against original source)
-            n_pass = n_diff = 0
-            max_global = 0
-            for src_p in compare_files:
-                idx   = files.index(src_p)
-                out_p = out_ppms[idx]
-                if not ok_compress[idx] or not os.path.exists(out_p):
-                    n_diff += 1; continue
-                try:
-                    orig  = load_image(src_p, probe_flag)
-                    recon = load_image(out_p, probe_flag)
-                    identical, max_diff, _ = compare(orig, recon)
-                    if identical:
-                        n_pass += 1
-                    else:
+                r_ppm = sum(ppm_sizes_ok) / total_pzp if total_pzp else 0
+                r_src = sum(src_sizes_ok) / total_pzp if total_pzp else 0
+                overall_r = r_ppm
+
+                # Decompress all successfully compressed files
+                t0 = time.perf_counter()
+                for pzp_p, out_p, ok in zip(pzp_paths, out_ppms, ok_compress):
+                    if ok:
+                        run_binary([binary, "decompress", pzp_p, out_p])
+                decomp_ms = (time.perf_counter() - t0) * 1e3
+
+                # Pixel comparison on random subset (compare against original source)
+                n_pass = n_diff = 0
+                max_global = 0
+                for src_p in compare_files:
+                    idx   = files.index(src_p)
+                    out_p = out_ppms[idx]
+                    if not ok_compress[idx] or not os.path.exists(out_p):
+                        n_diff += 1; continue
+                    try:
+                        orig  = load_image(src_p, probe_flag)
+                        recon = load_image(out_p, probe_flag)
+                        identical, max_diff, _ = compare(orig, recon)
+                        if identical:
+                            n_pass += 1
+                        else:
+                            n_diff += 1
+                            max_global = max(max_global, max_diff or 0)
+                    except Exception:
                         n_diff += 1
-                        max_global = max(max_global, max_diff or 0)
-                except Exception:
-                    n_diff += 1
 
-            px = (col(f"IDENTICAL ({n_pass}/{min(compare_count,n)})", GREEN)
-                  if n_diff == 0
-                  else col(f"{n_diff} DIFF  max={max_global}", YELLOW))
+                px = (col(f"IDENTICAL ({n_pass}/{min(compare_count,n)})", GREEN)
+                      if n_diff == 0
+                      else col(f"{n_diff} DIFF  max={max_global}", YELLOW))
 
-            comp_per   = comp_ms   / n_ok_c if n_ok_c else 0
-            decomp_per = decomp_ms / n_ok_c if n_ok_c else 0
+                comp_per   = comp_ms   / n_ok_c if n_ok_c else 0
+                decomp_per = decomp_ms / n_ok_c if n_ok_c else 0
 
-            print(f"  {label}  {comp_ms:>8.0f} ms  "
-                  f"{comp_per:>7.2f} ms  "
-                  f"{decomp_ms:>10.0f} ms  "
-                  f"{decomp_per:>9.2f} ms  "
-                  f"{fmt_bytes(total_pzp):>10}  "
-                  f"{r_ppm:>6.3f}×  "
-                  f"{r_src:>6.3f}×  "
-                  f"{px}")
+                row_label = label.rstrip() + compress_mode_tag
+                print(f"  {row_label:<18}  {comp_ms:>8.0f} ms  "
+                      f"{comp_per:>7.2f} ms  "
+                      f"{decomp_ms:>10.0f} ms  "
+                      f"{decomp_per:>9.2f} ms  "
+                      f"{fmt_bytes(total_pzp):>10}  "
+                      f"{r_ppm:>6.3f}×  "
+                      f"{r_src:>6.3f}×  "
+                      f"{px}")
 
-            all_rows.append((label, comp_per, decomp_per,
-                             total_pzp / n_ok_c if n_ok_c else 0,
-                             r_ppm, n_diff == 0))
+                all_rows.append((row_label, comp_per, decomp_per,
+                                 total_pzp / n_ok_c if n_ok_c else 0,
+                                 r_ppm, n_diff == 0))
 
     # Ratio detail lines (based on last binary run)
     if ratios_scratch:

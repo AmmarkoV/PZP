@@ -8,6 +8,7 @@ Usage:
 Options:
     --rle           Enable delta pre-filter (USE_RLE)
     --palette       Enable per-channel palette indexing (USE_PALETTE)
+    --lz4           Use LZ4 instead of ZSTD (faster decompress, larger output)
     --workers N     Parallel worker processes (default: CPU count)
     --ext EXT       Source extension to scan for (default: png)
 
@@ -72,6 +73,7 @@ def main():
     ap.add_argument("target_dir", help="Output directory for .pzp files")
     ap.add_argument("--rle",     action="store_true", help="Enable delta pre-filter")
     ap.add_argument("--palette", action="store_true", help="Enable palette indexing")
+    ap.add_argument("--lz4",     action="store_true", help="Use LZ4 instead of ZSTD")
     ap.add_argument("--workers", type=int, default=cpu_count(),
                     help=f"Parallel workers (default: {cpu_count()})")
     ap.add_argument("--ext", default="png",
@@ -92,10 +94,13 @@ def main():
         flags |= PZP.USE_RLE
     if args.palette:
         flags |= PZP.USE_PALETTE
+    if args.lz4:
+        flags |= PZP.USE_LZ4
 
     flag_names = []
     if flags & PZP.USE_RLE:     flag_names.append("RLE")
     if flags & PZP.USE_PALETTE: flag_names.append("PALETTE")
+    if flags & PZP.USE_LZ4:     flag_names.append("LZ4")
     flag_str = "+".join(flag_names) if flag_names else "none"
 
     ext = args.ext.lstrip(".")

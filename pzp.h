@@ -1212,6 +1212,131 @@ static void pzp_prefix_sum_avx2_2ch(unsigned char *src, unsigned char *dst, unsi
 }
 
 
+/*
+ * pzp_deinterleave_3ch
+ *
+ * Split n_pixels interleaved RGB bytes (src) into three separate planar
+ * buffers ch0/ch1/ch2, each of length n_pixels.
+ *
+ * SSSE3 path: 16 pixels (48 bytes) per iteration using _mm_shuffle_epi8.
+ * Three source chunks a/b/c each cover 16 bytes of the 48-byte input:
+ *   a = src[0..15]:  R0 G0 B0 R1 G1 B1 R2 G2 B2 R3 G3 B3 R4 G4 B4 R5
+ *   b = src[16..31]: G5 B5 R6 G6 B6 R7 G7 B7 R8 G8 B8 R9 G9 B9 R10 G10
+ *   c = src[32..47]: B10 R11 G11 B11 R12 G12 B12 R13 G13 B13 R14 G14 B14 R15 G15 B15
+ * Masks place each channel's bytes into the correct output positions (0x80 zeroes
+ * unused slots); the three OR'd shuffles produce one 16-byte channel result.
+ */
+static void pzp_deinterleave_3ch(
+    const unsigned char *src,
+    unsigned char *ch0, unsigned char *ch1, unsigned char *ch2,
+    unsigned int n_pixels)
+{
+    /* ch0 (R): a→R[0..5] at out[0..5], b→R[6..10] at out[6..10], c→R[11..15] at out[11..15] */
+    const __m128i shuf_r_a = _mm_setr_epi8( 0,  3,  6,  9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i shuf_r_b = _mm_setr_epi8(-1, -1, -1, -1, -1, -1,  2,  5,  8, 11, 14, -1, -1, -1, -1, -1);
+    const __m128i shuf_r_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  1,  4,  7, 10, 13);
+
+    /* ch1 (G): a→G[0..4] at out[0..4], b→G[5..10] at out[5..10], c→G[11..15] at out[11..15] */
+    const __m128i shuf_g_a = _mm_setr_epi8( 1,  4,  7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i shuf_g_b = _mm_setr_epi8(-1, -1, -1, -1, -1,  0,  3,  6,  9, 12, 15, -1, -1, -1, -1, -1);
+    const __m128i shuf_g_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  2,  5,  8, 11, 14);
+
+    /* ch2 (B): a→B[0..4] at out[0..4], b→B[5..9] at out[5..9], c→B[10..15] at out[10..15] */
+    const __m128i shuf_b_a = _mm_setr_epi8( 2,  5,  8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i shuf_b_b = _mm_setr_epi8(-1, -1, -1, -1, -1,  1,  4,  7, 10, 13, -1, -1, -1, -1, -1, -1);
+    const __m128i shuf_b_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  0,  3,  6,  9, 12, 15);
+
+    unsigned int i = 0;
+    for (; i + 15 < n_pixels; i += 16, src += 48)
+    {
+        __m128i a = _mm_loadu_si128((const __m128i *)(src +  0));
+        __m128i b = _mm_loadu_si128((const __m128i *)(src + 16));
+        __m128i c = _mm_loadu_si128((const __m128i *)(src + 32));
+
+        _mm_storeu_si128((__m128i *)(ch0 + i),
+            _mm_or_si128(_mm_shuffle_epi8(a, shuf_r_a),
+            _mm_or_si128(_mm_shuffle_epi8(b, shuf_r_b),
+                         _mm_shuffle_epi8(c, shuf_r_c))));
+        _mm_storeu_si128((__m128i *)(ch1 + i),
+            _mm_or_si128(_mm_shuffle_epi8(a, shuf_g_a),
+            _mm_or_si128(_mm_shuffle_epi8(b, shuf_g_b),
+                         _mm_shuffle_epi8(c, shuf_g_c))));
+        _mm_storeu_si128((__m128i *)(ch2 + i),
+            _mm_or_si128(_mm_shuffle_epi8(a, shuf_b_a),
+            _mm_or_si128(_mm_shuffle_epi8(b, shuf_b_b),
+                         _mm_shuffle_epi8(c, shuf_b_c))));
+    }
+    /* scalar tail */
+    for (; i < n_pixels; ++i, src += 3)
+    {
+        ch0[i] = src[0];
+        ch1[i] = src[1];
+        ch2[i] = src[2];
+    }
+}
+
+/*
+ * pzp_interleave_3ch
+ *
+ * Inverse of pzp_deinterleave_3ch: merge three planar channel buffers
+ * ch0/ch1/ch2 (each n_pixels bytes) back into interleaved RGB dst.
+ *
+ * For each 16-pixel block the three 16-byte channel vectors r/g/b are
+ * scattered into three 16-byte output chunks (out_a, out_b, out_c = 48 bytes):
+ *   out_a = [R0 G0 B0 R1 G1 B1 R2 G2 B2 R3 G3 B3 R4 G4 B4 R5]
+ *   out_b = [G5 B5 R6 G6 B6 R7 G7 B7 R8 G8 B8 R9 G9 B9 R10 G10]
+ *   out_c = [B10 R11 G11 B11 R12 G12 B12 R13 G13 B13 R14 G14 B14 R15 G15 B15]
+ */
+static void pzp_interleave_3ch(
+    const unsigned char *ch0, const unsigned char *ch1, const unsigned char *ch2,
+    unsigned char *dst,
+    unsigned int n_pixels)
+{
+    /* out_a: R at {0,3,6,9,12,15}, G at {1,4,7,10,13}, B at {2,5,8,11,14} */
+    const __m128i shuf_a_r = _mm_setr_epi8( 0, -1, -1,  1, -1, -1,  2, -1, -1,  3, -1, -1,  4, -1, -1,  5);
+    const __m128i shuf_a_g = _mm_setr_epi8(-1,  0, -1, -1,  1, -1, -1,  2, -1, -1,  3, -1, -1,  4, -1, -1);
+    const __m128i shuf_a_b = _mm_setr_epi8(-1, -1,  0, -1, -1,  1, -1, -1,  2, -1, -1,  3, -1, -1,  4, -1);
+
+    /* out_b: G at {0,3,6,9,12,15}, B at {1,4,7,10,13}, R at {2,5,8,11,14} */
+    const __m128i shuf_b_g = _mm_setr_epi8( 5, -1, -1,  6, -1, -1,  7, -1, -1,  8, -1, -1,  9, -1, -1, 10);
+    const __m128i shuf_b_b = _mm_setr_epi8(-1,  5, -1, -1,  6, -1, -1,  7, -1, -1,  8, -1, -1,  9, -1, -1);
+    const __m128i shuf_b_r = _mm_setr_epi8(-1, -1,  6, -1, -1,  7, -1, -1,  8, -1, -1,  9, -1, -1, 10, -1);
+
+    /* out_c: B at {0,3,6,9,12,15}, R at {1,4,7,10,13}, G at {2,5,8,11,14} */
+    const __m128i shuf_c_b = _mm_setr_epi8(10, -1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15);
+    const __m128i shuf_c_r = _mm_setr_epi8(-1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1, -1);
+    const __m128i shuf_c_g = _mm_setr_epi8(-1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1);
+
+    unsigned int i = 0;
+    for (; i + 15 < n_pixels; i += 16, dst += 48)
+    {
+        __m128i r = _mm_loadu_si128((const __m128i *)(ch0 + i));
+        __m128i g = _mm_loadu_si128((const __m128i *)(ch1 + i));
+        __m128i b = _mm_loadu_si128((const __m128i *)(ch2 + i));
+
+        _mm_storeu_si128((__m128i *)(dst +  0),
+            _mm_or_si128(_mm_shuffle_epi8(r, shuf_a_r),
+            _mm_or_si128(_mm_shuffle_epi8(g, shuf_a_g),
+                         _mm_shuffle_epi8(b, shuf_a_b))));
+        _mm_storeu_si128((__m128i *)(dst + 16),
+            _mm_or_si128(_mm_shuffle_epi8(g, shuf_b_g),
+            _mm_or_si128(_mm_shuffle_epi8(b, shuf_b_b),
+                         _mm_shuffle_epi8(r, shuf_b_r))));
+        _mm_storeu_si128((__m128i *)(dst + 32),
+            _mm_or_si128(_mm_shuffle_epi8(b, shuf_c_b),
+            _mm_or_si128(_mm_shuffle_epi8(r, shuf_c_r),
+                         _mm_shuffle_epi8(g, shuf_c_g))));
+    }
+    /* scalar tail */
+    for (; i < n_pixels; ++i, dst += 3)
+    {
+        dst[0] = ch0[i];
+        dst[1] = ch1[i];
+        dst[2] = ch2[i];
+    }
+}
+
+
 static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
 {
     unsigned int total_size = width * height;
@@ -1231,26 +1356,19 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 break;
             }
             case 3: {
-                // De-interleave into 3 planar buffers, run AVX2 prefix sum on each,
-                // then re-interleave.  Eliminates the serial carry-dependency chain
-                // that made the previous scalar loop the #1 callgrind hotspot.
+                // De-interleave via SSSE3 shuffle (16 px/iter), run AVX2 prefix
+                // sum on each planar buffer, then re-interleave via SSSE3 shuffle.
+                // Replaces the previous scalar stride-3 loops (~6.66B instructions
+                // callgrind hotspot) with ~16× faster SIMD scatter/gather.
                 unsigned char *ch0 = (unsigned char *)malloc(total_size);
                 unsigned char *ch1 = (unsigned char *)malloc(total_size);
                 unsigned char *ch2 = (unsigned char *)malloc(total_size);
                 if (ch0 && ch1 && ch2) {
-                    for (unsigned int i = 0; i < total_size; ++i) {
-                        ch0[i] = src[i*3];
-                        ch1[i] = src[i*3+1];
-                        ch2[i] = src[i*3+2];
-                    }
+                    pzp_deinterleave_3ch(src, ch0, ch1, ch2, total_size);
                     pzp_prefix_sum_avx2(ch0, ch0, total_size);
                     pzp_prefix_sum_avx2(ch1, ch1, total_size);
                     pzp_prefix_sum_avx2(ch2, ch2, total_size);
-                    for (unsigned int i = 0; i < total_size; ++i) {
-                        r[i*3]   = ch0[i];
-                        r[i*3+1] = ch1[i];
-                        r[i*3+2] = ch2[i];
-                    }
+                    pzp_interleave_3ch(ch0, ch1, ch2, r, total_size);
                 } else {
                     // OOM fallback: scalar
                     r[0] = src[0]; r[1] = src[1]; r[2] = src[2];

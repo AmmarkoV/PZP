@@ -1231,14 +1231,36 @@ static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, un
                 break;
             }
             case 3: {
-                // Scalar prefix sum for 3-channel interleaved data.
-                r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
-                for (unsigned int i = 1; i < total_size; ++i)
-                {
-                    r[i*3]   = src[i*3]   + r[(i-1)*3];
-                    r[i*3+1] = src[i*3+1] + r[(i-1)*3+1];
-                    r[i*3+2] = src[i*3+2] + r[(i-1)*3+2];
+                // De-interleave into 3 planar buffers, run AVX2 prefix sum on each,
+                // then re-interleave.  Eliminates the serial carry-dependency chain
+                // that made the previous scalar loop the #1 callgrind hotspot.
+                unsigned char *ch0 = (unsigned char *)malloc(total_size);
+                unsigned char *ch1 = (unsigned char *)malloc(total_size);
+                unsigned char *ch2 = (unsigned char *)malloc(total_size);
+                if (ch0 && ch1 && ch2) {
+                    for (unsigned int i = 0; i < total_size; ++i) {
+                        ch0[i] = src[i*3];
+                        ch1[i] = src[i*3+1];
+                        ch2[i] = src[i*3+2];
+                    }
+                    pzp_prefix_sum_avx2(ch0, ch0, total_size);
+                    pzp_prefix_sum_avx2(ch1, ch1, total_size);
+                    pzp_prefix_sum_avx2(ch2, ch2, total_size);
+                    for (unsigned int i = 0; i < total_size; ++i) {
+                        r[i*3]   = ch0[i];
+                        r[i*3+1] = ch1[i];
+                        r[i*3+2] = ch2[i];
+                    }
+                } else {
+                    // OOM fallback: scalar
+                    r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
+                    for (unsigned int i = 1; i < total_size; ++i) {
+                        r[i*3]   = src[i*3]   + r[(i-1)*3];
+                        r[i*3+1] = src[i*3+1] + r[(i-1)*3+1];
+                        r[i*3+2] = src[i*3+2] + r[(i-1)*3+2];
+                    }
                 }
+                free(ch0); free(ch1); free(ch2);
                 break;
             }
             default: {

@@ -7,9 +7,9 @@ with Python bindings and a pip-installable package.
 
 ## Overview
 
-PZP stores images as zstd-compressed PNM data with a compact binary header.
-It is designed for applications that need fast, lossless image storage with
-better compression than raw PNM/PPM, and a simpler implementation than PNG.
+PZP stores images as zstd- or LZ4-compressed PNM data with a compact binary
+header.  It is designed for applications that need fast, lossless image storage
+with better compression than raw PNM/PPM, and a simpler implementation than PNG.
 
 Goals:
 1. Header-only C implementation (`pzp.h`) — drop `#include "pzp.h"` and go
@@ -17,7 +17,9 @@ Goals:
 3. Decode speed faster than PNG for real-world datasets
 4. Compression ratio better than PNG on many image types
 5. Optional per-channel palette indexing for label / segmentation maps
-6. Python bindings via ctypes — installable with `pip`
+6. Optional LZ4 codec for even faster decompression (at lower compression ratio)
+7. Multi-frame animated container with per-frame delays, loop count, embedded audio and metadata
+8. Python bindings via ctypes — installable with `pip`
 
 Similar projects: [QOI](https://github.com/phoboslab/qoi), [ZPNG](https://github.com/catid/Zpng)
 
@@ -56,9 +58,13 @@ extremely well with zstd.
 
 ## File format
 
+### Single-frame `.pzp`
+
 ```
-[ 4 bytes  ] uncompressed payload size (uint32, little-endian)
-[ N bytes  ] zstd-compressed payload:
+[ 4 bytes  ] size prefix (uint32, little-endian):
+               bit 31 = codec flag  (0 = ZSTD, 1 = LZ4)
+               bits 0–30 = uncompressed payload size
+[ N bytes  ] compressed payload (ZSTD or LZ4):
     [ 40 bytes ] header  (10 × uint32)
                    magic · bpp_ext · channels_ext · width · height
                    bpp_int · channels_int · checksum · config · palette_bytes
@@ -67,18 +73,41 @@ extremely well with zstd.
 ```
 
 16-bit images are stored as two 8-bit internal channels per original channel
-(high-byte plane / low-byte plane), which improves zstd's compression ratio.
+(high-byte plane / low-byte plane), which improves compression ratio.
 
-### Compression modes
+### Container `.pzp` (animated / multi-frame)
+
+```
+[ 48 bytes ] PZPContainerHeader  (12 × uint32)
+               magic · version · frame_count · loop_count
+               metadata_offset · metadata_bytes
+               audio_offset · audio_bytes · audio_format
+               container_flags · header_checksum · reserved
+[ frame_count × 16 bytes ] frame index (PZPFrameEntry, 4 × uint32 each)
+               frame_offset · compressed_size · delay_ms · reserved
+[ frame data  ] per-frame blocks (each = size-prefixed single-frame payload)
+[ metadata    ] optional opaque blob
+[ audio       ] optional raw audio bytes (WAV / MP3 / OGG / FLAC)
+```
+
+### Compression flags
 
 | Flag | Value | Effect |
 |---|---|---|
-| `USE_COMPRESSION` | 1 | zstd entropy coding (always set) |
+| `USE_COMPRESSION` | 1 | ZSTD entropy coding (always set) |
 | `USE_RLE` | 2 | Left-pixel delta pre-filter — improves ratio on smooth / gradient images |
 | `USE_PALETTE` | 4 | Per-channel palette indexing — best for images with few unique values per channel (e.g. segmentation maps) |
+| `USE_INTER_DELTA` | 8 | Inter-frame delta — each frame stores `frame[N] − frame[N−1]`; useful only when consecutive frames are very similar (slow pan, static background) |
+| `USE_LZ4` | 16 | Use LZ4 instead of ZSTD — faster decompression, larger output; codec is stored per-frame in bit 31 of the size prefix |
 
-Flags can be combined with `|`.  The recommended combination for smooth images
-is `USE_COMPRESSION | USE_RLE`; for label maps `USE_COMPRESSION | USE_RLE | USE_PALETTE`.
+Flags can be combined with `|`.  Recommended combinations:
+
+| Use case | Flags |
+|---|---|
+| Natural images / photos | `USE_COMPRESSION \| USE_RLE` |
+| Segmentation / label maps | `USE_COMPRESSION \| USE_RLE \| USE_PALETTE` |
+| Latency-critical loader | `USE_COMPRESSION \| USE_RLE \| USE_LZ4` |
+| Slow-motion animation | `USE_COMPRESSION \| USE_RLE \| USE_INTER_DELTA` |
 
 ---
 
@@ -86,9 +115,12 @@ is `USE_COMPRESSION | USE_RLE`; for label maps `USE_COMPRESSION | USE_RLE | USE_
 
 ```bash
 sudo apt install libzstd-dev liblz4-dev   # Ubuntu / Debian
-sudo dnf install libzstd-devel  # Fedora / RHEL
-brew install zstd               # macOS
+sudo dnf install libzstd-devel lz4-devel  # Fedora / RHEL
+brew install zstd lz4                     # macOS
 ```
+
+Both `libzstd` and `liblz4` are required.  All build targets and the shared
+library link against both.
 
 ---
 
@@ -175,18 +207,50 @@ The `pzp` binary reads and writes PNM/PPM files (P5 grayscale, P6 colour).
 
 ```bash
 # Compress (zstd + delta filter)
-./pzp compress      input.ppm  output.pzp
-./pzp compress      input.pnm  output.pzp   # 16-bit depth supported
+./pzp compress          input.ppm  output.pzp
+./pzp compress          input.pnm  output.pzp   # 16-bit depth supported
+
+# Compress with LZ4 (faster decompress, larger file)
+./pzp compress          input.ppm  output.pzp  --lz4
 
 # Compress with palette mode (best for segmentation / label maps)
 ./pzp compress-palette  input.ppm  output.pzp
+./pzp compress-palette  input.ppm  output.pzp  --lz4
 
 # Pack (zstd only, no delta filter)
-./pzp pack          input.ppm  output.pzp
+./pzp pack              input.ppm  output.pzp
+./pzp pack              input.ppm  output.pzp  --lz4
 
-# Decompress (any mode — flags are stored in the file)
-./pzp decompress    output.pzp  reconstructed.ppm
+# Decompress (any mode — codec and flags are stored in the file)
+./pzp decompress        output.pzp  reconstructed.ppm
+
+# Inspect a container (frames, loop count, audio, metadata)
+./pzp info              file.pzp
+
+# Extract a single frame from a container
+./pzp extract-frame     file.pzp  frame0.ppm  0
+
+# Pack multiple PNM frames into an animated container
+./pzp pack-frames  out.pzp  <loop_count> <delay_ms>  frame*.ppm
+./pzp pack-frames  out.pzp  0 100  --delta  frame*.ppm   # inter-frame delta
+./pzp pack-frames  out.pzp  0 100  --lz4    frame*.ppm   # LZ4 codec
+./pzp pack-frames  out.pzp  0 100  --delta --lz4  frame*.ppm  # both
+
+# Attach audio to an existing container
+./pzp attach-audio  input.pzp  sound.wav  output.pzp
+./pzp attach-audio  input.pzp  music.mp3  output.pzp
+
+# Attach metadata string to an existing container
+./pzp attach-meta   input.pzp  '{"fps":24}' output.pzp
 ```
+
+Codec flags available on `compress`, `compress-palette`, `pack`, `pack-frames`:
+
+| Flag | Effect |
+|---|---|
+| *(none)* | ZSTD compression (default) |
+| `--lz4` | LZ4 compression — faster decompress, larger output |
+| `--delta` | Inter-frame delta (`pack-frames` only) |
 
 PNG and JPEG source files must be converted to PNM/PPM first (the binary has
 no libpng / libjpeg dependency by design):
@@ -200,8 +264,8 @@ ffmpeg -i photo.jpg photo.ppm     # FFmpeg
 
 ## C API (`pzp.h`)
 
-Include the header and link with `-lzstd`.  All functions are `static` inline;
-no separate compilation step is needed.
+Include the header and link with `-lzstd -llz4`.  All functions are `static`
+inline; no separate compilation step is needed.
 
 ### Decompress from file
 
@@ -245,11 +309,30 @@ void pzp_compress_combined(
 
 ```c
 typedef enum {
-    USE_COMPRESSION = 1 << 0,  // zstd entropy coding (always set)
-    USE_RLE         = 1 << 1,  // delta pre-filter
+    USE_COMPRESSION = 1 << 0,  // ZSTD entropy coding (always set)
+    USE_RLE         = 1 << 1,  // left-pixel delta pre-filter
     USE_PALETTE     = 1 << 2,  // per-channel palette indexing
+    USE_INTER_DELTA = 1 << 3,  // inter-frame delta (container only)
+    USE_LZ4         = 1 << 4,  // use LZ4 instead of ZSTD
 } PZPFlags;
 ```
+
+### Thread lifecycle (worker threads / data loaders)
+
+The decompression path keeps a per-thread `ZSTD_DCtx` to amortise context
+allocation across calls.  For clean shutdown or eager warm-up:
+
+```c
+// Call at thread start to eagerly allocate the ZSTD context.
+// No-op if already initialised.
+static inline void pzp_thread_init(void);
+
+// Call at thread exit to free the per-thread context.
+// Prevents leak-sanitiser noise (valgrind, LSAN).
+static inline void pzp_thread_cleanup(void);
+```
+
+LZ4 decompression is stateless and requires no context management.
 
 ---
 
@@ -258,6 +341,8 @@ typedef enum {
 `pzp_lib.c` exposes a stable ABI for ctypes / FFI consumers:
 
 ```c
+/* ── Single-frame I/O ──────────────────────────────────────────────────────── */
+
 // Decompress a .pzp file → malloc'd pixel buffer (caller frees with pzp_free).
 unsigned char *pzp_decompress_file(
     const char   *filename,
@@ -267,6 +352,7 @@ unsigned char *pzp_decompress_file(
     unsigned int *configuration);
 
 // Compress raw interleaved pixel data → .pzp file.
+// configuration may include USE_LZ4 to select the LZ4 codec.
 // Returns 1 on success, 0 on failure.
 int pzp_compress_file(
     const unsigned char *pixels,
@@ -277,6 +363,53 @@ int pzp_compress_file(
     const char  *output_filename);
 
 void pzp_free(void *ptr);
+
+/* ── Container (multi-frame) API ───────────────────────────────────────────── */
+
+unsigned int   pzp_container_frame_count(const char *filename);
+unsigned int   pzp_container_get_loop_count(const char *filename);
+
+// Fill delays_out[0..frame_count-1] with per-frame delay in ms.
+// Returns frame count on success, -1 on error.
+int pzp_container_get_delays(const char *filename,
+                              unsigned int *delays_out, unsigned int max_frames);
+
+// Decompress one frame from a container.
+unsigned char *pzp_container_get_frame(
+    const char   *filename,      unsigned int  frame_index,
+    unsigned int *width,         unsigned int *height,
+    unsigned int *bpp_ext,       unsigned int *channels_ext,
+    unsigned int *bpp_int,       unsigned int *channels_int,
+    unsigned int *configuration);
+
+// Read the embedded metadata blob (caller frees with pzp_free).
+unsigned char *pzp_container_read_metadata(const char *filename,
+                                            unsigned int *bytes_out);
+
+// Read the embedded audio blob (caller frees with pzp_free).
+// format_out receives the PZP_AUDIO_* four-char tag.
+unsigned char *pzp_container_read_audio(const char *filename,
+                                         unsigned int *bytes_out,
+                                         unsigned int *format_out);
+
+// Write a multi-frame container.  configurations[] is per-frame and may
+// mix ZSTD and LZ4 frames.  Returns 1 on success, 0 on failure.
+int pzp_write_frames(
+    const char          *output_filename,
+    const unsigned char **pixel_arrays,  unsigned int frame_count,
+    unsigned int *widths,                unsigned int *heights,
+    unsigned int *bpps,                  unsigned int *channels_arr,
+    unsigned int *configurations,        unsigned int *delay_ms_arr,
+    unsigned int  loop_count,
+    const unsigned char *metadata,       unsigned int metadata_bytes,
+    const unsigned char *audio,          unsigned int audio_bytes,
+    unsigned int  audio_format);
+
+/* ── Thread lifecycle ──────────────────────────────────────────────────────── */
+
+// Exported wrappers around the static-inline pzp_thread_init / cleanup.
+void pzp_thread_init_export(void);
+void pzp_thread_cleanup_export(void);
 ```
 
 ```bash
@@ -353,11 +486,13 @@ import cv2
 
 # From a numpy array (uint8 or uint16)
 img = cv2.imread("photo.ppm")
-pzp.write("photo.pzp", img)                              # zstd only
+pzp.write("photo.pzp", img)                              # ZSTD only
 pzp.write("photo.pzp", img, use_rle=True)                # + delta pre-filter
 pzp.write("photo.pzp", img, use_palette=True)            # + palette indexing
 pzp.write("photo.pzp", img, use_rle=True,
                              use_palette=True)            # all filters
+pzp.write("photo.pzp", img, use_lz4=True)               # LZ4 codec
+pzp.write("photo.pzp", img, use_rle=True, use_lz4=True) # delta + LZ4
 
 # 16-bit grayscale
 depth = cv2.imread("depth.pnm", cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
@@ -370,12 +505,79 @@ pzp.write("out.pzp", raw_bytes, width=640, height=360, bpp=8, channels=3)
 pzp.write("out.pzp", img, configuration=pzp.USE_COMPRESSION | pzp.USE_RLE)
 ```
 
+### Write animated container
+
+```python
+import PZP
+
+# Encode GIF frames + embedded audio
+frames = [...]   # list of (H, W, 3) uint8 numpy arrays
+delays = [100] * len(frames)   # ms per frame
+
+PZP.write_container("anim.pzp", frames,
+                    delays=delays, loop_count=0,  # 0 = loop forever
+                    use_rle=True)
+
+# With LZ4 for faster loading
+PZP.write_container("anim_fast.pzp", frames,
+                    delays=delays, loop_count=0,
+                    use_rle=True, use_lz4=True)
+
+# With inter-frame delta (for slow-motion / nearly-identical frames)
+PZP.write_container("anim_delta.pzp", frames,
+                    delays=delays, loop_count=0,
+                    use_rle=True, use_inter_delta=True)
+
+# Embed audio
+with open("music.mp3", "rb") as f:
+    audio = f.read()
+PZP.write_container("anim_sound.pzp", frames,
+                    delays=delays, loop_count=0,
+                    audio=audio, audio_format="MPEG")
+```
+
+### Read animated container
+
+```python
+import PZP
+
+n          = PZP.frame_count("anim.pzp")
+loop       = PZP.get_loop_count("anim.pzp")   # 0 = forever
+delays     = PZP.get_delays("anim.pzp")        # list of ms per frame
+
+frame0     = PZP.read_frame("anim.pzp", 0)    # numpy (H, W, C) uint8
+audio, fmt = PZP.get_audio("anim.pzp")         # bytes, format str (e.g. "MPEG")
+meta       = PZP.get_metadata("anim.pzp")      # bytes or None
+```
+
+### Thread lifecycle
+
+```python
+import PZP
+import threading
+
+def worker():
+    PZP.thread_init()     # eagerly allocate per-thread ZSTD context
+    try:
+        for path in paths:
+            img = PZP.read(path)
+            # ...
+    finally:
+        PZP.thread_cleanup()   # free context at thread exit (valgrind-clean)
+
+# DataLoader integration (PyTorch / similar)
+loader = DataLoader(dataset, num_workers=8,
+                    worker_init_fn=lambda _: PZP.thread_init())
+```
+
 ### Configuration constants
 
 ```python
-pzp.USE_COMPRESSION  # = 1  always active
-pzp.USE_RLE          # = 2  delta pre-filter
-pzp.USE_PALETTE      # = 4  per-channel palette indexing
+pzp.USE_COMPRESSION  # = 1   always active
+pzp.USE_RLE          # = 2   left-pixel delta pre-filter
+pzp.USE_PALETTE      # = 4   per-channel palette indexing
+pzp.USE_INTER_DELTA  # = 8   inter-frame delta (container only)
+pzp.USE_LZ4          # = 16  LZ4 codec instead of ZSTD
 ```
 
 ### Without numpy
@@ -395,37 +597,107 @@ pzp.USE_PALETTE      # = 4  per-channel palette indexing
 
 ---
 
-## Batch encoding and benchmarking scripts
+## Scripts
 
-### Encode a directory of images to PZP
+### `scripts/encode_directory.py` — batch encode a directory to PZP
 
-`scripts/encode_directory.py` encodes every PNG (or other format) in a source
-directory to a matching PZP file in a target directory, in parallel.
+Encodes every PNG (or other format) in a source directory to a matching PZP
+file in a target directory, preserving sub-directory structure, in parallel.
 
 ```bash
 # Standard compression
 python3 scripts/encode_directory.py test/segment_val2017 test/segment_val2017PZP
 
-# With RLE + palette (best ratio for segmentation maps)
+# RLE + palette (best ratio for segmentation maps)
 python3 scripts/encode_directory.py test/segment_val2017 test/segment_val2017PZP \
     --rle --palette
 
-# Control source format and parallelism
-python3 scripts/encode_directory.py samples/ output/ --ext ppm --workers 8
+# LZ4 for fastest possible load time
+python3 scripts/encode_directory.py frames/ frames_pzp/ --lz4
+
+# LZ4 + RLE, source extension, parallelism
+python3 scripts/encode_directory.py samples/ output/ --ext ppm --workers 8 --lz4 --rle
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--rle` | off | Enable delta pre-filter |
 | `--palette` | off | Enable palette indexing |
+| `--lz4` | off | Use LZ4 codec instead of ZSTD |
 | `--workers N` | CPU count | Parallel encoding processes |
 | `--ext EXT` | `png` | Source file extension |
 
-### Compare load speed: PNG vs PZP
+---
 
-`scripts/compare_load_speed.py` loads every matched pair from two directories
-(one PNG, one PZP) using `cv2.imread` and `pzp.read` respectively, reporting
-total time, per-image time, and winner across multiple passes.
+### `scripts/encode_animation_with_sound.py` — GIF + audio → PZP container
+
+Reads a GIF (animated or static) and an audio file, and packs them into a
+single self-contained `.pzp` container.  Loop count and per-frame delays are
+read automatically from the GIF and can be overridden.
+
+```bash
+# Basic usage — output defaults to <gif_stem>.pzp
+python3 scripts/encode_animation_with_sound.py animation.gif music.mp3
+
+# Specify output path
+python3 scripts/encode_animation_with_sound.py animation.gif sound.wav out.pzp
+
+# With compression options
+python3 scripts/encode_animation_with_sound.py animation.gif music.mp3 \
+    --rle --palette
+
+# With inter-frame delta (only beneficial for near-identical consecutive frames)
+python3 scripts/encode_animation_with_sound.py animation.gif music.mp3 --delta
+
+# Override loop count and frame rate
+python3 scripts/encode_animation_with_sound.py animation.gif music.mp3 \
+    --loop 3 --fps 12
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--rle` | off | Intra-frame delta pre-filter |
+| `--palette` | off | Per-channel palette encoding |
+| `--delta` | off | Inter-frame delta — only helps when frames are very similar |
+| `--loop N` | from GIF | Loop count (0 = forever) |
+| `--fps FPS` | from GIF | Override per-frame delay |
+
+Dependencies: `pip install Pillow numpy`
+
+---
+
+### `scripts/pzp-player` — animated PZP playback with audio
+
+Interactive player for animated `.pzp` containers.  Renders frames at their
+stored delays and plays back embedded audio synchronously.
+
+```bash
+pzp-player animation.pzp
+pzp-player animation.pzp --scale 2.0   # 2× zoom
+pzp-player animation.pzp --fps 24      # override playback speed
+```
+
+| Key | Action |
+|---|---|
+| `Space` | Pause / resume |
+| `←` / `→` | Step one frame (while paused) |
+| `R` | Restart from frame 0 |
+| `Q` / `Esc` | Quit |
+
+| Flag | Default | Description |
+|---|---|---|
+| `--scale FACTOR` | 1.0 | Window scale factor |
+| `--fps FPS` | from file | Override playback speed |
+
+Dependencies: `pip install numpy pygame`
+
+---
+
+### `scripts/compare_load_speed.py` — compare load speed: PNG vs PZP
+
+Loads every matched pair from two directories (one PNG, one PZP) using
+`cv2.imread` and `pzp.read` respectively, reporting total time, per-image
+time, and winner across multiple passes.
 
 ```bash
 python3 scripts/compare_load_speed.py \
@@ -440,11 +712,12 @@ python3 scripts/compare_load_speed.py \
 | `--passes N` | 3 | Timed measurement passes |
 | `--no-verify` | off | Skip pixel-identity check |
 
-### General benchmark (samples + directory mode)
+---
 
-`scripts/benchmark.py` times all build targets (`pzp`, `spzp`, `dpzp`) and
-compares them against PNG and JPEG for the bundled samples or any source
-directory.
+### `scripts/benchmark.py` — general benchmark
+
+Times all build targets (`pzp`, `spzp`, `dpzp`) and compares them against
+PNG and JPEG for the bundled samples or any source directory.
 
 ```bash
 source venv/bin/activate
@@ -477,6 +750,24 @@ python3 scripts/benchmark.py \
 
 PNG and JPEG sources are automatically pre-converted to PPM for the PZP binary
 (which reads PNM/PPM only), keeping the comparison fair.
+
+---
+
+## Compile-time options
+
+| Macro | Default | Effect |
+|---|---|---|
+| `PZP_VERBOSE=1` | 0 | Print per-frame encoding stats: delta coverage, compression ratio, end-of-container summary |
+| `PZP_VERIFY_CHECKSUM=1` | 0 | Verify pixel-data and container-header checksums on read (adds ~9% CPU; off by default for data-loader use) |
+| `INTEL_OPTIMIZATIONS` | off | Enable SSE2 / AVX2 SIMD prefix-scan on the decode path (`spzp` build target) |
+
+```bash
+# Verbose build — shows per-frame stats during encode
+gcc pzp.c -DPZP_VERBOSE=1 -lzstd -llz4 -lm -o pzp_verbose
+
+# Checksum-verifying build — use for integrity checks, not production loading
+gcc pzp.c -DPZP_VERIFY_CHECKSUM=1 -lzstd -llz4 -lm -o pzp_checked
+```
 
 ---
 

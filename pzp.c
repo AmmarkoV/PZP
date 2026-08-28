@@ -283,7 +283,7 @@ static int compress_pnm_to_pzp(const char *input, const char *output, unsigned i
     }
 
     pzp_split_channels(image, buffers, channelsInternal, width, height);
-    pzp_compress_combined(buffers, width, height,
+    int ok = pzp_compress_combined(buffers, width, height,
                           bitsperpixel, channels,
                           bitsperpixelInternal, channelsInternal,
                           configuration, output);
@@ -291,7 +291,7 @@ static int compress_pnm_to_pzp(const char *input, const char *output, unsigned i
     for (unsigned int ch = 0; ch < channelsInternal; ch++) free(buffers[ch]);
     free(buffers);
     free(image);
-    return 1;
+    return ok;
 }
 
 /* Detect audio format from file extension. */
@@ -589,7 +589,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "pack-frames: writing %u frames to %s\n",
                     frame_count, output_path);
-            pzp_container_write(output_path, all_buffers,
+            ok = pzp_container_write(output_path, all_buffers,
                                 frame_count, widths, heights,
                                 bpp_exts, ch_exts, bpp_ints, ch_ints,
                                 cfgs, delays, loop_count,

@@ -96,14 +96,14 @@ int pzp_compress_file(
 
     pzp_split_channels(pixels, buffers, channels_internal, width, height);
 
-    pzp_compress_combined(buffers, width, height,
+    int ok = pzp_compress_combined(buffers, width, height,
                           bpp, channels,
                           bpp_internal, channels_internal,
                           configuration, output_filename);
 
     for (unsigned int ch = 0; ch < channels_internal; ch++) free(buffers[ch]);
     free(buffers);
-    return 1;
+    return ok;
 }
 
 /* ── Container API ─────────────────────────────────────────────────────────── */
@@ -282,7 +282,7 @@ int pzp_write_frames(
     }
 
     if (ok)
-        pzp_container_write(output_filename, all_buffers,
+        ok = pzp_container_write(output_filename, all_buffers,
                             frame_count, widths, heights,
                             bpp_exts, ch_exts, bpp_ints, ch_ints,
                             configurations, delay_arr, loop_count,

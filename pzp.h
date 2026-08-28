@@ -177,10 +177,18 @@ static unsigned int convert_header(const char header[4])
            ((unsigned int)header[3]);
 }
 
+/* fail() used to unconditionally exit() the whole process here on any internal error ( allocation
+ * failure, a bad output path, a failed frame compression - all inside pzp_container_write() , i.e.
+ * the WRITE path only ). That's wrong for a function embedded as a library ( pzp_lib.c's libpzp.so ,
+ * loaded by the Python bindings, or any other host program ) : one caller's write failure ( disk full,
+ * bad permissions, OOM ) would otherwise take the entire host process down with it, not just that one
+ * call. fail() now just logs - pzp_container_write() ( the only caller ) returns 0 right after each
+ * fail() call instead of relying on it to never return, and that propagates up through
+ * pzp_compress_combined() to its callers ( pzp_lib.c, pzp.c ) as an ordinary 0/1 result. A CLI tool
+ * that wants exit()-on-failure behavior ( like pzp.c ) gets it by checking that return value itself. */
 static void fail(const char * message)
 {
   fprintf(stderr,RED "PZP Fatal Error: %s\n" NORMAL,message);
-  exit(EXIT_FAILURE);
 }
 
 static unsigned int hash_checksum(const void *data, size_t dataSize)
@@ -528,7 +536,9 @@ static unsigned char *pzp_compress_frame_to_memory(
  *
  * NOTE: modifies each frame's buffers in-place.
  */
-static void pzp_container_write(
+/* Returns 1 on success, 0 on failure ( bad output path, allocation failure, a frame that failed to
+ * compress ). Never exits/longjmps - see the comment on fail() above. */
+static int pzp_container_write(
         const char    *output_filename,
         unsigned char ***all_buffers,
         unsigned int   frame_count,
@@ -554,6 +564,7 @@ static void pzp_container_write(
     {
         free(frame_bufs); free(frame_sizes); free(frame_offsets);
         fail("pzp_container_write: allocation failed");
+        return 0;
     }
 
     /* Reference buffers for USE_INTER_DELTA: prev_orig[c] holds the ORIGINAL
@@ -678,6 +689,7 @@ static void pzp_container_write(
             }
             free(frame_bufs); free(frame_sizes); free(frame_offsets);
             fail("pzp_container_write: frame compression failed");
+            return 0;
         }
 
 #if PZP_VERBOSE
@@ -763,6 +775,7 @@ static void pzp_container_write(
         for (unsigned int f = 0; f < frame_count; f++) free(frame_bufs[f]);
         free(frame_bufs); free(frame_sizes); free(frame_offsets);
         fail("pzp_container_write: could not open output file");
+        return 0;
     }
 
     fwrite(&hdr, sizeof(unsigned int), 12, out);
@@ -793,6 +806,7 @@ static void pzp_container_write(
     free(frame_bufs);
     free(frame_sizes);
     free(frame_offsets);
+    return 1;
 }
 
 //-----------------------------------------------------------------------------------------------
@@ -892,7 +906,8 @@ static int pzp_container_attach(
 }
 
 //-----------------------------------------------------------------------------------------------
-static void pzp_compress_combined(unsigned char **buffers,
+/* Returns 1 on success, 0 on failure - see pzp_container_write() , the only thing this can fail on. */
+static int pzp_compress_combined(unsigned char **buffers,
                               unsigned int width,unsigned int height,
                               unsigned int bitsperpixelExternal, unsigned int channelsExternal,
                               unsigned int bitsperpixelInternal, unsigned int channelsInternal,
@@ -910,7 +925,7 @@ static void pzp_compress_combined(unsigned char **buffers,
     unsigned int   cfgs[1]         = { configuration };
     unsigned int   delays[1]       = { 0 };
 
-    pzp_container_write(output_filename,
+    return pzp_container_write(output_filename,
                         all_buffers, 1,
                         widths, heights,
                         bpp_exts, ch_exts,

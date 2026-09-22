@@ -1165,7 +1165,7 @@ static int pzpd_csv_store(const struct pzpd_tschema *sc, unsigned c, unsigned k,
     }
     if ( (t == PZPD_TYPE_U8) || (t == PZPD_TYPE_U16) || (t == PZPD_TYPE_U32) || (t == PZPD_TYPE_U64) )
     {
-        if (tmp[0] == '-') { goto range; }
+        if (tmp[strspn(tmp, " \t\n\v\f\r")] == '-') { goto range; }   // strtoull skips this whitespace, then negates without ERANGE
         unsigned long long v = strtoull(tmp, &e, 10);
         if ( (e == NULL) || (*e != 0) ) { goto bad; }
         if (errno == ERANGE) { goto range; }
@@ -3216,6 +3216,7 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
     if ( (mh.stream_count == 0) || (mh.stream_count > PZPD_MAX_STREAMS) || (mh.shard_count == 0) ||
          !pzpd_check_section(a->mmap_manifest, file, mh.shards_offset, PZPD_SECT_MSHARDS, (uint64_t) mh.shard_count * sizeof(struct pzpd_disk_manifest_shard)) ||
          !pzpd_check_section(a->mmap_manifest, file, mh.names_offset,  PZPD_SECT_MNAMES,  mh.names_bytes) ||
+         (mh.hash_count > file / sizeof(struct pzpd_disk_global_hash)) ||      // so the size below can't wrap around
          !pzpd_check_section(a->mmap_manifest, file, mh.hash_offset,   PZPD_SECT_MHASH,   mh.hash_count * sizeof(struct pzpd_disk_global_hash)) )
     {
         arch_close(a);
@@ -4000,7 +4001,7 @@ pzpd *pzpd_open_many(const char *const *paths, const char *const *aliases, unsig
         mb->path  = strdup(paths[i]);
         mb->alias = ( (aliases != NULL) && (aliases[i] != NULL) ) ? strdup(aliases[i]) : pzpd_default_alias(paths[i]);
         if ( (mb->path == NULL) || (mb->alias == NULL) ) { pzpd_close(a); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
-        mb->arch = arch_open(paths[i], flags & PZPD_O_VERIFY);
+        mb->arch = arch_open(paths[i], flags & ~PZPD_O_ALLOW_MISSING);   // VERIFY, HUGEPAGE, POPULATE act per archive
         if (mb->arch == NULL)
         {
             snprintf(mb->error, sizeof(mb->error), "%s", pzpd_errorText);
@@ -4135,7 +4136,7 @@ static pzpd *pzpd_coll_open(const char *path, unsigned flags)
         mb->count = dm->record_count;
         for (unsigned u = 0; u < PZPD_MAX_STREAMS; u++) { mb->to_member[u] = -1; mb->to_union[u] = -1; }
         for (unsigned u = 0; u < PZPD_MAX_TABLES; u++)  { mb->to_mtable[u] = -1; }
-        mb->arch = arch_open(mb->path, flags & PZPD_O_VERIFY);
+        mb->arch = arch_open(mb->path, flags & ~PZPD_O_ALLOW_MISSING);
         if (mb->arch == NULL)
         {
             // Missing member: its ordinal range stays reserved, only its reads fail

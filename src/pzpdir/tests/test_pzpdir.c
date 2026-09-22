@@ -47,6 +47,17 @@ static double now_s(void)
     return (double) t.tv_sec + (double) t.tv_nsec * 1e-9;
 }
 
+/** @brief File-backed pages mapped into this process (the "shared" field of /proc/self/statm), -1 if unknown. */
+static long resident_file_pages(void)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    long size = 0, resident = 0, shared = -1;
+    if (f == NULL) { return -1; }
+    if (fscanf(f, "%ld %ld %ld", &size, &resident, &shared) != 3) { shared = -1; }
+    fclose(f);
+    return shared;
+}
+
 /** @brief Deterministic pseudo-random bytes for (record, stream). */
 static void fill(unsigned char *p, size_t n, uint64_t seed)
 {
@@ -443,6 +454,35 @@ static void test_misc(void)
     b = pzpd_open(shard, 0);
     CHECK(b != NULL, "unmodified shard still opens standalone");
     pzpd_close(b);
+
+    // A manifest whose hash_count × 24 wraps around to the real section size (hash_count + 2^61), re-sealed:
+    // must be refused at open, not read past the mapping by pzpd_find() (hash_count sits at byte 1616:
+    // 48 B of fixed fields, 768 B streams, 768 B tables, 4 u64 offsets; sb_checksum 5 u64 later, at 1656)
+    char crafted[1400];
+    snprintf(crafted, sizeof(crafted), "%s/crafted.pzpd", dir);
+    {
+        int in = open(path, O_RDONLY), out = open(crafted, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        struct stat st;
+        fstat(in, &st);
+        unsigned char *all = (unsigned char *) malloc((size_t) st.st_size);
+        CHECK(read(in, all, (size_t) st.st_size) == st.st_size, "copy manifest");
+        const size_t hcOff = 1616, csOff = 1656;
+        uint64_t stored, hc;
+        memcpy(&stored, all + csOff, 8);
+        CHECK(stored == XXH64(all, csOff, 0), "manifest sb_checksum is at byte 1656");
+        memcpy(&hc, all + hcOff, 8);
+        hc += 1ull << 61;
+        memcpy(all + hcOff, &hc, 8);
+        uint64_t cs = XXH64(all, csOff, 0);
+        memcpy(all + csOff, &cs, 8);
+        CHECK(write(out, all, (size_t) st.st_size) == st.st_size, "write crafted manifest");
+        free(all);
+        close(in);
+        close(out);
+    }
+    b = pzpd_open(crafted, 0);
+    CHECK( (b == NULL) && (pzpd_last_error_code() == PZPD_E_FORMAT), "manifest with a wrapping hash_count refused (code %d)", pzpd_last_error_code());
+    if (b != NULL) { pzpd_find(b, "zz-not-there", 12, NULL); pzpd_close(b); }   // without the check: out-of-bounds read here
 }
 
 /** @brief Phase 1c: table schemas, CSV, binary rows, strings, global tables, collections. */
@@ -525,6 +565,19 @@ static void test_tables(void)
     CHECK(!pzpd_writer_rows_csv(w, (unsigned) tm, "1,1,s,1,1,1,-129,1", 18) && strstr(pzpd_last_error(), "out of range") != NULL, "i8 range");
     CHECK(pzpd_writer_end(w), "the record itself is still fine after rejected rows");
     CHECK(pzpd_writer_finish(w), "finish");
+
+    // u64: a minus sign after leading whitespace must not wrap around (strtoull negates it silently)
+    char upath[1100];
+    snprintf(upath, sizeof(upath), "%s/u64.pzpd", dir);
+    const char *ustreams[] = { "rgb" };
+    pzpd_writer_opts uo = { ustreams, 1, 0, 0 };
+    pzpd_writer *wu = pzpd_writer_create(upath, &uo);
+    int tu = (wu != NULL) ? pzpd_writer_table(wu, "v", "v:u64", 0) : -1;
+    CHECK( (tu >= 0) && pzpd_writer_begin(wu, "k", 1, PZPD_NO_GROUP, 0), "u64 table");
+    CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, " -1", 3) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: \" -1\" rejected");
+    CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, "\t-5", 3) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: tab then -5 rejected");
+    CHECK(pzpd_writer_rows_csv(wu, (unsigned) tu, " 7", 2), "u64: \" 7\" still accepted");
+    pzpd_writer_abort(wu);
 
     //--- read back ------------------------------------------------------------------------
     pzpd *a = pzpd_open(path, 0);
@@ -1109,10 +1162,18 @@ static void test_prefetch(void)
     free(mask);
 
     //--- open flags ---------------------------------------------------------------
+    long residentBefore = resident_file_pages();
     pzpd *h = pzpd_open(path, PZPD_O_POPULATE | PZPD_O_HUGEPAGE);
+    long residentAfter = resident_file_pages();
     CHECK(h != NULL, "open with PZPD_O_POPULATE | PZPD_O_HUGEPAGE");
     if (h != NULL)
     {
+        // POPULATE pre-faults every shard at open, before any read: at least half the archive is mapped in by now
+        uint64_t archiveBytes = 0;
+        for (unsigned k = 0; k < pzpd_shard_count(h); k++) { pzpd_shard_info si; if (pzpd_shard_info_get(h, k, &si)) { archiveBytes += si.file_bytes; } }
+        long pageBytes = sysconf(_SC_PAGESIZE);
+        CHECK( (residentBefore >= 0) && ((uint64_t)(residentAfter - residentBefore) * (uint64_t) pageBytes >= archiveBytes / 2),
+               "PZPD_O_POPULATE reaches the archive: its shards are resident right after pzpd_open()");
         int errs = 0;
         unsigned char buf[700];
         for (uint64_t i = 0; i < N; i += 997)

@@ -31,6 +31,11 @@ _PKG_DIR  = _ROOT / "src" / "pzp"
 _LIB_SRC  = _ROOT / _LIB_NAME       # built by make
 _LIB_DST  = _PKG_DIR / _LIB_NAME    # inside the package (for wheels)
 
+# libpzpdir.so (PZPD archives, pzp.pzpdir): built by src/pzpdir/Makefile (Linux)
+_DIR_LIB_NAME = "libpzpdir.so"
+_DIR_LIB_SRC  = _ROOT / "src" / "pzpdir" / _DIR_LIB_NAME
+_DIR_LIB_DST  = _PKG_DIR / _DIR_LIB_NAME
+
 
 def _build_c_library():
     """Run make to produce libpzp.so in the repo root."""
@@ -40,6 +45,9 @@ def _build_c_library():
         cwd=str(_ROOT),
         check=True,
     )
+    if sys.platform.startswith("linux"):
+        print(f"[pzp] Building {_DIR_LIB_NAME} via src/pzpdir/Makefile …")
+        subprocess.run(["make", _DIR_LIB_NAME], cwd=str(_DIR_LIB_SRC.parent), check=True)
 
 
 def _copy_lib_into_package():
@@ -51,6 +59,9 @@ def _copy_lib_into_package():
         )
     shutil.copy2(str(_LIB_SRC), str(_LIB_DST))
     print(f"[pzp] Copied {_LIB_NAME} → {_LIB_DST}")
+    if _DIR_LIB_SRC.exists():
+        shutil.copy2(str(_DIR_LIB_SRC), str(_DIR_LIB_DST))
+        print(f"[pzp] Copied {_DIR_LIB_NAME} → {_DIR_LIB_DST}")
 
 
 class BuildPy(build_py):

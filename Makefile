@@ -116,3 +116,30 @@ debug: all $(OUTDIR)
 	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --track-origins=yes --num-callers=20 --track-fds=yes ./$(DPZP) compress samples/segment.ppm $(OUTDIR)/segment.pzp 2>log7.txt
 	valgrind --tool=memcheck --leak-check=yes --show-reachable=yes --track-origins=yes --num-callers=20 --track-fds=yes ./$(DPZP) decompress $(OUTDIR)/segment.pzp $(OUTDIR)/segmentRecode.ppm 2>log8.txt
 
+
+# ---------------------------------------------------------------------------
+# pzpdir (PZPD archives) lives in src/pzpdir with its own Makefile; these
+# targets only delegate to it. `all` above is unchanged.
+# ---------------------------------------------------------------------------
+.PHONY: pzpdir test-pzpdir fuzz-pzpdir bench-pzpdir doc-pzpdir check-client-pzpdir clean-pzpdir
+
+pzpdir:
+	$(MAKE) -C src/pzpdir all
+
+test-pzpdir:
+	$(MAKE) -C src/pzpdir test
+
+fuzz-pzpdir:
+	$(MAKE) -C src/pzpdir fuzz
+
+bench-pzpdir:
+	$(MAKE) -C src/pzpdir bench
+
+doc-pzpdir:
+	$(MAKE) -C src/pzpdir doc
+
+check-client-pzpdir:
+	$(MAKE) -C src/pzpdir check-client
+
+clean-pzpdir:
+	$(MAKE) -C src/pzpdir clean

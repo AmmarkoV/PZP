@@ -19,4 +19,4 @@ numpy = ["numpy"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-pzp = ["libpzp.so", "libpzp.dylib", "pzp.dll"]
+pzp = ["libpzp.so", "libpzp.dylib", "pzp.dll", "libpzpdir.so"]

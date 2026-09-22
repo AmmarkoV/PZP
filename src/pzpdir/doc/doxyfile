@@ -1,0 +1,37 @@
+# Doxygen configuration for pzpdir (modelled on SharedMemoryVideoBuffers/doc/doxyfile).
+# Run through scripts/refreshDoxygen.sh, which sets DOXYGEN_INPUT and DOXYGEN_OUTPUT.
+#
+# EXTRACT_ALL = NO on purpose: with YES, doxygen silently disables WARN_IF_UNDOCUMENTED,
+# and the phase-1 gate is "zero warnings", i.e. every public item documented.
+
+PROJECT_NAME           = PZPDIR
+PROJECT_BRIEF          = "PZP directory archives: many files grouped into records, in a few self-contained shards"
+OUTPUT_DIRECTORY       = $(DOXYGEN_OUTPUT)
+INPUT                  = $(DOXYGEN_INPUT)/pzpdir.h \
+                         $(DOXYGEN_INPUT)/pzpdir.c \
+                         $(DOXYGEN_INPUT)/pzpdir_cli.c \
+                         $(DOXYGEN_INPUT)/doc/pzpdir.md
+FILE_PATTERNS          = *.c *.h *.md
+RECURSIVE              = NO
+USE_MDFILE_AS_MAINPAGE = $(DOXYGEN_INPUT)/doc/pzpdir.md
+OPTIMIZE_OUTPUT_FOR_C  = YES
+JAVADOC_AUTOBRIEF      = NO
+EXTRACT_ALL            = NO
+EXTRACT_STATIC         = NO
+EXTRACT_LOCAL_CLASSES  = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_IF_INCOMPLETE_DOC = YES
+WARN_LOGFILE           = $(DOXYGEN_OUTPUT)/doxygen_warnings.txt
+QUIET                  = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = YES
+USE_PDFLATEX           = YES
+LATEX_BATCHMODE        = YES
+LATEX_EXTRA_STYLESHEET = $(DOXYGEN_INPUT)/doc/unicodeCharacters.sty
+PDF_HYPERLINKS         = YES
+HAVE_DOT               = NO
+SOURCE_BROWSER         = YES
+TYPEDEF_HIDES_STRUCT   = NO
+MARKDOWN_SUPPORT       = YES

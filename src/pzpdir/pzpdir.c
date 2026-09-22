@@ -296,8 +296,8 @@ struct pzpd_disk_manifest
     uint64_t names_bytes;       ///< Shard file names size
     uint64_t hash_offset;       ///< Global hash data (pzpd_disk_global_hash entries)
     uint64_t hash_count;        ///< Global hash entries
-    uint64_t groups_offset;     ///< Global group table, 0 if none (phase 4)
-    uint64_t group_count;       ///< Global groups
+    uint64_t groups_offset;     ///< Reserved, 0: there is no manifest group table (group names are in the global hash; spec revision 10)
+    uint64_t group_count;       ///< Reserved, 0
     uint64_t file_bytes;        ///< Manifest file size
     uint64_t index_checksum;    ///< XXH64 of the shard table, names, hash and table section data
     uint64_t sb_checksum;       ///< XXH64 of every byte of this structure before this field
@@ -687,7 +687,7 @@ static int pzpd_probe_pnm(const unsigned char *d, size_t n, pzpd_blob_meta *m)
     int bitmap = (d[1] == '1') || (d[1] == '4');
     double v[3] = {0,0,0};
     if (pzpd_pnm_tokens(d, n, bitmap ? 2 : 3, v) == 0) { return 0; }
-    if ( (v[0] <= 0) || (v[1] <= 0) ) { return 0; }
+    if ( !((v[0] > 0) && (v[0] <= 4294967295.0)) || !((v[1] > 0) && (v[1] <= 4294967295.0)) ) { return 0; }   // also refuses nan, inf
     m->format   = PZPD_FORMAT_PNM;
     m->width    = (uint32_t) v[0];
     m->height   = (uint32_t) v[1];
@@ -705,7 +705,7 @@ static int pzpd_probe_pfm(const unsigned char *d, size_t n, pzpd_blob_meta *m)
     if ( (d[2] != ' ') && (d[2] != '\t') && (d[2] != '\r') && (d[2] != '\n') ) { return 0; }
     double v[3] = {0,0,0};
     if (pzpd_pnm_tokens(d, n, 3, v) == 0) { return 0; }
-    if ( (v[0] <= 0) || (v[1] <= 0) || (v[2] == 0) ) { return 0; }
+    if ( !((v[0] > 0) && (v[0] <= 4294967295.0)) || !((v[1] > 0) && (v[1] <= 4294967295.0)) || (v[2] == 0) ) { return 0; }   // also refuses nan, inf
     m->format   = PZPD_FORMAT_PFM;
     m->width    = (uint32_t) v[0];
     m->height   = (uint32_t) v[1];
@@ -1843,8 +1843,8 @@ pzpd_writer *pzpd_writer_create(const char *manifest_path, const pzpd_writer_opt
     if ( (align != 64) && (align != 4096) ) { pzpd_set_error(PZPD_E_ARG, "record alignment must be 64 or 4096, not %u", align); return NULL; }
 
     pzpd_writer *w = (pzpd_writer *) calloc(1, sizeof(pzpd_writer));
-    if (w != NULL) { w->last_group = PZPD_NO_GROUP; }
     if (w == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
+    w->last_group = PZPD_NO_GROUP;
     w->fd        = -1;
     w->S         = o->stream_count;
     w->align     = align;
@@ -2124,7 +2124,8 @@ int pzpd_writer_rows_csv(pzpd_writer *w, unsigned table, const char *csv, size_t
     if (wt == NULL) { return 0; }
     size_t r0 = wt->cur_rows.len, h0 = wt->cur_heap.len;
     int64_t n = pzpd_csv_parse(&wt->sc, csv, len, &wt->cur_rows, &wt->cur_heap);
-    if ( (n < 0) || ((uint64_t) wt->cur_n + (uint64_t) n > 0xFFFFFFFFull) ) { wt->cur_rows.len = r0; wt->cur_heap.len = h0; return 0; }
+    if ( (n >= 0) && ((uint64_t) wt->cur_n + (uint64_t) n > 0xFFFFFFFFull) ) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows", wt->sc.name); n = -1; }
+    if (n < 0) { wt->cur_rows.len = r0; wt->cur_heap.len = h0; return 0; }
     wt->cur_n += (uint32_t) n;
     return 1;
 }
@@ -2135,6 +2136,7 @@ int pzpd_writer_global_rows(pzpd_writer *w, unsigned table, const void *rows, ui
     struct pzpd_wtable *wt = pzpd_writer_table_for(w, table, 1);
     if (wt == NULL) { return 0; }
     size_t r0 = wt->g_rows.len, h0 = wt->g_heap.len;
+    if (wt->g_n + nrows > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows", wt->sc.name); return 0; }   // the reader's limit
     if (!pzpd_stage_rows(&wt->sc, rows, nrows, strings, strings_len, &wt->g_rows, &wt->g_heap)) { wt->g_rows.len = r0; wt->g_heap.len = h0; return 0; }
     wt->g_n += nrows;
     return 1;
@@ -2147,6 +2149,7 @@ int pzpd_writer_global_rows_csv(pzpd_writer *w, unsigned table, const char *csv,
     if (wt == NULL) { return 0; }
     size_t r0 = wt->g_rows.len, h0 = wt->g_heap.len;
     int64_t n = pzpd_csv_parse(&wt->sc, csv, len, &wt->g_rows, &wt->g_heap);
+    if ( (n >= 0) && (wt->g_n + (uint64_t) n > 0xFFFFFFFFull) ) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows", wt->sc.name); n = -1; }   // the reader's limit
     if (n < 0) { wt->g_rows.len = r0; wt->g_heap.len = h0; return 0; }
     wt->g_n += (uint64_t) n;
     return 1;
@@ -2932,9 +2935,9 @@ static int pzpd_sb_from_sections(const unsigned char *map, uint64_t file, uint64
     {
         struct pzpd_disk_record r;
         memcpy(&r, &rt[i], sizeof(r));
+        if (!pzpd_in_file(r.offset, r.bytes, file)) { pzpd_set_error(PZPD_E_FORMAT, "record table points past the end of the file"); return 0; }
         if (r.offset + r.bytes > end) { end = r.offset + r.bytes; }
     }
-    if (end > file) { pzpd_set_error(PZPD_E_FORMAT, "record table points past the end of the file"); return 0; }
     sb.records_bytes = end - PZPD_BLOCK;
     sb.rtab_offset   = off[PZPD_SECT_RECORDS];
     sb.btab_offset   = off[PZPD_SECT_BLOBS];
@@ -4372,13 +4375,18 @@ int pzpd_blob_info_get(pzpd *a, uint64_t ordinal, unsigned stream, pzpd_blob_inf
     struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
     if (ar == NULL) { return 0; }
     int ms = a->m[mi].to_member[stream];
-    if (!arch_blob_info_get(ar, local, (ms < 0) ? 0 : (unsigned) ms, out)) { return 0; }
     if (ms < 0)
     {
-        // The member has no such stream: same as a missing blob (record fields kept)
-        out->present = 0; out->size = 0; out->name = NULL; out->name_len = 0;
-        memset(&out->meta, 0, sizeof(out->meta));
+        // The member has no such stream: a missing blob, with the record's own fields
+        uint64_t sl;
+        struct pzpd_rshard *s = pzpd_locate(ar, local, &sl);
+        if (s == NULL) { return 0; }
+        memset(out, 0, sizeof(*out));
+        out->group = s->rtab[sl].group;
+        out->frame = s->rtab[sl].frame;
+        out->shard = (unsigned)(s - ar->shards);
     }
+    else if (!arch_blob_info_get(ar, local, (unsigned) ms, out)) { return 0; }
     out->member = mi;
     out->shard += a->m[mi].shard_base;
     return 1;
@@ -4860,10 +4868,11 @@ int pzpd_storage_kind(pzpd *a, uint64_t ordinal)
 enum { PZPD_PF_QUEUED = 0, PZPD_PF_INFLIGHT = 1, PZPD_PF_READY = 2 };   ///< I/O state of a schedule entry
 enum { PZPD_PF_FREE = 0, PZPD_PF_CLAIMED = 1, PZPD_PF_DONE = 2 };       ///< Claim state of a schedule entry
 
-/** @brief One submitted claim (24 bytes). */
+/** @brief One submitted claim (32 bytes). */
 struct pzpd_pf_entry
 {
     uint64_t ordinal;  ///< Record
+    uint64_t need;     ///< Buffer bytes when the record's shard is in BUFFERS mode, else 0 (computed at submit, outside the lock)
     uint32_t mask;     ///< Streams to prefetch
     uint32_t next;     ///< Next claim of the same ordinal, PZPD_PF_NONE if none
     uint32_t slot;     ///< Buffer slot (BUFFERS shards, while in flight or ready), PZPD_PF_NONE otherwise
@@ -5144,28 +5153,30 @@ static int pzpd_pf_buffer_refs(const struct pzpd_pf_loc *loc, unsigned S, uint32
     return complete;
 }
 
+/** @brief Buffer bytes a record needs when its shard is in BUFFERS mode (pzpd_pf_entry::need). Called without
+ *  the prefetcher lock: locating may open and validate a shard, and the index is read-only.
+ *  @return The bytes, or 0 for MAP / PAGECACHE shards and records that can't be located (their get reports why). */
+static uint64_t pzpd_pf_need(struct pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask)
+{
+    struct pzpd_pf_loc loc[PZPD_MAX_STREAMS];
+    struct pzpd_pf_range r[PZPD_MAX_STREAMS];
+    unsigned shard = 0;
+    uint64_t local, over;
+    if ( (pzpd_pf_locate(p->a, ordinal, mask, loc, &shard, &local) == NULL) || (p->shard_mode[shard] != PZPD_PF_BUFFERS) ) { return 0; }
+    return pzpd_pf_buffer_bytes(r, pzpd_pf_ranges(loc, p->a->S, r, &over));
+}
+
 /** @brief Take the next queued entry the window and budget allow. Lock held.
- *  @return Its position, or UINT64_MAX if none may start now (*need = buffer bytes for BUFFERS entries). */
-static uint64_t pzpd_pf_next(struct pzpd_prefetcher *p, uint64_t *need, int *isBuf)
+ *  @return Its position, or UINT64_MAX if none may start now. */
+static uint64_t pzpd_pf_next(struct pzpd_prefetcher *p)
 {
     while ( (p->cursor < p->n) && ((p->e[p->cursor].io != PZPD_PF_QUEUED) || (p->e[p->cursor].claim != PZPD_PF_FREE)) ) { p->cursor++; }
     if ( (p->cursor >= p->n) || (p->outstanding >= p->window) ) { return UINT64_MAX; }
-    *need = 0;
-    *isBuf = 0;
-    if (p->any_buffers)
+    uint64_t need = p->e[p->cursor].need;
+    if (need > 0)
     {
-        struct pzpd_pf_loc loc[PZPD_MAX_STREAMS];
-        struct pzpd_pf_range r[PZPD_MAX_STREAMS];
-        unsigned shard = 0;
-        uint64_t local, over;
-        if ( (pzpd_pf_locate(p->a, p->e[p->cursor].ordinal, p->e[p->cursor].mask, loc, &shard, &local) != NULL) &&
-             (p->shard_mode[shard] == PZPD_PF_BUFFERS) )
-        {
-            *isBuf = 1;
-            *need = pzpd_pf_buffer_bytes(r, pzpd_pf_ranges(loc, p->a->S, r, &over));
-            if ( (p->used > 0) && (p->used + *need > p->budget) ) { return UINT64_MAX; }   // one record always fits
-            if (p->nfree == 0) { return UINT64_MAX; }             // slots of discarded in-flight entries come back when their read ends
-        }
+        if ( (p->used > 0) && (p->used + need > p->budget) ) { return UINT64_MAX; }   // one record always fits
+        if (p->nfree == 0) { return UINT64_MAX; }                 // slots of discarded in-flight entries come back when their read ends
     }
     return p->cursor++;
 }
@@ -5177,9 +5188,8 @@ static void *pzpd_pf_thread(void *arg)
     pthread_mutex_lock(&p->lock);
     for (;;)
     {
-        uint64_t i = UINT64_MAX, need = 0;
-        int isBuf = 0;
-        while ( !p->stop && ((i = pzpd_pf_next(p, &need, &isBuf)) == UINT64_MAX) )
+        uint64_t i = UINT64_MAX;
+        while ( !p->stop && ((i = pzpd_pf_next(p)) == UINT64_MAX) )
         {
             if (p->cursor < p->n) { p->st.producer_stalls++; }
             pthread_cond_wait(&p->work, &p->lock);
@@ -5187,6 +5197,8 @@ static void *pzpd_pf_thread(void *arg)
         if (p->stop) { break; }
         uint64_t ordinal = p->e[i].ordinal;
         uint32_t mask = p->e[i].mask;
+        uint64_t need = p->e[i].need;
+        int isBuf = (need > 0);
         uint32_t slot = PZPD_PF_NONE;
         if (isBuf)
         {
@@ -5248,21 +5260,83 @@ static void *pzpd_pf_thread(void *arg)
     return NULL;
 }
 
-int pzpd_prefetch_auto_mode(pzpd *a, unsigned shard)
+/** @brief Lowest limit in `file` of a cgroup directory (base + rel) and of each of its parents up to base.
+ *  @return The lower of that and `limit` ("max", i.e. no limit, and missing files leave `limit` as is). */
+static uint64_t pzpd_cgroup_min(const char *base, const char *rel, const char *file, uint64_t limit)
+{
+    char dir[4096];
+    int n = snprintf(dir, sizeof(dir), "%s%s", base, rel);
+    if ( (n <= 0) || ((size_t) n >= sizeof(dir)) ) { return limit; }
+    size_t bl = strlen(base);
+    while ( (strlen(dir) > bl) && (dir[strlen(dir) - 1] == '/') ) { dir[strlen(dir) - 1] = 0; }
+    for (;;)
+    {
+        char path[4200];
+        snprintf(path, sizeof(path), "%s/%s", dir, file);
+        FILE *f = fopen(path, "r");
+        if (f != NULL)
+        {
+            unsigned long long v;
+            if ( (fscanf(f, "%llu", &v) == 1) && (v < limit) ) { limit = v; }
+            fclose(f);
+        }
+        char *slash = strrchr(dir, '/');
+        if ( (slash == NULL) || ((size_t)(slash - dir) < bl) ) { break; }
+        *slash = 0;
+    }
+    return limit;
+}
+
+/** @brief Memory this process may fill: physical RAM, or less when its cgroup or an ancestor sets a limit
+ *  (v2 memory.max, v1 memory.limit_in_bytes), as systemd MemoryMax, Slurm and containers do. */
+static uint64_t pzpd_memory_limit(void)
+{
+    uint64_t limit = (uint64_t) sysconf(_SC_PHYS_PAGES) * (uint64_t) sysconf(_SC_PAGESIZE);
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    if (f == NULL) { return limit; }
+    char line[4096];
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        // "0::/path" (v2) or "N:controller,controller:/path" (v1)
+        line[strcspn(line, "\n")] = 0;
+        char *c1 = strchr(line, ':'), *c2 = (c1 != NULL) ? strchr(c1 + 1, ':') : NULL;
+        if (c2 == NULL) { continue; }
+        *c2 = 0;
+        char *controllers = c1 + 1, *save = NULL;
+        const char *rel = c2 + 1;
+        if (controllers[0] == 0) { limit = pzpd_cgroup_min("/sys/fs/cgroup", rel, "memory.max", limit); continue; }
+        for (char *t = strtok_r(controllers, ",", &save); t != NULL; t = strtok_r(NULL, ",", &save))
+        {
+            if (strcmp(t, "memory") == 0) { limit = pzpd_cgroup_min("/sys/fs/cgroup/memory", rel, "memory.limit_in_bytes", limit); }
+        }
+    }
+    fclose(f);
+    return limit;
+}
+
+/** @brief Bytes of a member's shards: from its manifest's shard table (no shard is opened), or its standalone shard. */
+static uint64_t pzpd_member_bytes(const struct pzpd_member *mb)
+{
+    const struct pzpd_archive *ar = mb->arch;
+    if (ar == NULL) { return 0; }
+    if (ar->standalone) { return ar->shards[0].sb.file_bytes; }   // loaded by arch_open()
+    uint64_t bytes = 0;
+    for (unsigned k = 0; k < ar->shard_count; k++) { bytes += ar->mshards[k].file_bytes; }
+    return bytes;
+}
+
+/** @brief pzpd_prefetch_auto_mode() with the memory limit given (pzpd_prefetcher_create() reads it once). */
+static int pzpd_auto_mode(pzpd *a, unsigned shard, uint64_t memLimit)
 {
     pzpd_shard_info si;
     if (!pzpd_shard_info_get(a, shard, &si)) { return pzpd_errorCode; }
     if (si.storage == PZPD_STORAGE_RAM) { return PZPD_PF_MAP; }
-    const struct pzpd_member *mb = &a->m[si.member];
-    uint64_t memberBytes = 0;
-    for (unsigned k = 0; k < mb->shards; k++)
-    {
-        pzpd_shard_info o;
-        if (pzpd_shard_info_get(a, mb->shard_base + k, &o)) { memberBytes += o.file_bytes; }
-    }
-    uint64_t ram = (uint64_t) sysconf(_SC_PHYS_PAGES) * (uint64_t) sysconf(_SC_PAGESIZE);
-    pzpd_clear_error();
-    return (memberBytes < ram / 2) ? PZPD_PF_PAGECACHE : PZPD_PF_BUFFERS;
+    return (pzpd_member_bytes(&a->m[si.member]) < memLimit / 2) ? PZPD_PF_PAGECACHE : PZPD_PF_BUFFERS;
+}
+
+int pzpd_prefetch_auto_mode(pzpd *a, unsigned shard)
+{
+    return pzpd_auto_mode(a, shard, pzpd_memory_limit());
 }
 
 pzpd_prefetcher *pzpd_prefetcher_create(pzpd *a, const pzpd_prefetch_opts *o)
@@ -5306,10 +5380,11 @@ pzpd_prefetcher *pzpd_prefetcher_create(pzpd *a, const pzpd_prefetch_opts *o)
 
     // Mode per shard; O_DIRECT descriptors for BUFFERS shards
     for (unsigned sh = 0; sh < shards; sh++) { p->dfd[sh] = -1; p->dfd_open[sh] = -1; }
+    uint64_t memLimit = (d.mode == PZPD_PF_AUTO) ? pzpd_memory_limit() : 0;
     for (unsigned sh = 0; sh < a->shard_total; sh++)
     {
         int m = (int) d.mode;
-        if (m == PZPD_PF_AUTO) { m = pzpd_prefetch_auto_mode(a, sh); if (m < 0) { m = PZPD_PF_PAGECACHE; } }
+        if (m == PZPD_PF_AUTO) { m = pzpd_auto_mode(a, sh, memLimit); if (m < 0) { m = PZPD_PF_PAGECACHE; } }
         p->shard_mode[sh] = (uint8_t) m;
         if (m == PZPD_PF_MAP) { p->st.shards_map++; }
         else if (m == PZPD_PF_PAGECACHE) { p->st.shards_pagecache++; }
@@ -5346,6 +5421,15 @@ int pzpd_prefetch_submit(pzpd_prefetcher *p, const uint64_t *ordinals, const uin
     {
         if (ordinals[k] >= total) { pzpd_set_error(PZPD_E_ARG, "ordinal %llu out of range (%llu records)", (unsigned long long) ordinals[k], (unsigned long long) total); return 0; }
     }
+    // BUFFERS sizes are worked out here, before the lock: locating a record may open a shard
+    uint64_t *need = NULL;
+    if (p->any_buffers && (n > 0))
+    {
+        need = (uint64_t *) malloc(n * sizeof(uint64_t));
+        if (need == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+        for (size_t k = 0; k < n; k++) { need[k] = pzpd_pf_need(p, ordinals[k], (masks != NULL) ? masks[k] : p->mask); }
+        pzpd_clear_error();                                        // records that can't be located fail in their get
+    }
     pthread_mutex_lock(&p->lock);
     int ok = 1;
     if (p->n + n >= PZPD_PF_NONE) { pzpd_set_error(PZPD_E_ARG, "schedule longer than %u entries", PZPD_PF_NONE - 1); ok = 0; }
@@ -5363,6 +5447,7 @@ int pzpd_prefetch_submit(pzpd_prefetcher *p, const uint64_t *ordinals, const uin
         uint32_t i = (uint32_t) p->n++;
         p->e[i].ordinal = ordinals[k];
         p->e[i].mask    = (masks != NULL) ? masks[k] : p->mask;
+        p->e[i].need    = (need != NULL) ? need[k] : 0;
         p->e[i].next    = PZPD_PF_NONE;
         p->e[i].slot    = PZPD_PF_NONE;
         p->e[i].io      = PZPD_PF_QUEUED;
@@ -5373,6 +5458,7 @@ int pzpd_prefetch_submit(pzpd_prefetcher *p, const uint64_t *ordinals, const uin
     }
     if (ok) { p->st.submitted += n; pthread_cond_broadcast(&p->work); }
     pthread_mutex_unlock(&p->lock);
+    free(need);
     return ok;
 }
 
@@ -5478,35 +5564,29 @@ int pzpd_prefetch_get(pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask, pzpd_
             if (buf == NULL) { s = NULL; }
             else { pzpd_pf_buffer_refs(loc, a->S, mask, r, nr, buf, refs); }
         }
-        for (unsigned u = 0; (s != NULL) && (u < a->S); u++)
-        {
-            if (refs[u].data == NULL) { continue; }
-            present++;
-            uint32_t want;
-            if ( (a->flags & PZPD_O_VERIFY) && (!pzpd_header_blob_xxh(s, local, (unsigned) loc[u].mstream, &want) || (XXH32(refs[u].data, refs[u].size, 0) != want)) )
-            {
-                if (pzpd_errorCode == PZPD_OK) { pzpd_set_error(PZPD_E_CHECKSUM, "%s: checksum mismatch in record %llu stream %u", s->path, (unsigned long long) local, (unsigned) loc[u].mstream); }
-                s = NULL;
-            }
-        }
     }
     else if (s != NULL)
     {
-        //--- MAP / PAGECACHE: views into the shard mapping ----------------------------------------------
-        unsigned mi; uint64_t ml;
-        struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &ml);
-        for (unsigned u = 0; (ar != NULL) && (u < a->S); u++)
+        //--- MAP / PAGECACHE: views into the shard mapping, where pzpd_pf_locate() found each blob -----
+        for (unsigned u = 0; u < a->S; u++)
         {
-            if ( !(mask & (1u << u)) || !loc[u].present ) { continue; }
-            size_t size = 0;
-            const void *v = arch_view(ar, ml, (unsigned) loc[u].mstream, &size);
-            if (v == NULL) { ar = NULL; s = NULL; break; }         // with PZPD_O_VERIFY: checksum mismatch
-            refs[u].data   = v;
-            refs[u].size   = size;
+            if (!loc[u].present) { continue; }
+            refs[u].data   = s->map + loc[u].off;
+            refs[u].size   = loc[u].size;
             refs[u].format = loc[u].format;
-            present++;
         }
-        if (ar == NULL) { s = NULL; }
+    }
+    // Count the blobs; with PZPD_O_VERIFY, check each against the XXH32 in its record header
+    for (unsigned u = 0; (s != NULL) && (u < a->S); u++)
+    {
+        if (refs[u].data == NULL) { continue; }
+        present++;
+        uint32_t want;
+        if ( (a->flags & PZPD_O_VERIFY) && (!pzpd_header_blob_xxh(s, local, (unsigned) loc[u].mstream, &want) || (XXH32(refs[u].data, refs[u].size, 0) != want)) )
+        {
+            if (pzpd_errorCode == PZPD_OK) { pzpd_set_error(PZPD_E_CHECKSUM, "%s: checksum mismatch in record %llu stream %u", s->path, (unsigned long long) local, (unsigned) loc[u].mstream); }
+            s = NULL;
+        }
     }
     if (s == NULL)
     {
@@ -5754,7 +5834,7 @@ int pzpd_salvage(const char *shard_path, pzpd *schemas, pzpd_salvage_fn fn, void
     pzpd_salvaged_rows rows[PZPD_MAX_TABLES];
     struct pzpd_buf csv[PZPD_MAX_TABLES];
     memset(csv, 0, sizeof(csv));
-    int keepGoing = 1;
+    int keepGoing = 1, nomem = 0;
     unsigned char *hbuf = NULL;
     uint32_t hcap = 0;
     uint64_t off = PZPD_BLOCK;
@@ -5772,7 +5852,7 @@ int pzpd_salvage(const char *shard_path, pzpd *schemas, pzpd_salvage_fn fn, void
             if (rh.header_bytes > hcap)
             {
                 unsigned char *nb2 = (unsigned char *) realloc(hbuf, rh.header_bytes);
-                if (nb2 == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); keepGoing = 0; break; }
+                if (nb2 == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); nomem = 1; break; }
                 hbuf = nb2;
                 hcap = rh.header_bytes;
             }
@@ -5858,7 +5938,7 @@ int pzpd_salvage(const char *shard_path, pzpd *schemas, pzpd_salvage_fn fn, void
     for (unsigned t = 0; t < PZPD_MAX_TABLES; t++) { pzpd_buf_free(&csv[t]); }
     free(hbuf);
     munmap((void *) map, (size_t) file);
-    return keepGoing || (pzpd_errorCode != PZPD_E_NOMEM);
+    return !nomem;                                               // a callback that stopped the scan is not an error
 }
 
 //-----------------------------------------------------------------------------------------------

@@ -209,7 +209,7 @@ enum pzpd_storage
 /** @brief Prefetcher modes (spec §6). The mode is applied per shard. */
 enum pzpd_pf_mode
 {
-    PZPD_PF_AUTO      = 0,  ///< Per shard: RAM disk → MAP; block device, member < ½ RAM → PAGECACHE; else → BUFFERS
+    PZPD_PF_AUTO      = 0,  ///< Per shard: RAM disk → MAP; block device, member < ½ of the memory limit (RAM, or the cgroup's if lower) → PAGECACHE; else → BUFFERS
     PZPD_PF_MAP       = 1,  ///< mmap views, page tables pre-faulted ahead (`MADV_POPULATE_READ`); for RAM disks
     PZPD_PF_PAGECACHE = 2,  ///< mmap views, reads started ahead (`MADV_WILLNEED`) and completed + pre-faulted; for data that fits in RAM
     PZPD_PF_BUFFERS   = 3   ///< Private buffers filled with O_DIRECT reads (buffered where refused), within budget_bytes; the page cache doesn't grow. For data larger than RAM
@@ -1057,6 +1057,10 @@ void pzpd_prefetch_stats_get(const pzpd_prefetcher *p, pzpd_prefetch_stats *s);
 
 /**
  * @brief Mode that PZPD_PF_AUTO gives a shard, from its storage kind and the size of its member.
+ *
+ * A shard on tmpfs / ramfs gets PZPD_PF_MAP. Otherwise its member gets PZPD_PF_PAGECACHE when it is smaller than half
+ * the memory this process may use (physical RAM, or the limit of its cgroup or an ancestor when lower: systemd
+ * MemoryMax, Slurm, containers), and PZPD_PF_BUFFERS when not.
  * @param a     Open handle.
  * @param shard Shard index (over all members, as pzpd_shard_info_get()).
  * @return An enum pzpd_pf_mode value, or a negative enum pzpd_error.

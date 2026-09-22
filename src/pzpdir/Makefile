@@ -54,7 +54,7 @@ bench_dataloader_replay: scripts/bench_dataloader_replay.c $(LIB_DEPS)
 	$(CC) $(RELEASE) $(LIB_SRC) scripts/bench_dataloader_replay.c -o $@ $(LIBS)
 
 bench_pzpdir_early: scripts/bench_pzpdir_early.c $(LIB_DEPS)
-	$(CC) $(RELEASE) $(LIB_SRC) scripts/bench_pzpdir_early.c -o $@ $(LIBS)
+	$(CC) $(RELEASE) $(LIB_SRC) scripts/bench_pzpdir_early.c -o $@ $(LIBS) -ljpeg -lpng
 
 test: tests/test_pzpdir dpzpdir
 	./tests/test_pzpdir

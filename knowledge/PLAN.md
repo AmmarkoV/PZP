@@ -9,7 +9,7 @@ Status: **phase 1 implemented in `src/pzpdir/` and verified, except the early pe
 it passes at 1 thread but not at 8 (§6, phase 1 results). After the DataLoader profile (§6b),
 the decision (2026-09-21) is to **continue with the plan in its current order and leave the RGB
 size as is** (no pre-scaled RGB stream). All phases (1, 1b, 1c, 6, 7, 2, 3, 5, 4) are implemented (2026-09-22). Still unmeasured: huge pages (needs a `huge=` tmpfs mount, i.e. sudo). Next: the DataLoader integration (own repo / branch).**
-Spec v0.4 + revisions 1–10.
+Spec v0.4 + revisions 1–11. A review pass after the phases (§6, "Review fixes") fixed three bugs and the benchmarks.
 **First client:** the Y-MAP-Net DataLoader (`RGBToPoseDetect2D/datasets/DataLoader`). Its needs set the order of work (§5). Last updated 2026-09-22.
 
 ---
@@ -341,7 +341,7 @@ samples, shuffled, cold cache verified at 0.00 % resident with `mincore`; source
   - `Archive.prefetcher(streams, io_threads, mode, budget_mb, window)` → `Prefetcher` (`submit` with per-ordinal stream lists, `get` → `Record` (mapping of memoryviews, `with` / `release()`), `discard`, `clear`, `stats`)
   - `collection_write` / `collection_refresh`, `rebuild_manifest`, `salvage`, `edit_table` / `edit_stream` / `compact`, `detect_format`, `PzpdError` (`.code` = enum pzpd_error)
 - [x] Packaging: `setup.py` also builds `src/pzpdir/libpzpdir.so` and copies it into the package; `pyproject.toml` lists it as package data; the module finds it via `$PZPDIR_LIB`, next to itself, or in `src/pzpdir/`. (A wheel wasn't built here: that would rebuild the untracked root `libpzp.so` too.)
-- Not yet: `read_group` (arrives with phase 4)
+- `read_group` came with phase 4 (see there)
 
 **Verify** (✅ passed):
 - ✅ Round trip (`src/pzpdir/tests/test_pzpdir_py.py`, pytest-compatible, also runs as `python3 …` / `make test-py`; pytest isn't installed here): 8 tests — ctypes struct sizes equal the C `sizeof`s (17 structs), Writer → every read path with 200 records incl. PNG decode and metadata override, all three table kinds (str, arrays, bulk f32, global) incl. `table_all` = per-record rows, the prefetcher in MAP / PAGECACHE / BUFFERS / AUTO consumed by 4 Python threads (counters add up, no buffer memory left), per-ordinal masks and discard, collections with duplicate keys, rebuild-manifest (byte-identical), salvage of a zeroed shard, table / stream edits + compact, error codes, native PZP `read_image` (written with the `pzp` package). Passes with the venv's Python 3.12 / numpy 2.4 and the system Python / numpy 1.26
@@ -353,7 +353,7 @@ samples, shuffled, cold cache verified at 0.00 % resident with `mincore`; source
 - [x] MAP: `get` returns mmap views; I/O threads `madvise(MADV_POPULATE_READ)` each record a window ahead (read-one-byte-per-page fallback before 5.14); no budget, no arena
 - [x] PAGECACHE: also mmap views; `MADV_WILLNEED` on all of a record's ranges, then `MADV_POPULATE_READ`, so a prefetched record is resident *and* pre-faulted
 - [x] Open flags `PZPD_O_HUGEPAGE`, `PZPD_O_POPULATE`
-- [x] AUTO: RAM → MAP; BLOCK and member < ½ RAM → PAGECACHE; else → BUFFERS, which runs as PAGECACHE until phase 7 (`stats.auto_fallbacks`); `PZPD_PF_BUFFERS` itself is rejected until then
+- [x] AUTO: RAM → MAP; BLOCK and member < ½ RAM (since the review: ½ of the process's memory limit, i.e. the cgroup's when lower) → PAGECACHE; else → BUFFERS, which runs as PAGECACHE until phase 7 (`stats.auto_fallbacks`); `PZPD_PF_BUFFERS` itself is rejected until then
 - Spec: revision 5 (names, window / claim semantics, both mmap modes)
 
 **Verify** (✅ passed, ⚠️ partly, ⬜ open). COCO val2017, rgb+all+geo, 5 000 samples shuffled, strided workers; `scripts/bench_pzpdir_early.c` now has `pzpd-pf-{pagecache,map,auto}`, `--work US` (busy CPU per sample standing in for decode), and per-worker minor faults (`RUSAGE_THREAD`):
@@ -365,7 +365,7 @@ samples, shuffled, cold cache verified at 0.00 % resident with `mincore`; source
   | T=8 | 1 317 /s | 1 406 /s | **1 593 /s** (4 992 hits) | 1 600 |
 
   With **no** work every method is bandwidth-bound (3.5–3.9 GB/s, ~0.9 s per epoch at T=8) and the prefetcher gains nothing: it can't beat the device. Its value is overlapping I/O with decode.
-- ⚠️ RAM disk (`/dev/shm`, warm, each mode in its own process): with 2 ms work/sample MAP gives **0.00 worker-side minor faults / sample** (vs 10.85 for `pzpd-view`) and get p50 0.00 ms; throughput T=1 499 /s (record 481, view 488), T=8 3 904 /s (record 3 837, view 3 898), i.e. MAP ≥ view ≥ record. With **no** work: T=1 MAP 46 k/s > view 21 k/s > record 13 k/s, but T=8 MAP 96 k/s < view 138 k/s — 4 I/O threads can't stay ahead of 8 consumers that do nothing (3 441 sync misses). Not a DataLoader-like load, noted. **Huge pages not measured**: needs a tmpfs mounted with `huge=within_size` (sudo); `PZPD_O_HUGEPAGE` is implemented and tested for correctness only
+- ⚠️ RAM disk (`/dev/shm`, warm, each mode in its own process): with 2 ms work/sample MAP gives **0.00 worker-side minor faults / sample** (vs 10.85 for `pzpd-view`) and get p50 0.00 ms; throughput T=1 499 /s (record 481, view 488), T=8 3 904 /s (record 3 837, view 3 898), i.e. MAP ≥ view ≥ record. These numbers, and the first no-work ones (T=8 "MAP 96 k/s < view 138 k/s, the I/O threads can't keep up"), were measured while views and the prefetcher were only touched one byte per 4 KiB page, and are **superseded** by the corrected run in "Review fixes" below: with every byte read, MAP is 2× faster at T=1 and all paths tie at T=8 (memory bandwidth). **Huge pages not measured**: needs a tmpfs mounted with `huge=within_size` (sudo); `PZPD_O_HUGEPAGE` is implemented and tested for correctness only (until the review it never reached the archive, see below)
 - ✅ AUTO picks MAP for a `/dev/shm` member and PAGECACHE for an NVMe member of the same collection (unit test + `pzpdir info` on COCO + a `/dev/shm` member)
 - ✅ `dataloader-replay` (`scripts/bench_dataloader_replay.c`, `make bench_dataloader_replay`): the DataLoader's exact trace — shuffled epoch, batches of 40, worker t takes positions ≡ t (mod T), batch barrier, k+1 double buffer with the main thread "consuming" 26 ms per batch (Python collect + copy, §6b), per-sample rgb+all+geo; today's path replayed with `signalPrefetchFile` (open + WILLNEED), open/fstat/read/close ×3 and `freeFileDescriptor` (DONTNEED + close); decode + augmentation modelled as busy CPU. COCO val2017 on NVMe, cold:
 
@@ -398,6 +398,24 @@ samples, shuffled, cold cache verified at 0.00 % resident with `mincore`; source
 - ✅ Bonus: with no work, BUFFERS + `O_DIRECT` is the fastest path measured: **9 707 samples/s, 6.3 GB/s** vs 5 700 / 3.7 GB/s for PAGECACHE and 5 442 / 3.5 GB/s for `fs-open` (cold)
 - ✅ ASan / UBSan (unit tests, 15 new checks: budget stops the I/O threads before the window, held BUFFERS ticket readable after `clear` and freed on release, wider masks, destroy with prefetched buffers, BUFFERS over a disk + `/dev/shm` collection), TSan (unit tests + `client_smoke --mode buffers`, 16 threads), valgrind memcheck with leak check (`client_smoke` in BUFFERS / MAP / PAGECACHE) all clean; `clear` mid-epoch is safe; fuzzing with random modes and 4–32 KiB budgets: 3 000 iterations clean
 - ⚠️ The `O_DIRECT`-refused fallback isn't exercised on this machine: kernel 6.8's tmpfs accepts `O_DIRECT` (0 of 33 shards fell back)
+
+### Review fixes (2026-09-22)
+A review of `pzpdir.c` after all phases. Every fix has a unit test that fails (or crashes under ASan) on the code before it.
+- **Bugs:**
+  - `PZPD_O_HUGEPAGE` and `PZPD_O_POPULATE` never took effect: `pzpd_open_many` / collection members passed only `PZPD_O_VERIFY` on to each archive. Now every flag but `PZPD_O_ALLOW_MISSING` does (`strace` shows the `madvise` calls)
+  - CSV `" -1"` (minus after whitespace) was stored as 2^64 − 1 in a `u64` column; now out of range, like `"-1"`
+  - a crafted manifest whose `hash_count` × 24 wraps around crashed `pzpd_find()` (read past the mapping); `hash_count` is now bounded by the file size. Random bit flips can't hit this (checksum), so the fuzzer never did
+- **Robustness:** PNM / PFM sizes must fit u32 and be numbers (`strtod` reads `nan`, `inf`); the section scan refuses a record entry whose offset + size wraps past 2^64; the writer stops global rows at the reader's 4 G limit (it read past the caller's buffer before) and reports the limit for record rows
+- **Prefetcher:** BUFFERS record sizes are computed at submit, outside the lock (locating a record may open a shard, which blocked every get / release); MAP / PAGECACHE gets use the offsets they already located instead of a second route + resolve per stream; one checksum loop for all modes. Entries grow to 32 B; submitting 1.28 M entries takes 0.13 s instead of 0.06 s (the same work, moved out of the lock). Throughput is unchanged (medians of 5–7 runs, old and new alternating): RAM-disk MAP T=1 / T=8, NVMe cold BUFFERS 9 822 → 9 813 /s and PAGECACHE 5 599 → 5 620 /s at T=8, `dataloader-replay` T=30 BUFFERS ≈ 1 140–1 180 /s both. So the lock is not a bottleneck at these rates; replacing it with atomics is not needed
+- **AUTO** uses the process's memory limit: physical RAM, or the cgroup's (v2 `memory.max` / v1 `memory.limit_in_bytes`, own group or ancestor) when lower; member sizes come from the manifest, so no shard is opened for it (spec revision 11). COCO (4.8 GB): no limit or `MemoryMax=12G` → PAGECACHE, `MemoryMax=4G` → BUFFERS (before: PAGECACHE in all three)
+- **Benchmarks** (`bench_pzpdir_early`, `bench_dataloader_replay`): every mode now reads every byte it delivers once, as a decoder does (views and the prefetcher touched one byte per 4 KiB page, record / fs-open copied everything, so view vs record compared different work; `bench_pzpdir_early --touch pages` reproduces the old way), and every run opens the archive afresh (runs in one process inherited each other's page tables). Corrected RAM-disk run (`/dev/shm`, warm, no work, rgb+all+geo, samples/s, median of 5):
+
+  | T | pzpd-record | pzpd-view | pf-map |
+  |---|---|---|---|
+  | 1 | 12 528 | 14 151 | **28 859** (0.00 worker faults / sample) |
+  | 8 | 43 406 | 43 813 | 43 755 (≈ 28 GB/s: memory bandwidth) |
+
+- **Still open:** the `edit-stream` dry run looks every new name up in every shard (≈ 256 M lookups for ImageNet; one pass over the manifest's global hash would do); huge pages unmeasured (needs the sudo mount); `libpzpdir.so` stays `-march=native` (the Python package is built on the machine that uses it)
 
 ### DataLoader integration (first client; separate repo and branch)
 Covered by §5 (constraints) and §7 (plan). It starts after phase 6 (§5 order of work) and lives in
@@ -518,7 +536,7 @@ That confirms the 30-thread slowdown is memory / cache contention, not compute.
    - `imagePath` = key; `width` / `height` from `image`
    - `sk[]` from `persons` (a copy of ~112 B per person); `joint[]` from `joints`; `keypointsForEachSample` = joint count
    - tokens **computed at load**: tokenize `descriptions.text` (chosen `source`) across all members with `buildVocabulary.py`'s rules, build the sorted vocabulary (or map through a pinned `index_to_word.json`), then apply the blacklist and synonym map
-   - `descriptor` = a pointer into the mmapped `descriptor_<model>` table, with D from the schema; `db_get_batch_descriptors` uses it
+   - `descriptor` = a pointer into the mmapped `descriptor_<model>` table, with D from the schema; `db_get_batch_descriptors` uses it. **Caveat (found 2026-09-22, §8 results):** with `L2_NORMALIZE_DESCRIPTORS` the DataLoader L2-normalises every vector at load (`load_descriptor_bin`), and the archive stores them raw (bit-identical to the `.dinov3` file), so a zero-copy pointer is only right if the table holds normalised vectors. Decision needed: store normalised vectors (pack time or `replace-table`; keeps zero-copy) or normalise a private copy at load (≈ 0.43 s for COCO train, still 2.4× faster than today)
    - SuperPoint stays as today
 
    The `DB1` parser and descriptor matching collapse into a ~100-line adapter plus a small C tokenizer.
@@ -551,7 +569,7 @@ ext4, 16 cores, 31 GB RAM). There are 5 000 samples, and every stem is present i
 | captions | `val2017/descriptions.json` (DeepSeek-VL2) + `descriptionsOLD.json` | 0.4 MB+ | ~0.1 KB |
 | descriptors | `coco/cocoVal.db.dinov2`, `coco/cocoVal.db.dinov3` (768 × f32 each) | 15 MB each | 3 KB |
 
-- **Archive location:** `coco/cache/coco/pzpd/`, on the same NVMe for fairness. It's ~4.8 GB (+ ~30 MB of tables); the fallback is rgb+all+geo, ~3.2 GB.
+- **Archive location:** planned as `coco/cache/coco/pzpd/` on the same NVMe; they were built in a session scratch directory under `/tmp` instead and **moved on 2026-09-22 to `/media/ammar/games/PZPD_Test/`** (a 7200 rpm WD1001FALS hard disk, ext4): `coco_val2017.pzpd` (5 streams, 4.8 GB, 2 shards), `cocot.pzpd` (the same + tables), `sub60`, `syn`, the collections `cocoset` / `smokeset` (members stored relative, so they moved along), and the record lists `val2017.tsv` / `val2017_tables.tsv`. All verified with `verify --blobs` after the copy. NVMe measurements need a copy on the NVMe first (4.8 GB; `/` has 30 GB free, `/home` 8 GB).
 - **Shard boundaries:** `--shard-size 256M` / `64M` to exercise them.
 - **Cold runs (NVMe):** evict with `posix_fadvise(DONTNEED)` and confirm < 1% is still cached.
 - **Variants (NVMe):** `fs-open`, `fs-probe`, `pzpd-blob`, `pzpd-record`, `pzpd-view`, `pzpd-pf-pagecache`, `pzpd-pf-buffers`.
@@ -559,7 +577,53 @@ ext4, 16 cores, 31 GB RAM). There are 5 000 samples, and every stem is present i
 - **Workloads:** read sets rgb+all+geo and rgb+depth+seg+geo, T ∈ {1, 4, 8, 16}; `dataloader-replay` = the exact worker trace (strided, per-sample masks, k+1 double buffer); `--decode` for end-to-end.
 - **Reported:** samples/s, MB/s, p50/p99 latency, syscalls per sample, over-read bytes, open time, pack time, size vs `du`. Also startup time to build `PoseDatabase` from `cocoTrain.db` (49 MB text parse) vs from archive tables.
 - **Correctness:** `diff -r` after `unpack`, SHA-256 of every blob, `find()` resolves all 25 000 original names, metadata matches full decodes, and the table gates of phase 1c.
-- **Regression fixture:** the record list produced by `scripts/pzpdir_list_from_db.py` for val2017 is checked in.
+- **Regression fixture:** the record list produced by `scripts/pzpdir_list_from_db.py` for val2017 is `src/pzpdir/tests/fixtures/coco_val2017.tsv` (5 streams, 25 000 lines, 3.9 MB; this machine's absolute source paths). The tables list (91 MB, with descriptors) stays out of git.
+- **Hard disk (2026-09-22, the WD1001FALS above, cold, rgb+all+geo, 1 000 of the 5 000 shuffled samples):** copying the 9.8 GB of test archives onto it: 68 MB/s including `sync`; sequential read (`verify --blobs`, 4.8 GB): 73 MB/s ≈ 112 samples/s. Shuffled reads are seek-bound, about 60 % of that, and more consumer threads don't help (one spindle):
+
+  | T | pzpd-record | pf-pagecache | pf-buffers |
+  |---|---|---|---|
+  | 1 | 58 /s (p50 16.9 ms) | 68 /s | 69 /s |
+  | 8 | 71 /s | 52 /s (457 sync misses) | 73 /s |
+
+  More I/O threads let the drive's queue (mq-deadline, NCQ depth 32) reorder requests: BUFFERS at T=1 gives 60 / 69 / 72 / 72 /s with 1 / 4 / 16 / 32 I/O threads. At ~70 samples/s the DataLoader (≈ 480 /s at 6 workers, §6) would be I/O-bound 7×, so a hard disk only suits a first epoch whose member fits in RAM (AUTO → PAGECACHE, later epochs come from the page cache) or cold storage that is staged to NVMe / RAM with one sequential copy (4.8 GB ≈ 66 s here). Reading each window of the schedule in file order could at most approach the sequential ~112 /s.
+- **Results of the remaining §8 items (2026-09-22; NVMe = a copy of `coco_val2017` in `/tmp` on `/`, sources on `/home`, same Samsung 980 PRO):**
+  - **`find(name)`:** all 25 000 original names resolve to the right record and stream, all 5 000 keys to the right record (fixture list, Python, 8 µs per lookup + check)
+  - **Pack time:** 14.3 s to the NVMe (336 MB/s, sources evicted first), 80.9 s to the hard disk (59 MB/s), incl. `sync`. **Size:** archive 4.816 GB = sources' data + 0.33 % (4.800 GB, `du -sb`); on disk 0.74 % *smaller* than the 25 000 files (4.852 GB, `du`: 4 KiB block rounding)
+  - **Staging to `/dev/shm`** (cold, 4.8 GB): `cp -rL` of the 5 source dirs (25 004 files) 9.2 s (520 MB/s); `cp` of the 3 archive files 4.4 s (1.09 GB/s), **2.1× faster**; from the hard disk 65.5 s (74 MB/s)
+  - **`PoseDatabase` startup, COCO train** (118 287 samples, 262 465 persons, 17 joints, DINOv3 768-D; the DataLoader's own `createPoseDatabase` / `load_descriptor_bin` / `readPoseDatabase` from a scratch `libDataLoader.so` vs the same structs filled from archive tables the way the planned adapter would; GloVe embeddings excluded, same for both at ~0.05 s):
+
+    | | cold | warm |
+    |---|---|---|
+    | `.db` (49 MB parse 0.50 s + 365 MB `.dinov3` load 0.62 s) | 1.15 s | 0.96 s |
+    | archive, descriptors zero-copy | **0.05 s** (22×) | **0.03 s** (32×) |
+    | archive, descriptors L2-normalised into a copy at load | 0.48 s (2.4×) | 0.32 s (3×) |
+
+    Joints, image paths, sizes and every skeleton are identical (per-field hashes); descriptors are identical once normalised as the DataLoader does (see §7, caveat). Not compared: the `.db` also carries pre-computed token IDs, the archive caption *text* (tokenizer not written yet; COCO train has no captions file here). Zero-copy descriptors are read lazily during the epoch instead of at startup. The train archive holds empty stand-ins for the images (real names; startup never reads payloads): `startup/cocotrain.pzpd` on the hard disk, with the two drivers. Making the tables list took 394 s in Python (1.1 GB of text, mostly descriptors), packing 14 s
+  - **Read matrix, cold, samples/s, 5 000 shuffled** (`fs-probe` = `fs-open` after the DataLoader's first-touch stat() probing, 6 stats / sample here; `pzpd-blob` = one `pread` per stream):
+
+    | set A rgb+all+geo | T=1 | T=4 | T=8 | T=16 |
+    |---|---|---|---|---|
+    | fs-open | 1 089 | 3 510 | 5 581 | 7 427 |
+    | fs-probe | 1 051 | 3 423 | 5 476 | 7 401 |
+    | pzpd-blob | 1 567 | 4 353 | 5 890 | 6 522 |
+    | pzpd-record | 1 643 | 4 440 | 5 796 | 6 560 |
+    | pzpd-view | 1 535 | 4 277 | 5 558 | 6 148 |
+    | pf-pagecache | 3 532 | 4 081 | 5 681 | 6 262 |
+    | pf-buffers | **9 371** | **9 498** | **9 909** | **9 912** |
+
+    | set B rgb+depth+seg+geo | T=1 | T=4 | T=8 | T=16 |
+    |---|---|---|---|---|
+    | fs-open | 1 053 | 3 601 | 5 932 | 8 624 |
+    | fs-probe | 1 037 | 3 556 | 5 832 | 8 600 |
+    | pzpd-blob | 1 291 | 4 173 | 6 370 | 7 798 |
+    | pzpd-record | 1 432 | 4 161 | 5 121 | 5 648 |
+    | pzpd-view | 1 473 | 4 377 | 6 258 | 7 344 |
+    | pf-pagecache | 4 353 | 4 901 | 6 574 | 7 521 |
+    | pf-buffers | **7 860** | **8 233** | **10 446** | **11 069** |
+
+    Probing costs 1–3 % with warm dentries (cold ones need root). In set B one `pread` per record reads the ~478 KB `all` blob between rgb and depth, so `pzpd-record` falls behind `pzpd-blob` at T ≥ 8; the prefetcher reads ranges > 256 KB apart separately. At T = 16, plain files still beat single archive reads (as in phase 1); BUFFERS + `O_DIRECT` beats everything at every T
+  - **End-to-end with decode** (`--decode`: libjpeg, libpng, this repo's `pzp.h`; stand-ins for the DataLoader's codecs, no augmentation), set A, cold: fs-open 317 / 2 122 / 3 341, pzpd-record 357 / 2 387 / 3 372, pzpd-view 374 / 2 427 / 3 517, **pf-buffers 450 / 2 787 / 4 243** samples/s at T = 1 / 8 / 16 (+42 / +31 / +27 % over fs-open); decode ≈ 2.5–3.6 ms CPU per sample in every mode
+  - **Not measurable here:** dTLB misses (`perf` is installed but `perf_event_paranoid = 4`), cold dentry / inode caches (`drop_caches`), both need root
 
 ## 9. Risks and mitigations
 

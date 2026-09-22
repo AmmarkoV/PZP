@@ -12,7 +12,8 @@
  *      signalPrefetchFile(rgb), signalPrefetchFile(all)   (open + posix_fadvise(WILLNEED), fd kept)
  *      open/fstat/read/close of rgb, all, geo            (cachedReadImage)
  *      freeFileDescriptor(rgb), freeFileDescriptor(all)  (posix_fadvise(DONTNEED) + close)
- *    then decode + augmentation, modelled by --work-us of busy CPU (0 = I/O only).
+ *    then decode + augmentation, modelled by --work-us of busy CPU (0 = I/O only). Every path first reads
+ *    every byte it delivered once, as the decoder reads its input. Every run starts with a freshly opened archive.
  *
  *  Modes: fs (today), pzpd-record (one pread per sample), pzpd-pf-<auto|map|pagecache|buffers>
  *  (the whole epoch submitted to a prefetcher, workers get / release).
@@ -121,6 +122,16 @@ struct worker
     unsigned    t;  ///< Worker number
 };
 
+/** @brief Read every byte of a delivered blob once (8 at a time), as its decoder would. @return A sum that keeps the reads alive. */
+static uint64_t consume(const unsigned char *p, size_t n)
+{
+    uint64_t sum = 0, w;
+    size_t k = 0;
+    for (; k + 8 <= n; k += 8) { memcpy(&w, p + k, 8); sum += w; }
+    for (; k < n; k++) { sum += p[k]; }
+    return sum;
+}
+
 /** @brief Process one sample the way the chosen path does. */
 static void sample(struct run *r, size_t pos, unsigned char **buf, size_t *cap)
 {
@@ -134,7 +145,7 @@ static void sample(struct run *r, size_t pos, unsigned char **buf, size_t *cap)
             if (paths[i][k] == NULL) { continue; }
             size_t n = read_file(paths[i][k], buf, cap);
             bytes += n;
-            if (n) { sum += (*buf)[n - 1]; }
+            sum += consume(*buf, n);
         }
         free_fd(fdRgb);
         free_fd(fdAll);
@@ -145,7 +156,12 @@ static void sample(struct run *r, size_t pos, unsigned char **buf, size_t *cap)
         if (need > *cap) { *cap = need; *buf = (unsigned char *) realloc(*buf, need); }
         pzpd_blob_ref refs[PZPD_MAX_STREAMS];
         ssize_t n = pzpd_read_record(archive, i, mask, *buf, *cap, refs);
-        if (n > 0) { bytes += (uint64_t) n; sum += (*buf)[n - 1]; }
+        for (unsigned s = 0; (n > 0) && (s < pzpd_stream_count(archive)); s++)
+        {
+            if (refs[s].data == NULL) { continue; }
+            sum += consume((const unsigned char *) refs[s].data, refs[s].size);
+            bytes += refs[s].size;
+        }
     }
     else
     {
@@ -156,8 +172,7 @@ static void sample(struct run *r, size_t pos, unsigned char **buf, size_t *cap)
             for (unsigned s = 0; s < pzpd_stream_count(archive); s++)
             {
                 if (refs[s].data == NULL) { continue; }
-                const unsigned char *p = (const unsigned char *) refs[s].data;
-                for (size_t o = 0; o < refs[s].size; o += 4096) { sum += p[o]; }   // the decoder reads every page
+                sum += consume((const unsigned char *) refs[s].data, refs[s].size);
                 bytes += refs[s].size;
             }
         }
@@ -236,6 +251,7 @@ static void run(int mode, int pfMode, unsigned T, int cold)
 {
     static const char *pfNames[4] = { "auto", "map", "pagecache", "buffers" };
     if (cold) { make_cold(); }
+    else { pzpd_close(archive); archive = pzpd_open(archivePath, 0); }   // fresh mappings, page cache kept
     struct run r;
     memset(&r, 0, sizeof(r));
     r.mode = mode;

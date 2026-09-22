@@ -212,6 +212,12 @@ dated revisions, recorded in the changelog below.
   - **CLI / lists:** `@group NAME` names are stored (escapes allowed); `pack` uses the group's file sizes as the hint;
     `pzpdir groups`; `salvage` emits `@group` lines. **Python:** `Writer.group()`, `Archive.group_find / group /
     read_range / read_group`.
+- **v0.4 revision 11 (2026-09-22), from a review of the implementation:**
+  - **AUTO memory limit** (§6): "half of RAM" is half of the memory the process may use: physical RAM, or the limit of
+    its cgroup or an ancestor when lower (v2 `memory.max`, v1 `memory.limit_in_bytes`; systemd `MemoryMax`, Slurm,
+    containers). A member's size is the sum of its manifest's shard sizes.
+  - **Manifest header:** `groups_offset` / `group_count` are reserved and written as 0 (revision 10: there is no manifest
+    group table).
 
 ---
 
@@ -933,8 +939,8 @@ Modes (all in v1):
 
 0. **AUTO** (default). The mode is chosen **per shard** (and so per collection
    member) from `pzpd_storage_kind()` and size: RAM disk → MAP; block device
-   with the archive smaller than about half of RAM → PAGECACHE; otherwise →
-   BUFFERS. The chosen modes are reported in `stats` and by `pzpdir info`.
+   with the archive smaller than half of the process's memory limit (RAM, or its
+   cgroup's limit when lower; revision 11) → PAGECACHE; otherwise → BUFFERS. The chosen modes are reported in `stats` and by `pzpdir info`.
 1. **MAP** (RAM disk). Details in §6.1.
 2. **PAGECACHE.** I/O threads run `window` records ahead and call
    `posix_fadvise(WILLNEED)` on each record span. `get` returns `mmap` views.

@@ -305,6 +305,15 @@ static void test_formats(void)
     CHECK(pzpd_detect_format(p4, 9, NULL, 0, &m) == PZPD_FORMAT_PNM && m.bits == 1 && m.channels == 1, "PBM");
     const char *pf = "Pf\n10 20\n-1.0\n";
     CHECK(pzpd_detect_format(pf, strlen(pf), NULL, 0, &m) == PZPD_FORMAT_PFM && m.channels == 1 && m.bits == 32 && (m.meta_flags & PZPD_META_FLOAT) && !(m.meta_flags & PZPD_META_BIG_ENDIAN), "PFM little-endian");
+    // Sizes that don't fit u32 (or aren't numbers: strtod reads nan / inf) are not PNM / PFM headers
+    const char *badDims[4] = { "P5\n99999999999 2\n255\n", "P5\nnan 2\n255\n", "Pf\n10 inf\n-1.0\n", "PF\n1e30 20\n-1.0\n" };
+    for (int k = 0; k < 4; k++)
+    {
+        uint32_t fmt = pzpd_detect_format(badDims[k], strlen(badDims[k]), NULL, 0, &m);
+        CHECK( (fmt != PZPD_FORMAT_PNM) && (fmt != PZPD_FORMAT_PFM), "out-of-range size refused: \"%.12s\" (%s)", badDims[k], pzpd_format_name(fmt, f));
+    }
+    const char *p5max = "P5\n4294967295 1\n255\n";
+    CHECK(pzpd_detect_format(p5max, strlen(p5max), NULL, 0, &m) == PZPD_FORMAT_PNM && m.width == 4294967295u, "PGM width 2^32-1 still accepted");
 
     unsigned char npy[128];
     const char *hdr = "{'descr': '<f4', 'fortran_order': False, 'shape': (3, 4, 5), }";
@@ -398,6 +407,23 @@ static void test_misc(void)
         CHECK(pzpd_read_into(a, 1, 0, data, sizeof(data)) == PZPD_E_CHECKSUM, "PZPD_O_VERIFY catches a flipped payload byte");
         CHECK(pzpd_verify_record(a, 1, 0) && !pzpd_verify_record(a, 1, 1), "verify_record: header ok, payload bad");
         CHECK(pzpd_read_into(a, 2, 0, data, sizeof(data)) == (ssize_t) sizeof(data), "other records still read");
+        // The prefetcher checks the same checksums in every mode
+        const unsigned modes[3] = { PZPD_PF_MAP, PZPD_PF_PAGECACHE, PZPD_PF_BUFFERS };
+        for (int m = 0; m < 3; m++)
+        {
+            pzpd_prefetch_opts po = { 0, 1, modes[m], 0, 0 };
+            pzpd_prefetcher *pf = pzpd_prefetcher_create(a, &po);
+            uint64_t ords[2] = { 1, 2 };
+            pzpd_blob_ref refs[1];
+            pzpd_ticket t;
+            CHECK( (pf != NULL) && pzpd_prefetch_submit(pf, ords, NULL, 2), "prefetch with PZPD_O_VERIFY (mode %u)", modes[m]);
+            CHECK(pzpd_prefetch_get(pf, 1, 1, refs, &t) == PZPD_E_CHECKSUM, "prefetch get catches the flipped byte (mode %u)", modes[m]);
+            pzpd_prefetch_release(pf, &t);
+            CHECK( (pzpd_prefetch_get(pf, 2, 1, refs, &t) == 1) && (refs[0].size == sizeof(data)) && (memcmp(refs[0].data, data, sizeof(data)) == 0),
+                   "prefetch get of an intact record (mode %u)", modes[m]);
+            pzpd_prefetch_release(pf, &t);
+            pzpd_prefetcher_destroy(pf);
+        }
         pzpd_close(a);
     }
 
@@ -573,6 +599,11 @@ static void test_tables(void)
     pzpd_writer_opts uo = { ustreams, 1, 0, 0 };
     pzpd_writer *wu = pzpd_writer_create(upath, &uo);
     int tu = (wu != NULL) ? pzpd_writer_table(wu, "v", "v:u64", 0) : -1;
+    // Global rows stop at the reader's 4 G limit, before any row of the caller's buffer is read
+    int tg = (wu != NULL) ? pzpd_writer_table(wu, "g", "x:u16", PZPD_TABLE_GLOBAL) : -1;
+    uint16_t gx[1] = { 7 };
+    CHECK( (tg >= 0) && pzpd_writer_global_rows(wu, (unsigned) tg, gx, 1, NULL, 0), "one global row");
+    CHECK(!pzpd_writer_global_rows(wu, (unsigned) tg, gx, 0xFFFFFFFFu, NULL, 0) && strstr(pzpd_last_error(), "4 G rows") != NULL, "global rows beyond 4 G refused");
     CHECK( (tu >= 0) && pzpd_writer_begin(wu, "k", 1, PZPD_NO_GROUP, 0), "u64 table");
     CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, " -1", 3) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: \" -1\" rejected");
     CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, "\t-5", 3) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: tab then -5 rejected");
@@ -796,6 +827,9 @@ static void coll_check_all(pzpd *a, const char *what)
             if (!pzpd_blob_info_get(a, o, u, &bi) || (bi.present != present) || (bi.member != (inA ? 0u : 1u))) { errs++; continue; }
             if (!present)
             {
+                // A missing blob (or a stream the member lacks) still reports its record's shard, group and frame
+                pzpd_blob_info bd;
+                if ( !pzpd_blob_info_get(a, o, (unsigned) pzpd_stream_id(a, "depth"), &bd) || (bd.shard != bi.shard) || (bd.group != bi.group) || (bd.frame != bi.frame) ) { errs++; }
                 size_t vs = 1;
                 if ( (pzpd_read_into(a, o, u, buf, sizeof(buf)) != 0) || (pzpd_view(a, o, u, &vs) != NULL) || (vs != 0) || (refs[u].data != NULL) ) { errs++; }
                 continue;
@@ -1501,6 +1535,42 @@ static void test_recovery(void)
     pzpd_shard_info_get(a, 2, &o2);
     CHECK(one != NULL && pzpd_shard_info_get(one, 0, &s2) && s2.recovery == 2 && pzpd_count(one) == o2.record_count &&
           !strcmp(pzpd_stream_name(one, 1), "depth") && pzpd_table_count(one) == 3, "a shard without superblocks opens standalone (streams, tables from its sections)");
+    pzpd_close(one);
+
+    // Same shard, but record 0's offset + bytes wraps around past 2^64 (section checksum re-sealed):
+    // the rebuilt superblock must refuse it like any record past the end of the file
+    char wrapped[1300];
+    snprintf(wrapped, sizeof(wrapped), "%s/wrapped.pzpd", dir);
+    CHECK(copy_file(shards[2], wrapped), "copy the shard without superblocks");
+    {
+        int fd = open(wrapped, O_RDWR);
+        struct stat st;
+        fstat(fd, &st);
+        int patched = 0;
+        for (uint64_t off = 4096; (off + 32 <= (uint64_t) st.st_size) && !patched; off += 4096)
+        {
+            unsigned char h[32];
+            uint32_t kind;
+            uint64_t bytes;
+            if ( (pread(fd, h, 32, (off_t) off) != 32) || memcmp(h, "PZPDSECT", 8) ) { continue; }
+            memcpy(&kind, h + 12, 4);
+            memcpy(&bytes, h + 16, 8);
+            if ( (kind != 1) || (bytes < 32) ) { continue; }          // PZPD_SECT_RECORDS, 32-byte entries
+            unsigned char *data = (unsigned char *) malloc(bytes);
+            if (pread(fd, data, bytes, (off_t)(off + 32)) == (ssize_t) bytes)
+            {
+                uint64_t bad = UINT64_MAX - 63;                       // + the record's bytes (>= 64) wraps to a small value
+                memcpy(data, &bad, 8);
+                uint64_t cs = XXH64(data, bytes, 0);
+                patched = (pwrite(fd, data, 8, (off_t)(off + 32)) == 8) && (pwrite(fd, &cs, 8, (off_t)(off + 24)) == 8);
+            }
+            free(data);
+        }
+        close(fd);
+        CHECK(patched, "patched the record table");
+    }
+    one = pzpd_open(wrapped, 0);
+    CHECK( (one == NULL) && (pzpd_last_error_code() == PZPD_E_FORMAT), "a record table entry wrapping past 2^64 is refused by the section scan (code %d)", pzpd_last_error_code());
     pzpd_close(one);
 
     //--- a deleted shard fails only its own ordinals ------------------------------------

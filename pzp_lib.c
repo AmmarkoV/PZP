@@ -181,6 +181,23 @@ unsigned char *pzp_container_get_frame(
 }
 
 /*
+ * pzp_container_get_frames — decompress the first min(frame_count, max_frames) frames of a
+ * container in one pass ( file read once, each frame decoded once ). Use this, not
+ * pzp_container_get_frame() in a loop, to load an animation: a delta frame fetched on its own
+ * has to decode every frame back to its keyframe.
+ * Fills frames[0..n-1]; the caller frees each frames[i].pixels with pzp_free().
+ * Returns n, or 0 on error ( nothing left allocated ).
+ */
+unsigned int pzp_container_get_frames(
+        const char   *filename,
+        PZPFrame     *frames,
+        unsigned int  max_frames)
+{
+    if (!filename || !frames) return 0;
+    return pzp_container_read_frames(filename, frames, max_frames);
+}
+
+/*
  * pzp_container_read_metadata — return the metadata blob from a container.
  * Sets *bytes_out. Caller frees with pzp_free(). Returns NULL if absent.
  */

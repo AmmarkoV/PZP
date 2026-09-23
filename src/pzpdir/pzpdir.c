@@ -424,6 +424,48 @@ static void pzpd_clear_error(void)
     pzpd_errorCode    = PZPD_OK;
 }
 
+/** @brief An error kept across cleanup calls that clear or overwrite it (pzpd_error_save() / pzpd_error_restore()). */
+struct pzpd_saved_error
+{
+    int  code;       ///< enum pzpd_error
+    char text[512];  ///< Message
+};
+
+/** @brief Save this thread's error. */
+static void pzpd_error_save(struct pzpd_saved_error *e)
+{
+    e->code = pzpd_errorCode;
+    memcpy(e->text, pzpd_errorText, sizeof(e->text));
+}
+
+/** @brief Make a saved error this thread's error again. */
+static void pzpd_error_restore(const struct pzpd_saved_error *e)
+{
+    memcpy(pzpd_errorText, e->text, sizeof(pzpd_errorText));
+    pzpd_errorCode = e->code;
+}
+
+/** @brief Put printf-formatted context in front of this thread's error ("context: message").
+ *  @param code New enum pzpd_error, or PZPD_OK to keep the current one. */
+static void pzpd_error_wrap(int code, const char *fmt, ...)
+{
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(pzpd_errorText, sizeof(pzpd_errorText), fmt, args);
+    va_end(args);
+    size_t o = (n < 0) ? 0 : ((size_t) n < sizeof(pzpd_errorText)) ? (size_t) n : sizeof(pzpd_errorText) - 1;
+    const char *sep = ": ";
+    for (const char *q = sep; (*q != 0) && (o + 1 < sizeof(pzpd_errorText)); q++) { pzpd_errorText[o++] = *q; }
+    for (const char *q = e.text; (*q != 0) && (o + 1 < sizeof(pzpd_errorText)); q++) { pzpd_errorText[o++] = *q; }   // cut to fit, like snprintf
+    pzpd_errorText[o] = 0;
+    pzpd_errorCode = (code != PZPD_OK) ? code : e.code;
+    #if PZPDIR_DEBUG
+     fprintf(stderr, PZPD_RED "pzpdir: %s" PZPD_NORMAL "\n", pzpd_errorText);
+    #endif
+}
+
 const char *pzpd_last_error(void)
 {
     return pzpd_errorText;
@@ -567,6 +609,21 @@ static int pzpd_check_name(const char *what, const char *s, size_t len)
     if ( (s == NULL) || (len == 0) ) { pzpd_set_error(PZPD_E_ARG, "%s is empty", what); return 0; }
     if (len > PZPD_MAX_NAME) { pzpd_set_error(PZPD_E_ARG, "%s is %zu bytes, the limit is %u", what, len, PZPD_MAX_NAME); return 0; }
     if (memchr(s, 0, len) != NULL) { pzpd_set_error(PZPD_E_ARG, "%s contains a NUL byte", what); return 0; }
+    return 1;
+}
+
+/** @brief Validate a stream name: 1..PZPD_MAX_STREAM_NAME bytes without `"`, `\` or control characters (the shard
+ *  metadata JSON lists stream names unescaped, and recovery reads them back from it).
+ *  @return 1 if valid, 0 otherwise (error set). */
+static int pzpd_check_stream_name(const char *nm)
+{
+    size_t n = (nm != NULL) ? strlen(nm) : 0;
+    if ( (n == 0) || (n > PZPD_MAX_STREAM_NAME) ) { pzpd_set_error(PZPD_E_ARG, "stream names must be 1..%d bytes", PZPD_MAX_STREAM_NAME); return 0; }
+    for (size_t i = 0; i < n; i++)
+    {
+        unsigned char c = (unsigned char) nm[i];
+        if ( (c < 0x20) || (c == 0x7F) || (c == '"') || (c == '\\') ) { pzpd_set_error(PZPD_E_ARG, "stream name \"%s\": no quotes, backslashes or control characters", nm); return 0; }
+    }
     return 1;
 }
 
@@ -740,7 +797,7 @@ static int pzpd_probe_npy(const unsigned char *d, size_t n, pzpd_blob_meta *m)
     char *shape = strstr(hdr, "'shape'");
     if ( (descr == NULL) || (shape == NULL) ) { return 1; }
     char *q = strchr(descr + 7, '\'');                 // opening quote of the dtype string
-    if (q == NULL) { return 1; }
+    if ( (q == NULL) || (q[1] == 0) || (q[2] == 0) ) { return 1; }   // a header cut inside the dtype string
     char order = q[1];                                  // '<', '>', '|' or '='
     char kind  = q[2];                                  // 'f', 'i', 'u', 'b', 'c', ...
     int itemsize = atoi(q + 3);
@@ -1853,12 +1910,7 @@ pzpd_writer *pzpd_writer_create(const char *manifest_path, const pzpd_writer_opt
     for (unsigned s = 0; s < w->S; s++)
     {
         const char *nm = o->streams[s];
-        if ( (nm == NULL) || (nm[0] == 0) || (strlen(nm) > PZPD_MAX_STREAM_NAME) )
-        {
-            pzpd_set_error(PZPD_E_ARG, "stream %u: names must be 1..%d bytes", s, PZPD_MAX_STREAM_NAME);
-            free(w);
-            return NULL;
-        }
+        if (!pzpd_check_stream_name(nm)) { pzpd_error_wrap(PZPD_OK, "stream %u", s); free(w); return NULL; }
         for (unsigned t = 0; t < s; t++)
         {
             if (strcmp(w->streams[t], nm) == 0) { pzpd_set_error(PZPD_E_ARG, "stream name \"%s\" given twice", nm); free(w); return NULL; }
@@ -2025,14 +2077,13 @@ int pzpd_writer_blob_file(pzpd_writer *w, unsigned stream, const char *name, siz
     struct stat st;
     if (fstat(fd, &st) != 0) { pzpd_set_error(PZPD_E_IO, "cannot stat %s: %s", src_path, strerror(errno)); close(fd); return 0; }
     if (!S_ISREG(st.st_mode)) { pzpd_set_error(PZPD_E_ARG, "%s is not a regular file", src_path); close(fd); return 0; }
+    if ((uint64_t) st.st_size > 0xFFFFFFFFull - PZPD_BLOCK) { pzpd_set_error(PZPD_E_ARG, "%s: %llu bytes exceed the 4 GiB blob limit", src_path, (unsigned long long) st.st_size); close(fd); return 0; }   // before reading it all
     size_t size = (size_t) st.st_size;
     unsigned char *data = (unsigned char *) malloc(size > 0 ? size : 1);
     if (data == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory reading %s (%zu bytes)", src_path, size); close(fd); return 0; }
     if ( (size > 0) && !pzpd_pread_all(fd, data, size, 0) )
     {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
-        pzpd_set_error(PZPD_E_IO, "%s: %s", src_path, msg);
+        pzpd_error_wrap(PZPD_E_IO, "%s", src_path);
         free(data);
         close(fd);
         return 0;
@@ -2641,11 +2692,10 @@ int pzpd_writer_finish(pzpd_writer *w)
     pzpd_buf_free(&shardTab);
     pzpd_buf_free(&names);
 
-    char saved[512];
-    int savedCode = pzpd_errorCode;
-    snprintf(saved, sizeof(saved), "%s", pzpd_errorText);
-    pzpd_writer_free(w);
-    if (!ok) { pzpd_set_error(savedCode, "%s", saved); }
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    pzpd_writer_abort(w);          // only frees after a complete finish; after a failed last shard it also closes and removes its .tmp
+    if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
 
@@ -2733,9 +2783,8 @@ static int pzpd_read_table_dir(struct pzpd_archive *a, const struct pzpd_disk_ta
         if ( !pzpd_check_section(map, file, dir[t].section_offset, PZPD_SECT_TABLE, dir[t].section_bytes) ||
              !pzpd_table_parse(map + dir[t].section_offset, dir[t].section_bytes, &sc, &v, (dir[t].flags & PZPD_TABLE_GLOBAL) ? -1 : records) )
         {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
-            pzpd_set_error(PZPD_E_FORMAT, "%s: table %u: %s", what, t, msg[0] ? msg : "section is damaged");
+            if (pzpd_errorText[0] == 0) { pzpd_set_error(PZPD_E_FORMAT, "section is damaged"); }   // pzpd_check_section() sets none
+            pzpd_error_wrap(PZPD_E_FORMAT, "%s: table %u", what, t);
             return 0;
         }
         char dn[24];
@@ -2856,7 +2905,10 @@ static unsigned pzpd_meta_streams(const char *json, size_t len, char names[][24]
 static int pzpd_sb_from_sections(const unsigned char *map, uint64_t file, uint64_t hint_first, struct pzpd_disk_superblock *out)
 {
     struct { uint32_t kind; uint64_t off, bytes; } found[64];
-    unsigned nf = 0;
+    // Table edits append a table's new section and leave the old one until compact: per name, the newest
+    // section (met first going backwards) holds the rows, the oldest one's position gives the directory slot
+    struct pzpd_scan_table { char name[24]; uint32_t flags, stride; uint64_t off, bytes, slot; } tb[PZPD_MAX_TABLES];
+    unsigned nf = 0, T = 0;
     int haveRecords = 0;
     if (file < 2 * PZPD_BLOCK) { pzpd_set_error(PZPD_E_FORMAT, "file too small"); return 0; }
     for (uint64_t off = (file - sizeof(struct pzpd_disk_section)) & ~(uint64_t)(PZPD_BLOCK - 1); (off >= PZPD_BLOCK) && !haveRecords; off -= PZPD_BLOCK)
@@ -2866,37 +2918,52 @@ static int pzpd_sb_from_sections(const unsigned char *map, uint64_t file, uint64
         if ( (memcmp(h.magic, PZPD_MAGIC_SECTION, 8) != 0) || (h.bytes > file - off - sizeof(h)) ) { continue; }
         if ( !(((h.kind >= PZPD_SECT_RECORDS) && (h.kind <= PZPD_SECT_META)) || (h.kind == PZPD_SECT_TABLE) || (h.kind == PZPD_SECT_GROUPS)) ) { continue; }
         if (XXH64(map + off + sizeof(h), (size_t) h.bytes, 0) != h.checksum) { continue; }
+        if (h.kind == PZPD_SECT_TABLE)
+        {
+            struct pzpd_disk_table_head th;
+            if (h.bytes < sizeof(th)) { continue; }
+            memcpy(&th, map + off + sizeof(h), sizeof(th));
+            if (memchr(th.name, 0, sizeof(th.name)) == NULL) { continue; }
+            unsigned t = 0;
+            while ( (t < T) && (strcmp(tb[t].name, th.name) != 0) ) { t++; }
+            if (t < T) { tb[t].slot = off; continue; }                 // an older version: only its position counts
+            if (T == PZPD_MAX_TABLES) { continue; }
+            memcpy(tb[T].name, th.name, sizeof(tb[T].name));
+            tb[T].flags = th.flags; tb[T].stride = th.row_stride; tb[T].off = off + sizeof(h); tb[T].bytes = h.bytes; tb[T].slot = off;
+            T++;
+            continue;
+        }
         if (nf == 64) { break; }
         found[nf].kind = h.kind; found[nf].off = off + sizeof(h); found[nf].bytes = h.bytes; nf++;
         haveRecords = (h.kind == PZPD_SECT_RECORDS);
     }
     if (!haveRecords) { pzpd_set_error(PZPD_E_FORMAT, "no intact index sections found"); return 0; }
 
-    // In file order: records, blobs, hash, heap, meta, groups, then the tables (first of each kind after the record table)
+    // In file order: records, blobs, hash, heap, meta, groups (first of each kind after the record table)
     uint64_t off[6] = {0}, bytes[6] = {0};
     int have[6] = {0};
     uint64_t goff = 0, gbytes = 0;
     int haveGroups = 0;
     struct pzpd_disk_superblock sb;
     memset(&sb, 0, sizeof(sb));
-    unsigned T = 0;
     for (int i = (int) nf - 1; i >= 0; i--)
     {
         uint32_t k = found[i].kind;
         if ( (k <= PZPD_SECT_META) && !have[k] ) { have[k] = 1; off[k] = found[i].off; bytes[k] = found[i].bytes; }
         else if ( (k == PZPD_SECT_GROUPS) && !haveGroups && (found[i].bytes % sizeof(struct pzpd_disk_group) == 0) ) { haveGroups = 1; goff = found[i].off; gbytes = found[i].bytes; }
-        else if ( (k == PZPD_SECT_TABLE) && (T < PZPD_MAX_TABLES) && (found[i].bytes >= sizeof(struct pzpd_disk_table_head)) )
-        {
-            struct pzpd_disk_table_head th;
-            memcpy(&th, map + found[i].off, sizeof(th));
-            if (memchr(th.name, 0, sizeof(th.name)) == NULL) { continue; }
-            pzpd_put_slot_name(sb.tables[T].name, th.name);
-            sb.tables[T].flags          = (uint8_t) th.flags;
-            sb.tables[T].section_offset = found[i].off;
-            sb.tables[T].section_bytes  = found[i].bytes;
-            sb.tables[T].row_stride     = th.row_stride;
-            T++;
-        }
+    }
+    // Tables in directory order: by the position of each one's first section
+    for (unsigned i = 1; i < T; i++)
+    {
+        for (unsigned j = i; (j > 0) && (tb[j - 1].slot > tb[j].slot); j--) { struct pzpd_scan_table x = tb[j]; tb[j] = tb[j - 1]; tb[j - 1] = x; }
+    }
+    for (unsigned t = 0; t < T; t++)
+    {
+        pzpd_put_slot_name(sb.tables[t].name, tb[t].name);
+        sb.tables[t].flags          = (uint8_t) tb[t].flags;
+        sb.tables[t].section_offset = tb[t].off;
+        sb.tables[t].section_bytes  = tb[t].bytes;
+        sb.tables[t].row_stride     = tb[t].stride;
     }
     if ( !have[PZPD_SECT_BLOBS] || !have[PZPD_SECT_HASH] || !have[PZPD_SECT_HEAP] ||
          (bytes[PZPD_SECT_RECORDS] % sizeof(struct pzpd_disk_record)) || (bytes[PZPD_SECT_HASH] % sizeof(struct pzpd_disk_hash)) )
@@ -3263,7 +3330,7 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
         s->path[dirLen + ms->name_len] = 0;
     }
     if (expect != a->total) { arch_close(a); pzpd_set_error(PZPD_E_FORMAT, "%s: shard record counts don't add up", path); return NULL; }
-    if (!pzpd_read_table_dir(a, mh.tables, a->mmap_manifest, file, NULL, -1, 1, path)) { char msg[512]; int code = pzpd_errorCode; snprintf(msg, sizeof(msg), "%s", pzpd_errorText); arch_close(a); pzpd_set_error(code, "%s", msg); return NULL; }
+    if (!pzpd_read_table_dir(a, mh.tables, a->mmap_manifest, file, NULL, -1, 1, path)) { struct pzpd_saved_error e; pzpd_error_save(&e); arch_close(a); pzpd_error_restore(&e); return NULL; }
     if (flags & PZPD_O_POPULATE)
     {
         for (unsigned i = 0; i < a->shard_count; i++) { (void) pzpd_shard(a, i); }   // missing shards fail later, on use
@@ -4018,7 +4085,7 @@ pzpd *pzpd_open_many(const char *const *paths, const char *const *aliases, unsig
                 return NULL;
             }
         }
-        if (!pzpd_bind_streams(a, mb) || !pzpd_bind_tables(a, mb)) { char msg[600]; int code = pzpd_errorCode; snprintf(msg, sizeof(msg), "%s", pzpd_errorText); pzpd_close(a); pzpd_set_error(code, "%s", msg); return NULL; }
+        if (!pzpd_bind_streams(a, mb) || !pzpd_bind_tables(a, mb)) { struct pzpd_saved_error e; pzpd_error_save(&e); pzpd_close(a); pzpd_error_restore(&e); return NULL; }
     }
     if (!pzpd_check_aliases(a)) { pzpd_close(a); return NULL; }
     pzpd_layout(a);
@@ -4169,7 +4236,7 @@ static pzpd *pzpd_coll_open(const char *path, unsigned flags)
     }
     free(c.buf);
     if (ok) { ok = pzpd_check_aliases(a); }
-    if (!ok) { char msg[600]; int code = pzpd_errorCode; snprintf(msg, sizeof(msg), "%s", pzpd_errorText); pzpd_close(a); pzpd_set_error(code, "%s", msg); return NULL; }
+    if (!ok) { struct pzpd_saved_error e; pzpd_error_save(&e); pzpd_close(a); pzpd_error_restore(&e); return NULL; }
     pzpd_layout(a);
     // Missing members keep their recorded size in pzpd_layout() (count stays as read)
     return a;
@@ -4785,11 +4852,10 @@ static int pzpd_coll_write(const char *out, const char *const *paths, const char
     pzpd_buf_free(&members);
     pzpd_buf_free(&heap);
     pzpd_buf_free(&remap);
-    char msg[600];
-    int code = pzpd_errorCode;
-    snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
     pzpd_close(a);
-    if (!ok) { pzpd_set_error(code, "%s", msg); }
+    if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
 
@@ -4856,22 +4922,31 @@ int pzpd_storage_kind(pzpd *a, uint64_t ordinal)
 //    buffers counted against budget_bytes, so the page cache doesn't grow. A get moves the buffer
 //    into the ticket; release frees it.
 // A schedule entry has an I/O state (queued → in flight → ready) and a claim state (free →
-// claimed by a get → done by release / discard). `outstanding` counts entries whose I/O was
-// started and whose claim isn't done: the window limits it. Buffers of entries in flight or
-// ready live in `window` slots; `used` counts the bytes of those plus the tickets' buffers.
+// claimed by a get → done by release / discard). The schedule is split into PZPD_PF_LANES lanes
+// by ordinal, each with its own lock, entries, ordinal hash and buffer slots. `outstanding`
+// (entries whose I/O was started and whose claim isn't done: the window limits it) and `used`
+// (bytes of prefetched buffers plus the tickets' buffers: the budget limits it) are atomic
+// counters shared by the lanes; an I/O thread reserves both before it starts an entry.
 //-----------------------------------------------------------------------------------------------
 
 #define PZPD_PF_GAP  (256u * 1024u)   ///< Gaps between requested blobs up to this size are read over (one range)
 #define PZPD_PF_NONE 0xFFFFFFFFu      ///< No schedule position / no buffer slot
 #define PZPD_PF_DIO  4096u            ///< O_DIRECT granularity: file offsets, lengths and buffers aligned to this
+#define PZPD_PF_BATCH 8u              ///< MAP / PAGECACHE entries an I/O thread starts per lock hold; also the free window an idle I/O thread is woken for
+/** @brief Lanes of a prefetcher. The schedule is split by ordinal (a hash of it) into this many parts, each with its own
+ *  lock, so consumers and I/O threads working on different records rarely wait for each other; only the window and the
+ *  budget span the lanes (atomic counters). I/O threads serve the lanes round-robin: with fewer threads than lanes each
+ *  serves several, with more several serve each lane. */
+#define PZPD_PF_LANES 8u
 
 enum { PZPD_PF_QUEUED = 0, PZPD_PF_INFLIGHT = 1, PZPD_PF_READY = 2 };   ///< I/O state of a schedule entry
 enum { PZPD_PF_FREE = 0, PZPD_PF_CLAIMED = 1, PZPD_PF_DONE = 2 };       ///< Claim state of a schedule entry
 
-/** @brief One submitted claim (32 bytes). */
+/** @brief One submitted claim (40 bytes). */
 struct pzpd_pf_entry
 {
     uint64_t ordinal;  ///< Record
+    uint64_t seq;      ///< Position in the whole schedule (over all lanes): it may start once seq < claims done + window
     uint64_t need;     ///< Buffer bytes when the record's shard is in BUFFERS mode, else 0 (computed at submit, outside the lock)
     uint32_t mask;     ///< Streams to prefetch
     uint32_t next;     ///< Next claim of the same ordinal, PZPD_PF_NONE if none
@@ -4913,40 +4988,117 @@ struct pzpd_pf_range
     uint64_t hi;  ///< One past the last byte
 };
 
-/** @brief Prefetcher state (see the section comment above). */
-struct pzpd_prefetcher
+/** @brief A mutex on a cache line of its own (64-byte aligned). A struct holding one is aligned the same way, so
+ *  lanes and I/O threads next to each other in an array never share a line (no false sharing between their locks). */
+typedef pthread_mutex_t pzpd_cacheline_mutex __attribute__((aligned(64)));
+
+/** @brief One lane: the part of the schedule whose ordinals hash to it (pzpd_pf_lane_of()), with its own lock.
+ *  Consumers and I/O threads working on records of different lanes never wait for each other. */
+struct pzpd_pf_lane
 {
-    pzpd            *a;            ///< Handle
-    uint32_t         mask;         ///< Default stream mask
-    unsigned         window;       ///< Most outstanding entries
-    uint64_t         budget;       ///< BUFFERS byte budget
-    unsigned         nthreads;     ///< I/O threads started
-    uint8_t         *shard_mode;   ///< Per shard: PZPD_PF_MAP, _PAGECACHE or _BUFFERS
-    int             *dfd;          ///< Per shard: O_DIRECT descriptor in use, -1 = buffered pread (read atomically)
-    int             *dfd_open;     ///< Per shard: O_DIRECT descriptor to close at destroy, -1 if none
-    int              any_buffers;  ///< 1 if some shard is in BUFFERS mode
-    pthread_mutex_t  lock;         ///< Guards everything below
-    pthread_cond_t   work;         ///< I/O threads wait here for entries, window or budget
-    pthread_cond_t   ready;        ///< Gets and clears wait here for in-flight I/O
-    pthread_t       *threads;      ///< I/O threads
-    int              stop;         ///< Set by pzpd_prefetcher_destroy()
-    struct pzpd_pf_entry *e;       ///< Schedule
+    pzpd_cacheline_mutex lock;     ///< Guards every field below
+    pthread_cond_t   ready;        ///< Gets and clears wait here for this lane's in-flight I/O
+    struct pzpd_pf_entry *e;       ///< This lane's claims, in submission order
     uint64_t         n;            ///< Entries
     uint64_t         cap;          ///< Allocated entries
     struct pzpd_pf_hslot *slots;   ///< Ordinal hash (linear probing), hcap slots
     uint64_t         hcap;         ///< Slots, a power of two (0 before the first submit)
     uint64_t         hcount;       ///< Distinct ordinals in the hash
-    struct pzpd_pf_buf *bufs;      ///< `window` buffer slots
+    struct pzpd_pf_buf *bufs;      ///< Buffer slots, grown on demand up to `window`
     uint32_t        *free_bufs;    ///< Free buffer slot ids
+    unsigned         nbufs;        ///< Buffer slots allocated
     unsigned         nfree;        ///< Free buffer slots
-    uint64_t         used;         ///< Buffer bytes in slots and tickets
     uint64_t         cursor;       ///< Next entry the I/O threads look at
-    uint64_t         outstanding;  ///< Started entries whose claim isn't done
     unsigned         inflight;     ///< Entries being prefetched right now
     uint64_t         gen;          ///< Schedule generation, bumped by pzpd_prefetch_clear()
-    pzpd_prefetch_stats st;        ///< Counters
+    pzpd_prefetch_stats st;        ///< This lane's counters (pzpd_prefetch_stats_get() adds the lanes up)
+};
+
+_Static_assert(_Alignof(struct pzpd_pf_lane) == 64, "a lane starts a cache line");
+
+/** @brief Parking states of an I/O thread (pzpd_pf_worker::parked). */
+enum { PZPD_PF_AWAKE = 0, PZPD_PF_PARKED_EMPTY = 1, PZPD_PF_PARKED_STARVED = 2 };
+
+/** @brief An I/O thread and its parking place: it sleeps here when none of its lanes has an entry it may start. */
+struct pzpd_pf_worker
+{
+    struct pzpd_prefetcher *p;     ///< Prefetcher
+    unsigned         id;           ///< Thread index
+    pzpd_cacheline_mutex m;        ///< Guards the sleep
+    pthread_cond_t   c;            ///< Signalled by pzpd_pf_wake_worker()
+    int              wake;         ///< Atomic: set by a waker, reset by the thread before its last look at its lanes
+    int              parked;       ///< Atomic: PZPD_PF_AWAKE, _PARKED_EMPTY (no queued entries) or _PARKED_STARVED (window / budget full)
+};
+
+_Static_assert(_Alignof(struct pzpd_pf_worker) == 64, "an I/O thread's parking place starts a cache line");
+
+/** @brief Prefetcher state (see the section comment above). Allocated 64-byte aligned (the lanes are). */
+struct pzpd_prefetcher
+{
+    struct pzpd_pf_lane lane[PZPD_PF_LANES]; ///< The lanes
+    pzpd            *a;            ///< Handle
+    uint32_t         mask;         ///< Default stream mask
+    unsigned         window;       ///< Most outstanding entries, over all lanes
+    uint64_t         budget;       ///< BUFFERS byte budget, over all lanes
+    uint8_t         *shard_mode;   ///< Per shard: PZPD_PF_MAP, _PAGECACHE or _BUFFERS
+    int             *dfd;          ///< Per shard: O_DIRECT descriptor in use, -1 = buffered pread (read atomically)
+    int             *dfd_open;     ///< Per shard: O_DIRECT descriptor to close at destroy, -1 if none
+    int              any_buffers;  ///< 1 if some shard is in BUFFERS mode
+    pthread_mutex_t  ctl;          ///< Serialises submit and clear (taken before a lane lock, never while holding one)
+    unsigned         nworkers;     ///< I/O threads planned (their lanes depend on it)
+    unsigned         nthreads;     ///< I/O threads started
+    struct pzpd_pf_worker *w;      ///< I/O threads' parking places (nworkers, 64-byte aligned)
+    pthread_t       *threads;      ///< I/O threads
+    int              stop;         ///< Atomic: set by pzpd_prefetcher_destroy()
+    uint64_t         outstanding;  ///< Atomic: started entries whose claim isn't done (the window limits it)
+    uint64_t         done;         ///< Atomic: claims done (released / discarded) since the last clear: the schedule's progress
+    uint64_t         seq_next;     ///< Schedule position of the next submitted claim (under `ctl`)
+    uint64_t         used;         ///< Atomic: buffer bytes in slots and tickets (the budget limits it)
+    uint64_t         used_peak;    ///< Atomic: highest `used`
+    uint64_t         stalls;       ///< Atomic: times an I/O thread parked with queued entries (window / budget full)
+    uint64_t         fallbacks;    ///< Atomic: BUFFERS shards that fell back to buffered reads
+    pzpd_prefetch_stats st;        ///< Counters fixed at create (shard modes)
     struct timespec  t0;           ///< Creation time
 };
+
+/** @brief Atomic load of a shared prefetcher counter. */
+static inline uint64_t pzpd_atomic_get(const uint64_t *v) { return __atomic_load_n(v, __ATOMIC_SEQ_CST); }
+/** @brief Atomic add to a shared prefetcher counter. */
+static inline void pzpd_atomic_add(uint64_t *v, uint64_t d) { (void) __atomic_add_fetch(v, d, __ATOMIC_SEQ_CST); }
+/** @brief Atomic subtract from a shared prefetcher counter. */
+static inline void pzpd_atomic_sub(uint64_t *v, uint64_t d) { (void) __atomic_sub_fetch(v, d, __ATOMIC_SEQ_CST); }
+/** @brief Atomic store to a shared prefetcher counter. */
+static inline void pzpd_atomic_set(uint64_t *v, uint64_t x) { __atomic_store_n(v, x, __ATOMIC_SEQ_CST); }
+/** @brief Atomic load of a shared flag. */
+static inline int pzpd_atomic_geti(const int *v) { return __atomic_load_n(v, __ATOMIC_SEQ_CST); }
+/** @brief Atomic store of a shared flag. */
+static inline void pzpd_atomic_seti(int *v, int x) { __atomic_store_n(v, x, __ATOMIC_SEQ_CST); }
+
+/** @brief Reserve `amount` of a limit shared by the lanes: *v += amount unless that passes `limit`.
+ *  @param first When 1, a zero *v always takes the reservation (one record always fits the budget).
+ *  @return 1 if reserved, 0 if the limit is reached. */
+static int pzpd_atomic_reserve(uint64_t *v, uint64_t amount, uint64_t limit, int first)
+{
+    uint64_t cur = __atomic_load_n(v, __ATOMIC_SEQ_CST);
+    for (;;)
+    {
+        if ( !((first && (cur == 0)) || (cur + amount <= limit)) ) { return 0; }
+        if (__atomic_compare_exchange_n(v, &cur, cur + amount, 1, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) { return 1; }
+    }
+}
+
+/** @brief Raise a shared maximum to at least x. */
+static void pzpd_atomic_max(uint64_t *v, uint64_t x)
+{
+    uint64_t cur = __atomic_load_n(v, __ATOMIC_SEQ_CST);
+    while ( (cur < x) && !__atomic_compare_exchange_n(v, &cur, x, 1, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ) { }
+}
+
+/** @brief Lane of an ordinal (high bits of a multiplicative hash: the lanes' ordinal hashes use the low ones). */
+static inline unsigned pzpd_pf_lane_of(uint64_t ordinal)
+{
+    return (unsigned)(((ordinal * 0x9E3779B97F4A7C15ull) >> 40) % PZPD_PF_LANES);
+}
 
 /** @brief Seconds elapsed since t0. */
 static double pzpd_seconds_since(const struct timespec *t0)
@@ -4964,56 +5116,108 @@ static struct pzpd_pf_hslot *pzpd_pf_slot_of(struct pzpd_pf_hslot *slots, uint64
     return &slots[i];
 }
 
-/** @brief Make room for `more` distinct ordinals (load ≤ ½). Lock held. @return 1, or 0 if out of memory. */
-static int pzpd_pf_hash_reserve(struct pzpd_prefetcher *p, uint64_t more)
+/** @brief Make room for `more` distinct ordinals in a lane (load ≤ ½). Lane lock held. @return 1, or 0 if out of memory. */
+static int pzpd_pf_hash_reserve(struct pzpd_pf_lane *ln, uint64_t more)
 {
-    if (2 * (p->hcount + more) <= p->hcap) { return 1; }
-    uint64_t nc = (p->hcap == 0) ? 1024 : p->hcap;
-    while (nc < 2 * (p->hcount + more)) { nc *= 2; }
+    if (2 * (ln->hcount + more) <= ln->hcap) { return 1; }
+    uint64_t nc = (ln->hcap == 0) ? 1024 : ln->hcap;
+    while (nc < 2 * (ln->hcount + more)) { nc *= 2; }
     struct pzpd_pf_hslot *ns = (struct pzpd_pf_hslot *) malloc(nc * sizeof(struct pzpd_pf_hslot));
     if (ns == NULL) { return 0; }
     memset(ns, 0xFF, nc * sizeof(struct pzpd_pf_hslot));      // head = PZPD_PF_NONE everywhere
-    for (uint64_t i = 0; i < p->hcap; i++)
+    for (uint64_t i = 0; i < ln->hcap; i++)
     {
-        if (p->slots[i].head != PZPD_PF_NONE) { *pzpd_pf_slot_of(ns, nc, p->slots[i].ordinal) = p->slots[i]; }
+        if (ln->slots[i].head != PZPD_PF_NONE) { *pzpd_pf_slot_of(ns, nc, ln->slots[i].ordinal) = ln->slots[i]; }
     }
-    free(p->slots);
-    p->slots = ns;
-    p->hcap  = nc;
+    free(ln->slots);
+    ln->slots = ns;
+    ln->hcap  = nc;
     return 1;
 }
 
-/** @brief First free claim of an ordinal. Lock held. @return Its position, or UINT64_MAX if none. */
-static uint64_t pzpd_pf_claim(struct pzpd_prefetcher *p, uint64_t ordinal)
+/** @brief First free claim of an ordinal in its lane. Lane lock held. @return Its position, or UINT64_MAX if none. */
+static uint64_t pzpd_pf_claim(struct pzpd_pf_lane *ln, uint64_t ordinal)
 {
-    if (p->hcap == 0) { return UINT64_MAX; }
-    struct pzpd_pf_hslot *sl = pzpd_pf_slot_of(p->slots, p->hcap, ordinal);
+    if (ln->hcap == 0) { return UINT64_MAX; }
+    struct pzpd_pf_hslot *sl = pzpd_pf_slot_of(ln->slots, ln->hcap, ordinal);
     if (sl->head == PZPD_PF_NONE) { return UINT64_MAX; }
     uint32_t i = sl->head;
-    while ( (i != PZPD_PF_NONE) && (p->e[i].claim != PZPD_PF_FREE) ) { i = p->e[i].next; }
+    while ( (i != PZPD_PF_NONE) && (ln->e[i].claim != PZPD_PF_FREE) ) { i = ln->e[i].next; }
     sl->head = (i != PZPD_PF_NONE) ? i : sl->tail;              // claims never become free again: skip them next time
     return (i != PZPD_PF_NONE) ? i : UINT64_MAX;
 }
 
-/** @brief Free the buffer slot of entry i, if it holds one. Lock held. */
-static void pzpd_pf_drop_slot(struct pzpd_prefetcher *p, uint64_t i)
+/** @brief Free the buffer slot of entry i, if it holds one. Lane lock held. @return The budget bytes given back. */
+static uint64_t pzpd_pf_drop_slot(struct pzpd_prefetcher *p, struct pzpd_pf_lane *ln, uint64_t i)
 {
-    uint32_t k = p->e[i].slot;
-    if (k == PZPD_PF_NONE) { return; }
-    free(p->bufs[k].data);
-    p->used -= p->bufs[k].bytes;
-    p->bufs[k].data = NULL;
-    p->bufs[k].bytes = 0;
-    p->free_bufs[p->nfree++] = k;
-    p->e[i].slot = PZPD_PF_NONE;
+    uint32_t k = ln->e[i].slot;
+    if (k == PZPD_PF_NONE) { return 0; }
+    uint64_t bytes = ln->bufs[k].bytes;
+    free(ln->bufs[k].data);
+    pzpd_atomic_sub(&p->used, bytes);
+    ln->bufs[k].data = NULL;
+    ln->bufs[k].bytes = 0;
+    ln->free_bufs[ln->nfree++] = k;
+    ln->e[i].slot = PZPD_PF_NONE;
+    return bytes;
 }
 
-/** @brief Mark a claim done, returning its window slot (and buffer, once its read finished) if its I/O was started. Lock held. */
-static void pzpd_pf_done(struct pzpd_prefetcher *p, uint64_t i)
+/** @brief Mark a claim done, giving back its window place (and buffer, once its read finished) if its I/O was started.
+ *  Lane lock held. @return What it freed for pzpd_pf_wake(): bit 0 window, bit 1 budget. */
+static int pzpd_pf_done(struct pzpd_prefetcher *p, struct pzpd_pf_lane *ln, uint64_t i)
 {
-    p->e[i].claim = PZPD_PF_DONE;
-    if (p->e[i].io == PZPD_PF_READY) { pzpd_pf_drop_slot(p, i); }   // in flight: the I/O thread frees it when done
-    if (p->e[i].io != PZPD_PF_QUEUED) { p->outstanding--; pthread_cond_signal(&p->work); }
+    ln->e[i].claim = PZPD_PF_DONE;
+    int freed = 0;
+    if ( (ln->e[i].io == PZPD_PF_READY) && (pzpd_pf_drop_slot(p, ln, i) > 0) ) { freed |= 2; }   // in flight: the I/O thread frees it when done
+    if (ln->e[i].io != PZPD_PF_QUEUED) { pzpd_atomic_sub(&p->outstanding, 1); freed |= 1; }
+    // Progress lets later entries start: count it as window room once per batch of claims
+    if ( (__atomic_add_fetch(&p->done, 1, __ATOMIC_SEQ_CST) % PZPD_PF_BATCH) == 0 ) { freed |= 1; }
+    return freed;
+}
+
+/** @brief Grow a lane's buffer slots (doubling, at most `window`: no more entries than that are ever started).
+ *  Lane lock held. @return 1 if a slot was added, 0 otherwise. */
+static int pzpd_pf_grow_bufs(struct pzpd_prefetcher *p, struct pzpd_pf_lane *ln)
+{
+    if (ln->nbufs >= p->window) { return 0; }
+    unsigned nb = (ln->nbufs == 0) ? 16 : 2 * ln->nbufs;
+    if (nb > p->window) { nb = p->window; }
+    struct pzpd_pf_buf *b = (struct pzpd_pf_buf *) realloc(ln->bufs, nb * sizeof(struct pzpd_pf_buf));
+    if (b == NULL) { return 0; }
+    ln->bufs = b;
+    uint32_t *f = (uint32_t *) realloc(ln->free_bufs, nb * sizeof(uint32_t));
+    if (f == NULL) { return 0; }
+    ln->free_bufs = f;
+    for (unsigned k = ln->nbufs; k < nb; k++) { memset(&ln->bufs[k], 0, sizeof(ln->bufs[k])); ln->free_bufs[ln->nfree++] = k; }
+    ln->nbufs = nb;
+    return 1;
+}
+
+/** @brief Wake one I/O thread (it rechecks its lanes). No lane lock may be held. */
+static void pzpd_pf_wake_worker(struct pzpd_pf_worker *w)
+{
+    pzpd_atomic_seti(&w->wake, 1);
+    pthread_mutex_lock(&w->m);
+    pthread_cond_signal(&w->c);
+    pthread_mutex_unlock(&w->m);
+}
+
+/** @brief Wake parked I/O threads after something changed. No lane lock may be held.
+ *  @param freed Bits of pzpd_pf_done(): 1 window place (threads parked with queued entries are woken once a whole
+ *               batch fits, so a release costs a wake-up per batch, not per record), 2 budget bytes.
+ *  @param all   1 for new entries, clear and destroy: every parked thread is woken. */
+static void pzpd_pf_wake(struct pzpd_prefetcher *p, int freed, int all)
+{
+    if ( !all && !(freed & 2) )
+    {
+        uint64_t room = (p->window < PZPD_PF_BATCH) ? p->window : PZPD_PF_BATCH;
+        if ( !(freed & 1) || (pzpd_atomic_get(&p->outstanding) + room > p->window) ) { return; }
+    }
+    for (unsigned t = 0; t < p->nworkers; t++)
+    {
+        int parked = pzpd_atomic_geti(&p->w[t].parked);
+        if ( (parked == PZPD_PF_PARKED_STARVED) || (all && (parked != PZPD_PF_AWAKE)) ) { pzpd_pf_wake_worker(&p->w[t]); }
+    }
 }
 
 /** @brief File locations of a record's requested, present blobs (indexed by merged stream).
@@ -5107,12 +5311,7 @@ static unsigned char *pzpd_pf_read(struct pzpd_prefetcher *p, unsigned shard, co
             if ( (rd < 0) && direct && (errno == EINVAL) )
             {
                 // The file system refuses O_DIRECT for this read: buffered reads from now on (counted once)
-                if (__atomic_exchange_n(&p->dfd[shard], -1, __ATOMIC_RELAXED) >= 0)
-                {
-                    pthread_mutex_lock(&p->lock);
-                    p->st.direct_fallbacks++;
-                    pthread_mutex_unlock(&p->lock);
-                }
+                if (__atomic_exchange_n(&p->dfd[shard], -1, __ATOMIC_RELAXED) >= 0) { pzpd_atomic_add(&p->fallbacks, 1); }
                 continue;
             }
             if (rd <= 0) { free(buf); pzpd_set_error(PZPD_E_IO, "%s: read failed at %llu: %s", s->path, (unsigned long long)(alo + got), (rd < 0) ? strerror(errno) : "unexpected end of file"); return NULL; }
@@ -5166,97 +5365,155 @@ static uint64_t pzpd_pf_need(struct pzpd_prefetcher *p, uint64_t ordinal, uint32
     return pzpd_pf_buffer_bytes(r, pzpd_pf_ranges(loc, p->a->S, r, &over));
 }
 
-/** @brief Take the next queued entry the window and budget allow. Lock held.
+/** @brief Take a lane's next queued entry, reserving its window place and budget bytes (shared by the lanes).
+ *  Lane lock held. @param starved Set to 1 when an entry is queued but the window, budget or buffer slots are full.
  *  @return Its position, or UINT64_MAX if none may start now. */
-static uint64_t pzpd_pf_next(struct pzpd_prefetcher *p)
+static uint64_t pzpd_pf_next(struct pzpd_prefetcher *p, struct pzpd_pf_lane *ln, int *starved)
 {
-    while ( (p->cursor < p->n) && ((p->e[p->cursor].io != PZPD_PF_QUEUED) || (p->e[p->cursor].claim != PZPD_PF_FREE)) ) { p->cursor++; }
-    if ( (p->cursor >= p->n) || (p->outstanding >= p->window) ) { return UINT64_MAX; }
-    uint64_t need = p->e[p->cursor].need;
+    while ( (ln->cursor < ln->n) && ((ln->e[ln->cursor].io != PZPD_PF_QUEUED) || (ln->e[ln->cursor].claim != PZPD_PF_FREE)) ) { ln->cursor++; }
+    if (ln->cursor >= ln->n) { return UINT64_MAX; }
+    // Global order: no lane runs more than `window` claims ahead of the schedule's progress
+    if (ln->e[ln->cursor].seq >= pzpd_atomic_get(&p->done) + p->window) { *starved = 1; return UINT64_MAX; }
+    uint64_t need = ln->e[ln->cursor].need;
+    // slots of discarded in-flight entries come back when their read ends
+    if ( (need > 0) && (ln->nfree == 0) && !pzpd_pf_grow_bufs(p, ln) ) { *starved = 1; return UINT64_MAX; }
+    if (!pzpd_atomic_reserve(&p->outstanding, 1, p->window, 0)) { *starved = 1; return UINT64_MAX; }
     if (need > 0)
     {
-        if ( (p->used > 0) && (p->used + need > p->budget) ) { return UINT64_MAX; }   // one record always fits
-        if (p->nfree == 0) { return UINT64_MAX; }                 // slots of discarded in-flight entries come back when their read ends
+        if (!pzpd_atomic_reserve(&p->used, need, p->budget, 1)) { pzpd_atomic_sub(&p->outstanding, 1); *starved = 1; return UINT64_MAX; }   // one record always fits
+        pzpd_atomic_max(&p->used_peak, pzpd_atomic_get(&p->used));
     }
-    return p->cursor++;
+    return ln->cursor++;
 }
 
-/** @brief I/O thread: take the next queued entry within window and budget, prefetch it, repeat. */
-static void *pzpd_pf_thread(void *arg)
+/** @brief Start entry i (lane lock held; window and budget already reserved): its buffer slot for a BUFFERS shard, in-flight state. */
+static void pzpd_pf_start(struct pzpd_pf_lane *ln, uint64_t i)
 {
-    struct pzpd_prefetcher *p = (struct pzpd_prefetcher *) arg;
-    pthread_mutex_lock(&p->lock);
-    for (;;)
+    uint32_t slot = PZPD_PF_NONE;
+    if (ln->e[i].need > 0)
     {
-        uint64_t i = UINT64_MAX;
-        while ( !p->stop && ((i = pzpd_pf_next(p)) == UINT64_MAX) )
-        {
-            if (p->cursor < p->n) { p->st.producer_stalls++; }
-            pthread_cond_wait(&p->work, &p->lock);
-        }
-        if (p->stop) { break; }
-        uint64_t ordinal = p->e[i].ordinal;
-        uint32_t mask = p->e[i].mask;
-        uint64_t need = p->e[i].need;
-        int isBuf = (need > 0);
-        uint32_t slot = PZPD_PF_NONE;
-        if (isBuf)
-        {
-            slot = p->free_bufs[--p->nfree];
-            p->bufs[slot].data  = NULL;
-            p->bufs[slot].bytes = need;
-            p->bufs[slot].mask  = mask;
-            p->used += need;
-            if (p->used > p->st.buffer_bytes_peak) { p->st.buffer_bytes_peak = p->used; }
-        }
-        p->e[i].slot = slot;
-        p->e[i].io = PZPD_PF_INFLIGHT;
-        p->outstanding++;
-        p->inflight++;
-        pthread_mutex_unlock(&p->lock);
+        slot = ln->free_bufs[--ln->nfree];
+        ln->bufs[slot].data  = NULL;
+        ln->bufs[slot].bytes = ln->e[i].need;
+        ln->bufs[slot].mask  = ln->e[i].mask;
+    }
+    ln->e[i].slot = slot;
+    ln->e[i].io = PZPD_PF_INFLIGHT;
+    ln->inflight++;
+}
 
+/** @brief Prefetch one batch of a lane: up to PZPD_PF_BATCH MAP / PAGECACHE entries, or one BUFFERS entry (its read
+ *  takes long), taken under one lock hold, prefetched without the lock, completed under one lock hold.
+ *  @param starved Set to 1 when the lane has queued entries that can't start yet. @return Entries prefetched. */
+static unsigned pzpd_pf_lane_batch(struct pzpd_prefetcher *p, struct pzpd_pf_lane *ln, int *starved)
+{
+    struct { uint64_t i, ordinal, bytes, over; uint32_t mask, slot; int isBuf; unsigned char *data; double dt; } job[PZPD_PF_BATCH];
+    unsigned nt = 0;
+    pthread_mutex_lock(&ln->lock);
+    uint64_t i;
+    while ( (nt < PZPD_PF_BATCH) && ((i = pzpd_pf_next(p, ln, starved)) != UINT64_MAX) )
+    {
+        pzpd_pf_start(ln, i);
+        job[nt].i = i; job[nt].ordinal = ln->e[i].ordinal; job[nt].mask = ln->e[i].mask; job[nt].slot = ln->e[i].slot;
+        job[nt].isBuf = (ln->e[i].need > 0); job[nt].data = NULL; job[nt].bytes = 0; job[nt].over = 0;
+        nt++;
+        if (job[nt - 1].isBuf) { break; }
+    }
+    pthread_mutex_unlock(&ln->lock);
+    if (nt == 0) { return 0; }
+
+    for (unsigned k = 0; k < nt; k++)
+    {
         struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         struct pzpd_pf_loc loc[PZPD_MAX_STREAMS];
         struct pzpd_pf_range r[PZPD_MAX_STREAMS];
         unsigned shard = 0, nr = 0;
-        uint64_t local = 0, over = 0, bytes = 0;
-        unsigned char *data = NULL;
-        struct pzpd_rshard *s = pzpd_pf_locate(p->a, ordinal, mask, loc, &shard, &local);
+        uint64_t local = 0;
+        struct pzpd_rshard *s = pzpd_pf_locate(p->a, job[k].ordinal, job[k].mask, loc, &shard, &local);
         if (s != NULL)                                            // on error the get reports it
         {
-            nr = pzpd_pf_ranges(loc, p->a->S, r, &over);
-            if (isBuf) { data = pzpd_pf_read(p, shard, s, r, nr); }  // NULL on error: the get reads again and reports it
+            nr = pzpd_pf_ranges(loc, p->a->S, r, &job[k].over);
+            if (job[k].isBuf) { job[k].data = pzpd_pf_read(p, shard, s, r, nr); }  // NULL on error: the get reads again and reports it
             else
             {
                 if (p->shard_mode[shard] == PZPD_PF_PAGECACHE)
                 {
                     // Start every range's reads at once (queue depth), then wait for them while pre-faulting
                     uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
-                    for (unsigned k = 0; k < nr; k++)
+                    for (unsigned q = 0; q < nr; q++)
                     {
-                        uintptr_t lo = (uintptr_t)(s->map + r[k].lo) & ~(page - 1);
-                        (void) madvise((void *) lo, (uintptr_t)(s->map + r[k].hi) - lo, MADV_WILLNEED);
+                        uintptr_t lo = (uintptr_t)(s->map + r[q].lo) & ~(page - 1);
+                        (void) madvise((void *) lo, (uintptr_t)(s->map + r[q].hi) - lo, MADV_WILLNEED);
                     }
                 }
-                for (unsigned k = 0; k < nr; k++) { pzpd_populate(s->map + r[k].lo, (size_t)(r[k].hi - r[k].lo)); }
+                for (unsigned q = 0; q < nr; q++) { pzpd_populate(s->map + r[q].lo, (size_t)(r[q].hi - r[q].lo)); }
             }
-            for (unsigned k = 0; k < nr; k++) { bytes += r[k].hi - r[k].lo; }
+            for (unsigned q = 0; q < nr; q++) { job[k].bytes += r[q].hi - r[q].lo; }
         }
-        double dt = pzpd_seconds_since(&t0);
-
-        pthread_mutex_lock(&p->lock);
-        if (slot != PZPD_PF_NONE) { p->bufs[slot].data = data; }
-        p->e[i].io = PZPD_PF_READY;
-        if (p->e[i].claim == PZPD_PF_DONE) { pzpd_pf_drop_slot(p, i); pthread_cond_signal(&p->work); }   // discarded meanwhile
-        p->inflight--;
-        p->st.prefetched++;
-        p->st.bytes_prefetched += bytes;
-        p->st.bytes_over_read  += over;
-        p->st.io_seconds       += dt;
-        pthread_cond_broadcast(&p->ready);
+        job[k].dt = pzpd_seconds_since(&t0);
     }
-    pthread_mutex_unlock(&p->lock);
+
+    int freed = 0;
+    pthread_mutex_lock(&ln->lock);
+    for (unsigned k = 0; k < nt; k++)
+    {
+        uint64_t e = job[k].i;
+        if (job[k].slot != PZPD_PF_NONE) { ln->bufs[job[k].slot].data = job[k].data; }
+        ln->e[e].io = PZPD_PF_READY;
+        if ( (ln->e[e].claim == PZPD_PF_DONE) && (pzpd_pf_drop_slot(p, ln, e) > 0) ) { freed |= 2; }   // discarded meanwhile
+        ln->inflight--;
+        ln->st.prefetched++;
+        ln->st.bytes_prefetched += job[k].bytes;
+        ln->st.bytes_over_read  += job[k].over;
+        ln->st.io_seconds       += job[k].dt;
+    }
+    pthread_cond_broadcast(&ln->ready);
+    pthread_mutex_unlock(&ln->lock);
+    if (freed) { pzpd_pf_wake(p, freed, 0); }
+    return nt;
+}
+
+/** @brief One pass of an I/O thread over its lanes (lane l is served by thread l mod T when there are T < lanes
+ *  threads, else by the threads t with t mod lanes = l): a batch from each. @return Entries prefetched. */
+static unsigned pzpd_pf_scan(struct pzpd_prefetcher *p, const struct pzpd_pf_worker *w, int *starved)
+{
+    unsigned T = p->nworkers, took = 0;
+    if (T >= PZPD_PF_LANES) { return pzpd_pf_lane_batch(p, &p->lane[w->id % PZPD_PF_LANES], starved); }
+    for (unsigned l = w->id; l < PZPD_PF_LANES; l += T) { took += pzpd_pf_lane_batch(p, &p->lane[l], starved); }
+    return took;
+}
+
+/** @brief I/O thread: prefetch batches from its lanes until none can start, then park. Before sleeping it announces
+ *  why (queued entries blocked by window / budget, or none) and looks once more, so a waker either sees the
+ *  announcement or the thread sees the waker's change: no wake-up is lost. */
+static void *pzpd_pf_thread(void *arg)
+{
+    struct pzpd_pf_worker *w = (struct pzpd_pf_worker *) arg;
+    struct pzpd_prefetcher *p = w->p;
+    while (!pzpd_atomic_geti(&p->stop))
+    {
+        int starved = 0;
+        if (pzpd_pf_scan(p, w, &starved) > 0) { continue; }
+        pzpd_atomic_seti(&w->wake, 0);
+        int took = 0;
+        for (;;)
+        {
+            int why = starved ? PZPD_PF_PARKED_STARVED : PZPD_PF_PARKED_EMPTY;
+            pzpd_atomic_seti(&w->parked, why);
+            starved = 0;
+            if ( (took = (pzpd_pf_scan(p, w, &starved) > 0)) ) { break; }
+            if ( (starved ? PZPD_PF_PARKED_STARVED : PZPD_PF_PARKED_EMPTY) == why ) { break; }   // announced the right reason
+        }
+        if (!took)
+        {
+            if (starved) { pzpd_atomic_add(&p->stalls, 1); }
+            pthread_mutex_lock(&w->m);
+            while ( !pzpd_atomic_geti(&w->wake) && !pzpd_atomic_geti(&p->stop) ) { pthread_cond_wait(&w->c, &w->m); }
+            pthread_mutex_unlock(&w->m);
+        }
+        pzpd_atomic_seti(&w->parked, PZPD_PF_AWAKE);
+    }
     return NULL;
 }
 
@@ -5350,33 +5607,36 @@ pzpd_prefetcher *pzpd_prefetcher_create(pzpd *a, const pzpd_prefetch_opts *o)
     if (d.io_threads > 256) { pzpd_set_error(PZPD_E_ARG, "at most 256 I/O threads"); return NULL; }
     if (d.window > (1u << 24)) { pzpd_set_error(PZPD_E_ARG, "window of %u records is too large", d.window); return NULL; }
 
-    struct pzpd_prefetcher *p = (struct pzpd_prefetcher *) calloc(1, sizeof(struct pzpd_prefetcher));
+    struct pzpd_prefetcher *p = (struct pzpd_prefetcher *) aligned_alloc(64, sizeof(struct pzpd_prefetcher));
     if (p == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
+    memset(p, 0, sizeof(*p));
     p->a      = a;
     p->mask   = (d.stream_mask != 0) ? d.stream_mask : 0xFFFFFFFFu;
     p->window = (d.window != 0) ? d.window : 256;
     p->budget = (d.budget_bytes != 0) ? d.budget_bytes : (512ull << 20);
     clock_gettime(CLOCK_MONOTONIC, &p->t0);
-    pthread_mutex_init(&p->lock, NULL);
-    pthread_cond_init(&p->work, NULL);
-    pthread_cond_init(&p->ready, NULL);
+    for (unsigned l = 0; l < PZPD_PF_LANES; l++) { pthread_mutex_init(&p->lane[l].lock, NULL); pthread_cond_init(&p->lane[l].ready, NULL); }
+    pthread_mutex_init(&p->ctl, NULL);
     unsigned threads = (d.io_threads != 0) ? d.io_threads : 4;
     unsigned shards = a->shard_total ? a->shard_total : 1;
     p->shard_mode = (uint8_t *) malloc(shards);
     p->dfd        = (int *) malloc(shards * sizeof(int));
     p->dfd_open   = (int *) malloc(shards * sizeof(int));
-    p->bufs       = (struct pzpd_pf_buf *) calloc(p->window, sizeof(struct pzpd_pf_buf));
-    p->free_bufs  = (uint32_t *) malloc(p->window * sizeof(uint32_t));
     p->threads    = (pthread_t *) calloc(threads, sizeof(pthread_t));
-    if ( (p->shard_mode == NULL) || (p->dfd == NULL) || (p->dfd_open == NULL) || (p->bufs == NULL) || (p->free_bufs == NULL) || (p->threads == NULL) )
+    p->w          = (struct pzpd_pf_worker *) aligned_alloc(64, threads * sizeof(struct pzpd_pf_worker));
+    if (p->w != NULL)
+    {
+        memset(p->w, 0, threads * sizeof(struct pzpd_pf_worker));
+        for (unsigned t = 0; t < threads; t++) { p->w[t].p = p; p->w[t].id = t; pthread_mutex_init(&p->w[t].m, NULL); pthread_cond_init(&p->w[t].c, NULL); }
+        p->nworkers = threads;
+    }
+    if ( (p->shard_mode == NULL) || (p->dfd == NULL) || (p->dfd_open == NULL) || (p->threads == NULL) || (p->w == NULL) )
     {
         if (p->dfd_open != NULL) { for (unsigned sh = 0; sh < shards; sh++) { p->dfd_open[sh] = -1; } }
         pzpd_prefetcher_destroy(p);
         pzpd_set_error(PZPD_E_NOMEM, "out of memory");
         return NULL;
     }
-    for (unsigned k = 0; k < p->window; k++) { p->free_bufs[k] = p->window - 1 - k; }
-    p->nfree = p->window;
 
     // Mode per shard; O_DIRECT descriptors for BUFFERS shards
     for (unsigned sh = 0; sh < shards; sh++) { p->dfd[sh] = -1; p->dfd_open[sh] = -1; }
@@ -5398,14 +5658,14 @@ pzpd_prefetcher *pzpd_prefetcher_create(pzpd *a, const pzpd_prefetch_opts *o)
                 p->dfd_open[sh] = open(si.path, O_RDONLY | O_DIRECT | O_CLOEXEC);
                 p->dfd[sh] = p->dfd_open[sh];
             }
-            if (p->dfd[sh] < 0) { p->st.direct_fallbacks++; }
+            if (p->dfd[sh] < 0) { p->fallbacks++; }
         }
     }
     pzpd_clear_error();
 
     for (unsigned t = 0; t < threads; t++)
     {
-        int err = pthread_create(&p->threads[t], NULL, pzpd_pf_thread, p);
+        int err = pthread_create(&p->threads[t], NULL, pzpd_pf_thread, &p->w[t]);
         if (err != 0) { pzpd_prefetcher_destroy(p); pzpd_set_error(PZPD_E_IO, "cannot start an I/O thread: %s", strerror(err)); return NULL; }
         p->nthreads++;
     }
@@ -5421,66 +5681,108 @@ int pzpd_prefetch_submit(pzpd_prefetcher *p, const uint64_t *ordinals, const uin
     {
         if (ordinals[k] >= total) { pzpd_set_error(PZPD_E_ARG, "ordinal %llu out of range (%llu records)", (unsigned long long) ordinals[k], (unsigned long long) total); return 0; }
     }
-    // BUFFERS sizes are worked out here, before the lock: locating a record may open a shard
+    // BUFFERS sizes are worked out here, before any lock: locating a record may open a shard. The claims are
+    // sorted by lane (stable: each lane keeps the submission order), so each lane is locked once
     uint64_t *need = NULL;
+    uint32_t *order = (n > 0) ? (uint32_t *) malloc(n * sizeof(uint32_t)) : NULL;
+    if ( (n > 0) && (order == NULL) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
     if (p->any_buffers && (n > 0))
     {
         need = (uint64_t *) malloc(n * sizeof(uint64_t));
-        if (need == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+        if (need == NULL) { free(order); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
         for (size_t k = 0; k < n; k++) { need[k] = pzpd_pf_need(p, ordinals[k], (masks != NULL) ? masks[k] : p->mask); }
         pzpd_clear_error();                                        // records that can't be located fail in their get
     }
-    pthread_mutex_lock(&p->lock);
+    uint64_t start[PZPD_PF_LANES + 1] = {0};
+    for (size_t k = 0; k < n; k++) { start[pzpd_pf_lane_of(ordinals[k]) + 1]++; }
+    for (unsigned l = 0; l < PZPD_PF_LANES; l++) { start[l + 1] += start[l]; }
+    uint64_t fill[PZPD_PF_LANES];
+    memcpy(fill, start, sizeof(fill));
+    for (size_t k = 0; k < n; k++) { order[fill[pzpd_pf_lane_of(ordinals[k])]++] = (uint32_t) k; }
+    if (n >= PZPD_PF_NONE) { free(order); free(need); pzpd_set_error(PZPD_E_ARG, "schedule longer than %u entries", PZPD_PF_NONE - 1); return 0; }
+
+    pthread_mutex_lock(&p->ctl);
+    // Room in every lane first, so a failed submit adds nothing
     int ok = 1;
-    if (p->n + n >= PZPD_PF_NONE) { pzpd_set_error(PZPD_E_ARG, "schedule longer than %u entries", PZPD_PF_NONE - 1); ok = 0; }
-    if (ok && (p->n + n > p->cap))
+    for (unsigned l = 0; ok && (l < PZPD_PF_LANES); l++)
     {
-        uint64_t nc = (p->cap == 0) ? 1024 : p->cap;
-        while (nc < p->n + n) { nc *= 2; }
-        struct pzpd_pf_entry *ne = (struct pzpd_pf_entry *) realloc(p->e, nc * sizeof(struct pzpd_pf_entry));
-        if (ne == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
-        else { p->e = ne; p->cap = nc; }
+        uint64_t cnt = start[l + 1] - start[l];
+        if (cnt == 0) { continue; }
+        struct pzpd_pf_lane *ln = &p->lane[l];
+        pthread_mutex_lock(&ln->lock);
+        if (ln->n + cnt >= PZPD_PF_NONE) { pzpd_set_error(PZPD_E_ARG, "schedule longer than %u entries", PZPD_PF_NONE - 1); ok = 0; }
+        if (ok && (ln->n + cnt > ln->cap))
+        {
+            uint64_t nc = (ln->cap == 0) ? 1024 : ln->cap;
+            while (nc < ln->n + cnt) { nc *= 2; }
+            struct pzpd_pf_entry *ne = (struct pzpd_pf_entry *) realloc(ln->e, nc * sizeof(struct pzpd_pf_entry));
+            if (ne == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+            else { ln->e = ne; ln->cap = nc; }
+        }
+        if (ok && !pzpd_pf_hash_reserve(ln, cnt)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        pthread_mutex_unlock(&ln->lock);
     }
-    if (ok && !pzpd_pf_hash_reserve(p, n)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
-    for (size_t k = 0; ok && (k < n); k++)
+    for (unsigned l = 0; ok && (l < PZPD_PF_LANES); l++)
     {
-        uint32_t i = (uint32_t) p->n++;
-        p->e[i].ordinal = ordinals[k];
-        p->e[i].mask    = (masks != NULL) ? masks[k] : p->mask;
-        p->e[i].need    = (need != NULL) ? need[k] : 0;
-        p->e[i].next    = PZPD_PF_NONE;
-        p->e[i].slot    = PZPD_PF_NONE;
-        p->e[i].io      = PZPD_PF_QUEUED;
-        p->e[i].claim   = PZPD_PF_FREE;
-        struct pzpd_pf_hslot *sl = pzpd_pf_slot_of(p->slots, p->hcap, ordinals[k]);
-        if (sl->head == PZPD_PF_NONE) { sl->ordinal = ordinals[k]; sl->head = i; sl->tail = i; p->hcount++; }
-        else { p->e[sl->tail].next = i; sl->tail = i; }
+        if (start[l + 1] == start[l]) { continue; }
+        struct pzpd_pf_lane *ln = &p->lane[l];
+        pthread_mutex_lock(&ln->lock);
+        for (uint64_t q = start[l]; q < start[l + 1]; q++)
+        {
+            size_t k = order[q];
+            uint32_t i = (uint32_t) ln->n++;
+            ln->e[i].ordinal = ordinals[k];
+            ln->e[i].seq     = p->seq_next + k;
+            ln->e[i].mask    = (masks != NULL) ? masks[k] : p->mask;
+            ln->e[i].need    = (need != NULL) ? need[k] : 0;
+            ln->e[i].next    = PZPD_PF_NONE;
+            ln->e[i].slot    = PZPD_PF_NONE;
+            ln->e[i].io      = PZPD_PF_QUEUED;
+            ln->e[i].claim   = PZPD_PF_FREE;
+            struct pzpd_pf_hslot *sl = pzpd_pf_slot_of(ln->slots, ln->hcap, ordinals[k]);
+            if (sl->head == PZPD_PF_NONE) { sl->ordinal = ordinals[k]; sl->head = i; sl->tail = i; ln->hcount++; }
+            else { ln->e[sl->tail].next = i; sl->tail = i; }
+        }
+        ln->st.submitted += start[l + 1] - start[l];
+        pthread_mutex_unlock(&ln->lock);
     }
-    if (ok) { p->st.submitted += n; pthread_cond_broadcast(&p->work); }
-    pthread_mutex_unlock(&p->lock);
+    if (ok) { p->seq_next += n; }
+    pthread_mutex_unlock(&p->ctl);
     free(need);
+    free(order);
+    if (ok && (n > 0)) { pzpd_pf_wake(p, 0, 1); }
     return ok;
 }
 
 void pzpd_prefetch_clear(pzpd_prefetcher *p)
 {
     if (p == NULL) { return; }
-    pthread_mutex_lock(&p->lock);
-    do
+    pthread_mutex_lock(&p->ctl);
+    for (unsigned l = 0; l < PZPD_PF_LANES; l++)
     {
-        p->cursor = p->n;                                          // I/O threads take nothing new
-        while (p->inflight > 0) { pthread_cond_wait(&p->ready, &p->lock); }
-    } while (p->cursor != p->n);                                   // a submit raced the clear: drain again
-    for (uint64_t i = 0; i < p->n; i++) { pzpd_pf_drop_slot(p, i); }   // prefetched, not yet got (tickets keep theirs)
-    p->n = 0;
-    p->cursor = 0;
-    p->outstanding = 0;
-    p->hcount = 0;
-    if (p->slots != NULL) { memset(p->slots, 0xFF, p->hcap * sizeof(struct pzpd_pf_hslot)); }
-    p->gen++;
-    pthread_cond_broadcast(&p->ready);                             // gets waiting on the old schedule
-    pthread_cond_broadcast(&p->work);
-    pthread_mutex_unlock(&p->lock);
+        struct pzpd_pf_lane *ln = &p->lane[l];
+        pthread_mutex_lock(&ln->lock);
+        ln->cursor = ln->n;                                        // I/O threads take nothing new from this lane
+        while (ln->inflight > 0) { pthread_cond_wait(&ln->ready, &ln->lock); }
+        uint64_t started = 0;
+        for (uint64_t i = 0; i < ln->n; i++)
+        {
+            if ( (ln->e[i].io != PZPD_PF_QUEUED) && (ln->e[i].claim != PZPD_PF_DONE) ) { started++; }   // their window places
+            pzpd_pf_drop_slot(p, ln, i);                           // prefetched, not yet got (tickets keep theirs)
+        }
+        pzpd_atomic_sub(&p->outstanding, started);
+        ln->n = 0;
+        ln->cursor = 0;
+        ln->hcount = 0;
+        if (ln->slots != NULL) { memset(ln->slots, 0xFF, ln->hcap * sizeof(struct pzpd_pf_hslot)); }
+        ln->gen++;
+        pthread_cond_broadcast(&ln->ready);                        // gets waiting on the old schedule
+        pthread_mutex_unlock(&ln->lock);
+    }
+    p->seq_next = 0;                                               // every lane is empty: the new schedule starts at 0
+    pzpd_atomic_set(&p->done, 0);
+    pthread_mutex_unlock(&p->ctl);
+    pzpd_pf_wake(p, 3, 1);
 }
 
 int pzpd_prefetch_get(pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask, pzpd_blob_ref *refs, pzpd_ticket *t)
@@ -5492,39 +5794,41 @@ int pzpd_prefetch_get(pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask, pzpd_
     memset(refs, 0, sizeof(pzpd_blob_ref) * a->S);
 
     uint32_t heldMask = 0;
-    pthread_mutex_lock(&p->lock);
-    uint64_t i = pzpd_pf_claim(p, ordinal);
-    if (i == UINT64_MAX) { p->st.unscheduled++; }
+    unsigned l = pzpd_pf_lane_of(ordinal);
+    struct pzpd_pf_lane *ln = &p->lane[l];
+    pthread_mutex_lock(&ln->lock);
+    uint64_t i = pzpd_pf_claim(ln, ordinal);
+    if (i == UINT64_MAX) { ln->st.unscheduled++; }
     else
     {
-        p->e[i].claim = PZPD_PF_CLAIMED;
-        if (p->e[i].io == PZPD_PF_READY) { p->st.hits++; }
-        else if (p->e[i].io == PZPD_PF_QUEUED) { p->st.sync_misses++; }
+        ln->e[i].claim = PZPD_PF_CLAIMED;
+        if (ln->e[i].io == PZPD_PF_READY) { ln->st.hits++; }
+        else if (ln->e[i].io == PZPD_PF_QUEUED) { ln->st.sync_misses++; }
         else
         {
-            p->st.waits++;
-            uint64_t gen = p->gen;
-            while ( (p->gen == gen) && (p->e[i].io == PZPD_PF_INFLIGHT) ) { pthread_cond_wait(&p->ready, &p->lock); }
-            if (p->gen != gen) { i = UINT64_MAX; }                // cleared meanwhile: nothing to release
+            ln->st.waits++;
+            uint64_t gen = ln->gen;
+            while ( (ln->gen == gen) && (ln->e[i].io == PZPD_PF_INFLIGHT) ) { pthread_cond_wait(&ln->ready, &ln->lock); }
+            if (ln->gen != gen) { i = UINT64_MAX; }                // cleared meanwhile: nothing to release
         }
         if (i != UINT64_MAX)
         {
-            t->pos = i;
-            t->gen = p->gen;
-            uint32_t k = p->e[i].slot;
+            t->pos = ((uint64_t) l << 32) | i;
+            t->gen = ln->gen;
+            uint32_t k = ln->e[i].slot;
             if (k != PZPD_PF_NONE)                                 // the buffer moves to the ticket (still counted in `used`)
             {
-                t->buf = p->bufs[k].data;
-                t->bytes = p->bufs[k].bytes;
-                heldMask = p->bufs[k].mask;
-                p->bufs[k].data = NULL;
-                p->bufs[k].bytes = 0;
-                p->free_bufs[p->nfree++] = k;
-                p->e[i].slot = PZPD_PF_NONE;
+                t->buf = ln->bufs[k].data;
+                t->bytes = ln->bufs[k].bytes;
+                heldMask = ln->bufs[k].mask;
+                ln->bufs[k].data = NULL;
+                ln->bufs[k].bytes = 0;
+                ln->free_bufs[ln->nfree++] = k;
+                ln->e[i].slot = PZPD_PF_NONE;
             }
         }
     }
-    pthread_mutex_unlock(&p->lock);
+    pthread_mutex_unlock(&ln->lock);
 
     struct pzpd_pf_loc loc[PZPD_MAX_STREAMS];
     unsigned shard = 0;
@@ -5552,15 +5856,14 @@ int pzpd_prefetch_get(pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask, pzpd_
             unsigned nr = pzpd_pf_ranges(loc, a->S, r, &over);
             uint64_t bytes = pzpd_pf_buffer_bytes(r, nr);
             unsigned char *buf = pzpd_pf_read(p, shard, s, r, nr);
-            pthread_mutex_lock(&p->lock);
+            int freed = (t->bytes > 0) ? 2 : 0;
             free(t->buf);
-            p->used -= t->bytes;
+            pzpd_atomic_sub(&p->used, t->bytes);
             t->buf = buf;
             t->bytes = (buf != NULL) ? bytes : 0;
-            p->used += t->bytes;
-            if (p->used > p->st.buffer_bytes_peak) { p->st.buffer_bytes_peak = p->used; }
-            pthread_cond_signal(&p->work);
-            pthread_mutex_unlock(&p->lock);
+            pzpd_atomic_add(&p->used, t->bytes);
+            pzpd_atomic_max(&p->used_peak, pzpd_atomic_get(&p->used));
+            if (freed) { pzpd_pf_wake(p, freed, 0); }
             if (buf == NULL) { s = NULL; }
             else { pzpd_pf_buffer_refs(loc, a->S, mask, r, nr, buf, refs); }
         }
@@ -5590,13 +5893,13 @@ int pzpd_prefetch_get(pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask, pzpd_
     }
     if (s == NULL)
     {
-        int code = (pzpd_errorCode != PZPD_OK) ? pzpd_errorCode : PZPD_E_FORMAT;
-        char msg[512];
-        snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
+        if (pzpd_errorCode == PZPD_OK) { pzpd_errorCode = PZPD_E_FORMAT; }
+        struct pzpd_saved_error e;
+        pzpd_error_save(&e);
         memset(refs, 0, sizeof(pzpd_blob_ref) * a->S);
         pzpd_prefetch_release(p, t);
-        pzpd_set_error(code, "%s", msg);
-        return code;
+        pzpd_error_restore(&e);
+        return e.code;
     }
     return present;
 }
@@ -5604,31 +5907,42 @@ int pzpd_prefetch_get(pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask, pzpd_
 void pzpd_prefetch_release(pzpd_prefetcher *p, pzpd_ticket *t)
 {
     if ( (p == NULL) || (t == NULL) ) { return; }
-    pthread_mutex_lock(&p->lock);
-    if (t->buf != NULL) { free(t->buf); }
-    if (t->bytes > 0) { p->used -= t->bytes; pthread_cond_signal(&p->work); }
-    if ( (t->pos != UINT64_MAX) && (t->gen == p->gen) && (t->pos < p->n) && (p->e[t->pos].claim == PZPD_PF_CLAIMED) )
+    int freed = 0;
+    free(t->buf);
+    if (t->bytes > 0) { pzpd_atomic_sub(&p->used, t->bytes); freed |= 2; }
+    unsigned l = (unsigned)(t->pos >> 32);
+    uint64_t i = t->pos & 0xFFFFFFFFull;
+    if ( (t->pos != UINT64_MAX) && (l < PZPD_PF_LANES) )
     {
-        pzpd_pf_done(p, t->pos);
-        p->st.released++;
+        struct pzpd_pf_lane *ln = &p->lane[l];
+        pthread_mutex_lock(&ln->lock);
+        if ( (t->gen == ln->gen) && (i < ln->n) && (ln->e[i].claim == PZPD_PF_CLAIMED) )
+        {
+            freed |= pzpd_pf_done(p, ln, i);
+            ln->st.released++;
+        }
+        pthread_mutex_unlock(&ln->lock);
     }
     t->pos = UINT64_MAX;
     t->buf = NULL;
     t->bytes = 0;
-    pthread_mutex_unlock(&p->lock);
+    if (freed) { pzpd_pf_wake(p, freed, 0); }
 }
 
 void pzpd_prefetch_discard(pzpd_prefetcher *p, uint64_t ordinal)
 {
     if (p == NULL) { return; }
-    pthread_mutex_lock(&p->lock);
-    uint64_t i = pzpd_pf_claim(p, ordinal);
+    struct pzpd_pf_lane *ln = &p->lane[pzpd_pf_lane_of(ordinal)];
+    int freed = 0;
+    pthread_mutex_lock(&ln->lock);
+    uint64_t i = pzpd_pf_claim(ln, ordinal);
     if (i != UINT64_MAX)
     {
-        pzpd_pf_done(p, i);
-        p->st.discarded++;
+        freed = pzpd_pf_done(p, ln, i);
+        ln->st.discarded++;
     }
-    pthread_mutex_unlock(&p->lock);
+    pthread_mutex_unlock(&ln->lock);
+    if (freed) { pzpd_pf_wake(p, freed, 0); }
 }
 
 void pzpd_prefetch_stats_get(const pzpd_prefetcher *p, pzpd_prefetch_stats *s)
@@ -5636,35 +5950,57 @@ void pzpd_prefetch_stats_get(const pzpd_prefetcher *p, pzpd_prefetch_stats *s)
     if (s == NULL) { return; }
     memset(s, 0, sizeof(*s));
     if (p == NULL) { return; }
-    struct pzpd_prefetcher *q = (struct pzpd_prefetcher *) p;     // the lock is not part of the logical state
-    pthread_mutex_lock(&q->lock);
+    struct pzpd_prefetcher *q = (struct pzpd_prefetcher *) p;     // the locks are not part of the logical state
     *s = q->st;
-    s->buffer_bytes = q->used;
-    pthread_mutex_unlock(&q->lock);
-    s->elapsed_seconds = pzpd_seconds_since(&p->t0);
+    for (unsigned l = 0; l < PZPD_PF_LANES; l++)
+    {
+        struct pzpd_pf_lane *ln = &q->lane[l];
+        pthread_mutex_lock(&ln->lock);
+        s->submitted        += ln->st.submitted;
+        s->prefetched       += ln->st.prefetched;
+        s->hits             += ln->st.hits;
+        s->waits            += ln->st.waits;
+        s->sync_misses      += ln->st.sync_misses;
+        s->unscheduled      += ln->st.unscheduled;
+        s->discarded        += ln->st.discarded;
+        s->released         += ln->st.released;
+        s->bytes_prefetched += ln->st.bytes_prefetched;
+        s->bytes_over_read  += ln->st.bytes_over_read;
+        s->io_seconds       += ln->st.io_seconds;
+        pthread_mutex_unlock(&ln->lock);
+    }
+    s->producer_stalls   = pzpd_atomic_get(&q->stalls);
+    s->direct_fallbacks  = (unsigned) pzpd_atomic_get(&q->fallbacks);
+    s->buffer_bytes      = pzpd_atomic_get(&q->used);
+    s->buffer_bytes_peak = pzpd_atomic_get(&q->used_peak);
+    s->elapsed_seconds   = pzpd_seconds_since(&p->t0);
 }
 
 void pzpd_prefetcher_destroy(pzpd_prefetcher *p)
 {
     if (p == NULL) { return; }
-    pthread_mutex_lock(&p->lock);
-    p->stop = 1;
-    pthread_cond_broadcast(&p->work);
-    pthread_mutex_unlock(&p->lock);
+    pzpd_atomic_seti(&p->stop, 1);
+    for (unsigned t = 0; t < p->nthreads; t++) { pzpd_pf_wake_worker(&p->w[t]); }
     for (unsigned t = 0; t < p->nthreads; t++) { pthread_join(p->threads[t], NULL); }
-    for (unsigned k = 0; (p->bufs != NULL) && (k < p->window); k++) { free(p->bufs[k].data); }
+    for (unsigned t = 0; (p->w != NULL) && (t < p->nworkers); t++) { pthread_mutex_destroy(&p->w[t].m); pthread_cond_destroy(&p->w[t].c); }
+    for (unsigned l = 0; l < PZPD_PF_LANES; l++)
+    {
+        struct pzpd_pf_lane *ln = &p->lane[l];
+        for (unsigned k = 0; k < ln->nbufs; k++) { free(ln->bufs[k].data); }
+        free(ln->bufs);
+        free(ln->free_bufs);
+        free(ln->slots);
+        free(ln->e);
+        pthread_cond_destroy(&ln->ready);
+        pthread_mutex_destroy(&ln->lock);
+    }
     for (unsigned sh = 0; (p->dfd_open != NULL) && (sh < (p->a->shard_total ? p->a->shard_total : 1)); sh++) { if (p->dfd_open[sh] >= 0) { close(p->dfd_open[sh]); } }
-    pthread_cond_destroy(&p->work);
-    pthread_cond_destroy(&p->ready);
-    pthread_mutex_destroy(&p->lock);
+    pthread_mutex_destroy(&p->ctl);
+    free(p->w);
     free(p->threads);
     free(p->shard_mode);
     free(p->dfd);
     free(p->dfd_open);
-    free(p->bufs);
-    free(p->free_bufs);
-    free(p->slots);
-    free(p->e);
     free(p);
 }
 
@@ -5697,7 +6033,7 @@ int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_pa
     for (unsigned i = 0; ok && (i < n); i++)
     {
         ar[i] = arch_open(shard_paths[i], 0);
-        if (ar[i] == NULL) { char msg[512]; snprintf(msg, sizeof(msg), "%s", pzpd_errorText); pzpd_set_error(pzpd_errorCode, "%s: %s", shard_paths[i], msg); ok = 0; break; }
+        if (ar[i] == NULL) { pzpd_error_wrap(PZPD_OK, "%s", shard_paths[i]); ok = 0; break; }
         if (!ar[i]->standalone) { pzpd_set_error(PZPD_E_ARG, "%s is not a shard", shard_paths[i]); ok = 0; break; }
         const struct pzpd_disk_superblock *sb = &ar[i]->shards[0].sb;
         if (sb->shard_index >= n) { pzpd_set_error(PZPD_E_ARG, "%s is shard %u, but only %u shards were given", shard_paths[i], sb->shard_index, n); ok = 0; break; }
@@ -5764,9 +6100,8 @@ int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_pa
         memcpy(streams, a0->streams, sizeof(streams));
         ok = pzpd_write_manifest(manifest_path, a0->shards[0].sb.archive_uuid, total, a0->S, streams, n, &shardTab, &names, &ghash, a0->T, tabs);
     }
-    char msg[512];
-    int code = pzpd_errorCode;
-    snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
     pzpd_buf_free(&shardTab);
     pzpd_buf_free(&names);
     pzpd_buf_free(&ghash);
@@ -5774,7 +6109,7 @@ int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_pa
     free(ar);
     free(byIndex);
     free(mdir);
-    if (!ok) { pzpd_set_error(code, "%s", msg); }
+    if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
 
@@ -6131,9 +6466,7 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
         grows.len = gheap.len = 0;
         if (pzpd_csv_parse(&nsc, rows[i].csv, rows[i].csv_len, &grows, &gheap) < 0)
         {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
-            pzpd_set_error(PZPD_E_ARG, "rows of \"%.*s\" (entry %zu): %s", (int)(rows[i].key_len > 200 ? 200 : rows[i].key_len), rows[i].key, i + 1, msg);
+            pzpd_error_wrap(PZPD_E_ARG, "rows of \"%.*s\" (entry %zu)", (int)(rows[i].key_len > 200 ? 200 : rows[i].key_len), rows[i].key, i + 1);
             ok = 0;
         }
     }
@@ -6151,7 +6484,7 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
         struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
-        if (sa == NULL) { char msg[512]; snprintf(msg, sizeof(msg), "%s", pzpd_errorText); pzpd_set_error(pzpd_errorCode, "%s: %s", m->shards[k].path, msg); ok = 0; break; }
+        if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         struct pzpd_rshard *s = &sa->shards[0];
         int so = -1;
         for (unsigned t = 0; t < sa->T; t++) { if (!strcmp(sa->tables[t].name, table)) { so = (int) t; } }
@@ -6185,9 +6518,7 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
                     int64_t got = pzpd_csv_parse(&nsc, r->csv, r->csv_len, &trows, &theap);
                     if (got < 0)
                     {
-                        char msg[512];
-                        snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
-                        pzpd_set_error(PZPD_E_ARG, "rows of \"%.*s\": %s", (int)(kl > 200 ? 200 : kl), key, msg);
+                        pzpd_error_wrap(PZPD_E_ARG, "rows of \"%.*s\"", (int)(kl > 200 ? 200 : kl), key);
                         ok = 0;
                     }
                     else { nrows += (uint64_t) got; }
@@ -6255,15 +6586,14 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
     uint64_t um = 0;
     for (size_t i = 0; i < n; i++) { um += (matched != NULL) && !matched[i]; }
     if (unmatched != NULL) { *unmatched = um; }
-    char msg[512];
-    int code = pzpd_errorCode;
-    snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
     pzpd_buf_free(&secbuf); pzpd_buf_free(&trows); pzpd_buf_free(&theap); pzpd_buf_free(&tindex);
     pzpd_buf_free(&grows); pzpd_buf_free(&gheap);
     free(keys);
     free(matched);
     arch_close(m);
-    if (!ok) { pzpd_set_error(code, "%s", msg); }
+    if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
 
@@ -6277,7 +6607,7 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed)
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
         struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
-        if (sa == NULL) { char msg[512]; snprintf(msg, sizeof(msg), "%s", pzpd_errorText); pzpd_set_error(pzpd_errorCode, "%s: %s", m->shards[k].path, msg); ok = 0; break; }
+        if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         struct pzpd_rshard *s = &sa->shards[0];
         if (!pzpd_finish_flip(s)) { arch_close(sa); ok = 0; break; }
         struct pzpd_disk_superblock sb = s->sb;
@@ -6336,11 +6666,10 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed)
         arch_close(sa);
     }
     if (ok && changed) { ok = pzpd_edit_finish(manifest, m); }
-    char msg[512];
-    int code = pzpd_errorCode;
-    snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
     arch_close(m);
-    if (!ok) { pzpd_set_error(code, "%s", msg); }
+    if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
 
@@ -6455,11 +6784,10 @@ static int pzpd_rewrite_shard(struct pzpd_archive *sa, unsigned newS, char names
     else if (final != NULL) { unlink(final); }
     if (w->fd >= 0) { close(w->fd); w->fd = -1; }
     if (w->tmp_path != NULL) { unlink(w->tmp_path); }
-    char msg[512];
-    int code = pzpd_errorCode;
-    snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
     pzpd_writer_free(w);
-    if (!ok) { pzpd_set_error(code, "%s", msg); }
+    if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
 
@@ -6478,7 +6806,7 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
     if ( ok && (op == PZPD_EDIT_ADD) && (m->S >= PZPD_MAX_STREAMS) ) { pzpd_set_error(PZPD_E_ARG, "more than %d streams", PZPD_MAX_STREAMS); ok = 0; }
     if ( ok && (op == PZPD_EDIT_DROP) && (m->S == 1) ) { pzpd_set_error(PZPD_E_ARG, "can't drop the only stream"); ok = 0; }
     for (unsigned t = 0; ok && (op == PZPD_EDIT_ADD) && (t < m->T); t++) { if (!strcmp(m->tables[t].name, stream)) { pzpd_set_error(PZPD_E_ARG, "\"%s\" is a table name", stream); ok = 0; } }
-    if ( ok && (op == PZPD_EDIT_ADD) && ((strlen(stream) == 0) || (strlen(stream) > PZPD_MAX_STREAM_NAME)) ) { pzpd_set_error(PZPD_E_ARG, "bad stream name"); ok = 0; }
+    if ( ok && (op == PZPD_EDIT_ADD) && !pzpd_check_stream_name(stream) ) { ok = 0; }
 
     // New stream list and the old stream of each new one
     char names[PZPD_MAX_STREAMS][24];
@@ -6530,28 +6858,37 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
         struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
-        if (sa == NULL) { char msg[512]; snprintf(msg, sizeof(msg), "%s", pzpd_errorText); pzpd_set_error(pzpd_errorCode, "%s: %s", m->shards[k].path, msg); ok = 0; break; }
+        if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         int has = 0;
         for (unsigned u = 0; u < sa->S; u++) { if (!strcmp(sa->streams[u], stream)) { has = 1; } }
         int done = (op == PZPD_EDIT_ADD) ? has : (op == PZPD_EDIT_DROP) ? !has : (sa->shards[0].sb.generation > m->mshards[k].generation);
         todo[k] = !done;
-        // Names: a new name must not exist anywhere in the archive, except as the blob it replaces
-        for (size_t i = 0; ok && (i < n); i++)
+        // Names: a new name must not exist anywhere in the archive, except as the blob it replaces. The shard's
+        // hash and the input names are both sorted by hash: one merge pass, not a lookup per name per shard
+        struct pzpd_rshard *s0 = pzpd_shard(sa, 0);
+        size_t e = 0;
+        for (uint64_t h = 0; ok && (s0 != NULL) && (n > 0) && (h < s0->sb.hash_count); h++)
         {
-            int so = -1;
-            int64_t o = arch_find(sa, blobs[i].name, blobs[i].name_len, &so, PZPD_KIND_NAME);
-            if (o < 0) { continue; }
-            size_t kl = 0;
-            const char *key = arch_record_key(sa, (uint64_t) o, &kl);
-            // The name may already be the edited stream's blob of the same record (replace, or a resumed add)
-            int same = (key != NULL) && (kl == blobs[i].key_len) && !memcmp(key, blobs[i].key, kl) && (so >= 0) && !strcmp(sa->streams[so], stream);
-            if (!same) { pzpd_set_error(PZPD_E_DUPLICATE, "name \"%.*s\" already exists in the archive", (int)(blobs[i].name_len > 200 ? 200 : blobs[i].name_len), blobs[i].name); ok = 0; }
+            const struct pzpd_disk_hash *he = &s0->hash[h];
+            if (he->kind != PZPD_KIND_NAME) { continue; }
+            while ( (e < n) && (nk[e].hash < he->hash) ) { e++; }
+            for (size_t j = e; ok && (j < n) && (nk[j].hash == he->hash); j++)
+            {
+                const pzpd_edit_blob *bl = &blobs[nk[j].idx];
+                if (!pzpd_match(sa, he->local_ordinal, he->stream, PZPD_KIND_NAME, bl->name, bl->name_len)) { continue; }
+                size_t kl = 0;
+                const char *key = arch_record_key(sa, he->local_ordinal, &kl);
+                // The name may already be the edited stream's blob of the same record (replace, or a resumed add)
+                int same = (key != NULL) && (kl == bl->key_len) && !memcmp(key, bl->key, kl) && (he->stream < sa->S) && !strcmp(sa->streams[he->stream], stream);
+                if (!same) { pzpd_set_error(PZPD_E_DUPLICATE, "name \"%.*s\" already exists in the archive", (int)(bl->name_len > 200 ? 200 : bl->name_len), bl->name); ok = 0; }
+            }
         }
-        if (ok) { pzpd_clear_error(); }                         // lookups that found nothing are not errors
+        if (ok) { pzpd_clear_error(); }                         // failed matches are not errors
 
-        if (ok && !done)
+        if (ok && (!done || (n > 0)))
         {
-            // Every record must keep a blob, and every input key must be a record somewhere (counted below)
+            // Every input key must be a record somewhere (counted below), and in a shard still to edit every
+            // record must keep a blob (an edited shard's stream list no longer matches `map`)
             struct pzpd_rshard *s = &sa->shards[0];
             for (uint64_t i = 0; ok && (i < s->sb.record_count); i++)
             {
@@ -6567,6 +6904,7 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
                         if ( (b->key_len == kl) && !memcmp(b->key, key, kl) ) { gets = 1; matched[keys[e].idx] = 1; }
                     }
                 }
+                if (done) { continue; }
                 unsigned left = gets;
                 for (unsigned u = 0; u < newS; u++)
                 {
@@ -6576,12 +6914,6 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
                 }
                 if (left == 0) { pzpd_set_error(PZPD_E_ARG, "record \"%.*s\" would be left without blobs", (int)(kl > 200 ? 200 : kl), key ? key : ""); ok = 0; }
             }
-        }
-        else if (ok && (n > 0))
-        {
-            // Already edited: still count its keys as matched
-            for (size_t i = 0; i < n; i++) { if (!matched[i] && (arch_find(sa, blobs[i].key, blobs[i].key_len, NULL, PZPD_KIND_KEY) >= 0)) { matched[i] = 1; } }
-            pzpd_clear_error();
         }
         arch_close(sa);
     }
@@ -6600,15 +6932,14 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
     uint64_t um = 0;
     for (size_t i = 0; i < n; i++) { um += (matched != NULL) && !matched[i]; }
     if (unmatched != NULL) { *unmatched = um; }
-    char msg[512];
-    int code = pzpd_errorCode;
-    snprintf(msg, sizeof(msg), "%s", pzpd_errorText);
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
     free(keys);
     free(nk);
     free(matched);
     free(todo);
     arch_close(m);
-    if (!ok) { pzpd_set_error(code, "%s", msg); }
+    if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
 

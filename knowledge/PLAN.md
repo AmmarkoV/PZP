@@ -8,7 +8,7 @@ order, and how each step is verified*.
 Status: **phase 1 implemented in `src/pzpdir/` and verified, except the early performance gate:
 it passes at 1 thread but not at 8 (§6, phase 1 results). After the DataLoader profile (§6b),
 the decision (2026-09-21) is to **continue with the plan in its current order and leave the RGB
-size as is** (no pre-scaled RGB stream). All phases (1, 1b, 1c, 6, 7, 2, 3, 5, 4) are implemented (2026-09-22). Still unmeasured: huge pages (needs a `huge=` tmpfs mount, i.e. sudo). Next: the DataLoader integration (own repo / branch).**
+size as is** (no pre-scaled RGB stream). All phases (1, 1b, 1c, 6, 7, 2, 3, 5, 4) are implemented (2026-09-22). Still unmeasured: huge pages (needs a `huge=` tmpfs mount, i.e. sudo). DataLoader integration (§7, D22–D26): converter (Part A) done; DataLoader steps 0–5 done and verified on branch `pzpdir`; step 6 (removing the `.db` path) waits until the datasets are converted on the training PC.**
 Spec v0.4 + revisions 1–11. A review pass after the phases (§6, "Review fixes") fixed three bugs and the benchmarks.
 **First client:** the Y-MAP-Net DataLoader (`RGBToPoseDetect2D/datasets/DataLoader`). Its needs set the order of work (§5). Last updated 2026-09-22.
 
@@ -61,6 +61,11 @@ calls, and there is no real read-ahead.
 | D19 | Collection API extras | Adopted: `pzpd_collection_write()` / `pzpd_collection_refresh()` (C API for `pzpdir collect`), and `pzpd_find_all()` returns the **total** match count even beyond the buffer. **Not** adopted: `pzpd_member_has_stream()` |
 | D20 | Coding and documentation style | Follow **PThreadWorkerPool**, **SharedMemoryVideoBuffers** and this **PZP** repo: Doxygen-ready comments on every public item, a `doc/doxyfile` + `scripts/refreshDoxygen.sh` that builds HTML + PDF, and PZP's `pzp_`-style snake_case prefix (`pzpd_`). Details in §4. PThreadWorkerPool is a **style** reference only: its batch kick/wait model doesn't fit the prefetcher's continuous queue, which gets its own small pthread queue in the same style |
 | D21 | First client | The **DataLoader** (`RGBToPoseDetect2D/datasets/DataLoader`) is the first consumer. It **vendors** `pzpdir.h` + `pzpdir.c` + `xxhash.h` into its single-command gcc build, like its `codecs/pzp.h`. The work order follows its critical path (§5): format → collections → tables → prefetcher, then its integration branch can start, while recovery, edits, video and Python bindings follow |
+| D22 | DataLoader transition (2026-09-22) | **Full switch to `.pzpd`.** No mixed `.db` / archive sources in one DB instance. The `.db` + directory read path is kept only until the §7 equivalence gates pass (it is what they compare against), then removed |
+| D23 | Descriptors in DataLoader archives | **L2-normalised at conversion** (as the DataLoader's `L2_NORMALIZE_DESCRIPTORS` does at load today), so `descriptor_<model>` stays zero-copy. A global `descriptor_info` table (`model:str, dim:u32, l2norm:u8`) records it; the loader aborts if it disagrees with its build. **Only DINOv3 is converted** (`descriptor_dinov3`); `.dinov2` files are ignored. A source without a `.dinov3` file (e.g. BG-20k, AM-2k, 300w, generated) gets no descriptor table, and its samples get an empty vector, as today |
+| D24 | Captions | **Every sample has a caption**; the converter aborts on a sample without one. **Only the current caption file** (DeepSeek-VL2) is converted, one `descriptions` row per sample; `descriptionsOLD.json` and other older caption sets are not. Caption files are not always `<images>/descriptions.json` (e.g. `coco/train2017DeepSeekVL2descriptions.json`, `300w/indoorDeepSeekVL2descriptions.json`), so the converter takes them from `--descriptions`, else `<images>/descriptions.json`, else `<db dir>/<images dir name>DeepSeekVL2descriptions.json` (e.g. `train2017`, `indoor`). **The format carries only the caption strings**: no token IDs, no vocabulary. Turning strings into tokens is the DataLoader's own dynamic step and does not depend on PZPD. The `.db` token IDs are not migrated |
+| D25 | Geolocation and SuperPoint | **Not in DataLoader archives.** The converter writes no `geo` stream and no SuperPoint data; with archive sources the DataLoader rejects `addGeolocation` / `addSuperpoint`. Stream order: `rgb, all, depth, seg` |
+| D26 | Converter scope | This work delivers the **conversion code** (`datasets/convertToPZPD.py` + `checkPZPD.py` in RGBToPoseDetect2D). Running it over the real datasets happens on the PC that holds them; here the code is tested on COCO val2017 and small fixtures |
 
 ## 3. Architecture at a glance
 
@@ -415,13 +420,29 @@ A review of `pzpdir.c` after all phases. Every fix has a unit test that fails (o
   | 1 | 12 528 | 14 151 | **28 859** (0.00 worker faults / sample) |
   | 8 | 43 406 | 43 813 | 43 755 (≈ 28 GB/s: memory bandwidth) |
 
-- **Still open:** the `edit-stream` dry run looks every new name up in every shard (≈ 256 M lookups for ImageNet; one pass over the manifest's global hash would do); huge pages unmeasured (needs the sudo mount); `libpzpdir.so` stays `-march=native` (the Python package is built on the machine that uses it)
+- **Still open:** huge pages unmeasured (needs the sudo mount); `libpzpdir.so` stays `-march=native` (the Python package is built on the machine that uses it)
+
+### Review fixes (2026-09-23)
+A second review of `pzpdir.c`. Each bug fix has a unit test that fails (or trips ASan) on the code before it.
+- **Recovery (section scan) after a table edit:** an edited shard that was not compacted since keeps the replaced table section next to its replacement; with both superblocks lost, the scan took both (4 tables instead of 3: refused as stale through the manifest, the old rows possible standalone). It now takes each table's newest section, in the slot of its first one (spec revision 7 text updated). A table dropped since the last `compact` still comes back (no generation is stored in sections)
+- **`pzpd_writer_finish()` failing** on the last shard (e.g. disk full while writing its index) left the shard's descriptor open and its `.tmp` file behind; it now cleans up as `pzpd_writer_abort()` does
+- **NPY probe:** a header cut right after the dtype's opening quote (≥ 4 KiB headers) read past the probe's stack copy
+- **`edit-stream` dry run:** the name-clash check merges each shard's sorted hash with the sorted input names instead of one lookup per name per shard. 200 k new files into 785 shards: `add-stream` 55.8 s → 34.9 s, output byte-identical
+- `scripts/check_client_build.sh` links the DataLoader's `PZPDLoader.c` when present (its branch `pzpdir` calls it, so the link check failed)
+- **v0.10, prefetcher lanes:** a contention benchmark (1 M × 256 B records on `/dev/shm`, MAP, consumers only get + release) showed the single prefetcher mutex was the ceiling: unscheduled gets fell from 4.1 M/s at T=1 to 3.0 M/s at T=16, and 16 I/O threads were 2.5–4× slower than 4 (their wake-ups and lock traffic; removing the `madvise` changed nothing). Now:
+  - the schedule is split by ordinal into `PZPD_PF_LANES` (8) lanes, each with its own lock, entries, ordinal hash and buffer slots (grown on demand); window and budget are atomic counters shared by the lanes, reserved by compare-and-swap before an entry starts. Every entry keeps its position in the whole schedule and may start only when it is < claims done + window, so no lane runs ahead of the global order. Tickets carry the lane in their private `pos`
+  - I/O threads serve lanes round-robin (4 threads → 2 lanes each), start up to 8 MAP / PAGECACHE entries per lock hold (BUFFERS: one) and park on their own condition variable; they announce why before a last look, and releases wake only threads parked with queued entries, once per batch of window room
+  - synthetic, T=16: unscheduled gets 3.0 → 18.5 M/s, prefetched gets 1.0 → 4.9 M/s (4 I/O threads), 0.77 → 3.8 M/s (16 I/O threads)
+  - `dataloader-replay` (COCO val2017, NVMe, cold, 11.8 ms work): T=6 unchanged (479 / 478 samples/s, ~5 000 hits); T=30 PAGECACHE 1 171 → 1 118–1 136, BUFFERS 1 157–1 179 → 1 235–1 244; 17–22 sync misses of 5 000 (0 before). Neutral for the DataLoader, whose rates are far below either ceiling
+  - checks: unit tests (ASan / UBSan, TSan twice), CLI, Python, fuzzing, `client_smoke` on COCO in MAP / PAGECACHE / BUFFERS at 16 threads (ASan, TSan)
+- Also: stream names with `"`, `\` or control characters are refused (the shard metadata JSON lists them unescaped); `pzpd_writer_blob_file()` refuses a file over 4 GiB before reading it; a resumed `edit-stream` matches the done shards' keys in the same record pass (no lookup per file per shard); error context through `pzpd_error_wrap()` / `pzpd_error_save()`; the CLI's list parsing and `unpack` reuse `split_fields()` / `write_file()`
 
 ### DataLoader integration (first client; separate repo and branch)
 Covered by §5 (constraints) and §7 (plan). It starts after phase 6 (§5 order of work) and lives in
-`RGBToPoseDetect2D/datasets/DataLoader`: vendored `pzpdir/` sources, a ~100-line `DBLoader.c`
-adapter + C tokenizer, prefetcher hooks in `PrepareBatch.c` / `DataLoader.c`, new
-`db_set_*` setters and `DataLoader.py` wrappers.
+`RGBToPoseDetect2D/datasets/DataLoader`: vendored `pzpdir/` sources, a ~100-line `PZPDLoader.c`
+adapter, prefetcher hooks in `PrepareBatch.c` / `DataLoader.c`, new
+`db_set_*` setters and `DataLoader.py` wrappers, plus the converter `datasets/convertToPZPD.py`.
+Full switch, no mixed sources (D22–D26).
 
 ## 6b. Rethink input: DataLoader profile (2026-09-21)
 
@@ -519,39 +540,112 @@ That confirms the 30-thread slowdown is memory / cache contention, not compute.
 
 ## 7. DataLoader integration plan (from `PrepareBatch.c`, `DataLoader.c`, `DBLoader.c`, `DataLoader.py`)
 
+Revised 2026-09-22 with decisions D22–D26: a full switch to archives, descriptors normalised
+at conversion, a caption for every sample, no geolocation, no SuperPoint. The deliverable is
+code. The real datasets are converted on the PC that holds them (D26).
+
 **Today:**
-- `readPoseDatabase` parses each source's `DB1` `.db` at startup and matches descriptors by position + basename. Sources are concatenated via `startOffset`.
+- `readPoseDatabase` parses each source's `DB1` `.db` at startup and matches descriptors (`<db>.dinov2` / `.dinov3`) by position + basename. Sources are concatenated via `startOffset`.
 - The epoch order `db->indices` is shuffled once per epoch. Batches are consecutive slices of it, and Python double-buffers batch k+1 while the GPU trains on k.
 - Worker *t* takes positions `start+t, start+t+T, …`.
+- Files are resolved by `resolvePathToRequestedFiles` (cached per sample as `DL_FileKind`):
+  - rgb: `<images>/<file>`
+  - depth: `<stem>.pzp`, then `.png`, then `_depth.png`
+  - seg: `<stem>.pzp`, then `.png`
+  - combined: `<stem>.pzp` / `.png`
 - Per sample the reads are, in order, each gated by config flags and presence:
   1. combined (before the erase decision)
   2. rgb
   3. depth, if not multiplexed
   4. seg, if not multiplexed
-  5. geo, last
 - `signalPrefetchFile` only warms the same file microseconds before reading it, then drops it with `DONTNEED` and closes it.
+- The codecs already decode from memory (`readImageFromMemory`, `ReadJPEGMem`, `ReadPNGMem`, `ReadPZPMemory`), and `cachedReadImage()` is already the point where a different byte source plugs in.
 
-**Plan:**
-1. **The archive is the DB.** Each dataset source is one archive instead of `.db` + descriptor files + 5 dirs. All sources are opened as one collection in `sourceID` order, so `pzpd_member_of(ordinal) == sourceID`. Sample *i* = ordinal *i* (through a filter map when `ignoreNoSkeletonSamples` is set). `PoseDatabase` is filled from tables:
+### Part A: the converter (`RGBToPoseDetect2D/datasets/convertToPZPD.py`) (implemented 2026-09-22)
+
+Files (in RGBToPoseDetect2D, uncommitted): `datasets/convertToPZPD.py` (converter), `datasets/checkPZPD.py` (checker), `datasets/testConvertToPZPD.py` (fixture tests). It uses the phase 5 `pzp.pzpdir.Writer` directly (needs `pip install -e` of this repo on the converting PC). A text record list is not used, because at COCO-train scale the tables list was 1.1 GB and took 394 s (§8).
+
+1. **Input:** `--source DB IMAGES DEPTH SEG ALL [--descriptions FILE]`, or `--config configuration.json [--set TrainingDataset|ValidationDataset …] [--all] [--root DIR]` (paths relative to the config's directory, 5- or 6-column entries, enabled values as `DataLoader.py`). A source listed in both sets is converted once; two different sources with the same `.db` name are refused. Output: **one directory per dataset**, named after its `.db`: `OUT/cocoTrain/cocoTrain.pzpd` + shards `cocoTrain.NNNNN.pzpd` (`--shard-size`, default 4 GB). After each source it prints the config entry to use (`["enabled", ".../cocoTrain.pzpd"]`).
+   - **Changed from the plan:** no collection files. The DataLoader opens its enabled sources itself (`pzpd_open_many`, step 1), and a collection file would go stale whenever an entry is enabled or disabled.
+2. **Records:**
+   - One record per `.db` sample, in `.db` order, with key = `imagePath`; blob names are the paths as given in the config (e.g. `datasets/coco/cache/coco/val2017/000000000139.jpg`).
+   - Streams `rgb, all, depth, seg` (D25), found with exactly `resolvePathToRequestedFiles`'s rules (stem = `imagePath` minus its last 4 characters; `all` `.pzp`/`.png`, depth `.pzp`/`.png`/`_depth.png`, seg `.pzp`/`.png`). `checkPZPD.py` uses the same function.
+   - **Changed from the plan:** a sample with an `all` file gets **no depth / seg blobs**, because the DataLoader never reads them then (`multiplexed`). So every record holds `rgb + all` or `rgb + depth? + seg?`, and every DataLoader read is one contiguous span. COCO val2017: 3.24 GB instead of 4.8 GB.
+   - A missing rgb aborts. Missing depth / seg / all is allowed, as today.
+3. **Tables:**
+   - `joints` (global), `image`, `persons` from the `.db` (a keypoint count ≠ 3J aborts)
+   - `descriptions` (`source:str, text:str`, one row per sample, source `deepseekvl2`) from the caption file (D24); a sample without a caption, or a caption file with two different texts for one file name, aborts
+   - `descriptor_dinov3` (`v:f32[D]`, bulk) when `<db>.dinov3` exists, plus the global `descriptor_info` (`dinov3, D, 1`); `.dinov2` is ignored. The file is read as `load_descriptor_bin` reads it (12-byte header, or legacy 8-byte with D inferred), matched as `readPoseDatabase` matches it (by position, basename checked; fewer descriptors than samples or a wrong name aborts, extra ones are ignored), and normalised as `l2_normalize_descriptor_dataset` does (double sum in order, float inverse, all-zero vectors stay zero)
+4. **Safety:**
+   - `--dry-run` prints per-stream presence counts, the caption / descriptor files and the estimated size, and writes nothing.
+   - Free space in the output directory is checked before writing.
+   - After writing, the archive is opened with verification and every blob is verified; any failure (incl. Ctrl-C) removes the source's archive files.
+   - On a rerun, a source whose archive exists with the same record count and keys is skipped; one that doesn't match is refused unless `--force` (which rewrites it).
+5. **`datasets/checkPZPD.py`** (same source options) checks per source: streams and record keys; every blob is exactly the file the rules find (bytes and name, and no blob where no file is expected); the `.db` rebuilt from `joints` / `image` / `persons` equals the `.db` text line for line (token lines excluded); one caption row per record equal to the caption file; `descriptor_dinov3` bit-identical to the normalised `.dinov3` with unit norms, `descriptor_info` consistent, and no descriptor tables without a `.dinov3`.
+
+**Verify** (✅ passed, 2026-09-22):
+- ✅ `--dry-run --all` over every `configuration.json` source present here (11 sources, 257 k samples, 24 s): all parse, every sample has a caption (`train2017` and 300w from the `<db dir>/<images dir>DeepSeekVL2descriptions.json` files), every `.dinov3` matches; `generatedTrain.db` is refused because its images are not on this machine (`00000-1022848691.png` missing), which is the intended abort
+- ✅ COCO val2017 from the config: written + verified in 10 s (3.24 GB, 5 000 records, rgb + all); `checkPZPD.py`: 10 000 blobs byte-identical, 21 041 `.db` lines identical, 5 000 captions, descriptors bit-identical, 0 failures (7 s)
+- ✅ openposeFactory (depth + seg, DINOv3, 64 MB shards → 3 shards) and 300w indoor (PNG rgb, no descriptors) with `--source`: `checkPZPD.py` 0 failures
+- ✅ Descriptors of COCO val2017 in the archive are **bit-identical** to the DataLoader's own `load_descriptor_bin` + `l2_normalize_descriptor_dataset` built with its release flags (5 000 × 768, 0 floats differ)
+- ✅ `testConvertToPZPD.py`: 31 checks on synthetic sources, 0 failures. They cover three layouts (captions in `<images>/`, next to the `.db` with an extra `prompt` key, legacy 8-byte descriptors), several shards, depth `.png` over `_depth.png`, depth dropped when `all` exists, an all-zero descriptor kept, captions with quotes / newlines / non-ASCII, `.dinov2` ignored; the checker reporting a changed rgb file, a changed caption and an extra source file; every abort above; a failed write leaving no files; config parsing, rerun skip, `--dry-run`, `--force`, and name clashes
+
+### Part B: the DataLoader moves to archives (branch `pzpdir` in RGBToPoseDetect2D, from `refactor`)
+
+**Status (2026-09-22): steps 0–5 implemented and verified on branch `pzpdir` (uncommitted); step 6 not started** (it removes the `.db` path, which is still the only way to train until the datasets are converted on the training PC, and which the equivalence gates compare against). Files: `pzpdir/` (vendored `pzpdir.h`, `pzpdir.c`, `third_party/xxhash.h`, as committed in cffd865), new `PZPDLoader.{h,c}`, edits in `DataLoader.{h,c}`, `DBLoader.h`, `PrepareBatch.c`, `DataLoader.py`, `Makefile`, `makeLibrary.sh`. Deviations from the steps below: one pzpdir handle per DatabaseList, opened in `db_create` (sample counts come from a quick `pzpd_open` in `db_set_source_entry`); the schedule is (re)submitted in `db_start_threads` when the order changed (shuffle counter) or the batch isn't the expected next one; every sample does one `get` with its mask before its first decode (also erased ones, whose combined file is read before the erase decision) and releases after its last; without a prefetcher (`prefetchMode="off"`) the workers decode straight from mmap views. Archive samples fill the existing per-sample kind cache (`depthKind` / `segKind` / `combinedKind`) at load, so the worker's presence logic is unchanged; `PZPC` (PZP containers, e.g. `all_val2017PZPF`) is accepted as PZP. Captions: `PoseEntry.description` points into the archive, `db_get_sample_description()` / `DataLoader.get_sample_description()`; tokens stay empty for archive samples (tokenization is out of scope, step 3).
+
+**Verify** (✅ passed; harness `eqtest.c` in the session scratchpad links `libDataLoader.so` and compares a `.db` + directories DataLoader with an archive one, augmentations off):
+- ✅ COCO val2017: `PoseDatabase` identical field by field except tokens (5 000 samples, 11 004 persons, 17 joints, descriptors 768-D bit-identical incl. `db_get_sample_descriptors` per position, 5 000 captions); **165 batches byte-identical** (rgb, 8-bit and 16-bit heatmaps): one sequential epoch through `db_update` + 40 shuffled batches through `StartUpdate` / `CollectUpdate`; prefetcher 6 598 / 6 600 hits
+- ✅ openposeFactory (depth + seg, DINOv3) + 300w indoor (PNG rgb, no descriptors) as two sources: identical, in prefetch modes off / auto / map / pagecache / buffers and at 3 and 6 threads
+- ✅ AddressSanitizer build (both sources sets, buffers / auto / off; COCO with mmap views only): clean, identical. Found on the way: `db_allocate_source_list` doesn't zero the struct, so the new `archive` pointer is now initialised explicitly
+- ✅ Python (`DataLoader.py`, double buffer, short entry `["enabled", "cocoVal.pzpd"]` + a disabled one): 12 batches identical to the `.db` DataLoader, descriptor length 768, captions returned, bad `prefetchMode` refused
+- ✅ Throughput, COCO val2017, augmentations on, samples/s (single runs): warm T=6 633 dirs / 638 archive, T=30 398 / 402; cold T=6 574 / 629, T=30 393 / 415. No loss, as expected from §6b (I/O is hidden)
+- ⚠ `ignoreNoSkeletonSamples=1` with more than one source aborts **in the existing `.db` path** too: `readPoseDatabase` returns the next free slot including `startOffset` as the source's count and `totalNumberOfSamples` is never reduced, so empty slots get read. The archive loader reproduces the same accounting on purpose (its `PoseDatabase` equals the `.db` one in this mode as well). Training doesn't use the option (`ignoreNoSkeletonTrainingSamples` is false and not passed). Not fixed: pre-existing
+- ⚠ Pre-existing, found with the viewer: the `.db` files store person boxes as **corners** (`x1,y1,x2,y2`; all 11 004 COCO val2017 boxes satisfy x1 ≤ x2 ≤ width, y1 ≤ y2 ≤ height, and `genericDatasetParser.get_training_bbox` writes min / max), while `HeatmapGenerator.c:843` reads them as `x, y, w, h` (`x2 = bboxX + bboxW`), so the person-blob centres / sizes are off. Also `genericDatasetParser.py:431` takes y from the x slot (openpose / 300w / generated boxes are wrong either way). The `HeatmapGenerator.c` side is **fixed on branch `pzpdir`** (fields renamed `bboxX2` / `bboxY2`, read as corners; blobs verified on COCO val2017); the generic parser is still open. Written up with the per-.db check and the fix as **A9 in `RGBToPoseDetect2D/knowledge/DATALOADER.md`**
+- Archive browser: `src/pzpdir/scripts/pzpdir_viewer.py` (wxPython) lists records (filter by key), shows every blob and table row of a record, previews any stream (PZP / PZPC natively, others via PIL; 16-bit and 1-channel stretched; persons drawn from the `persons` table), an archive summary (members, shards, storage, AUTO mode, streams, schemas), and saves a blob to a file
+
+Every step keeps training usable. The `.db` path stays until step 5's gates pass (D22).
+
+0. **Vendor the library.** Copy `pzpdir.h`, `pzpdir.c` and `third_party/xxhash.h` into `DataLoader/pzpdir/`, built with `PZPDIR_WITH_PZP=0`. Add `pzpdir.c` to `Makefile` and `makeLibrary.sh`, and print `pzpdirVersion` at startup.
+   → **gate:** the release, ASan and `-pg` builds all compile with zero warnings, and training output is unchanged.
+1. **Sources.** `db_set_source_entry` recognises a `.pzpd` DB path by its magic bytes. Config entries become `['enabled', 'datasets/pzpd/coco_train2017.pzpd']`, and `DataLoader.py` accepts the short form. A set is either all `.pzpd` or all `.db`, and a mix is rejected. All sources open as one handle (`pzpd_open_many`, aliases = source names), and member index = `sourceID`.
+2. **`PZPDLoader.c` (new, ~100 lines).** It fills `PoseDatabase` from the tables:
    - `imagePath` = key; `width` / `height` from `image`
-   - `sk[]` from `persons` (a copy of ~112 B per person); `joint[]` from `joints`; `keypointsForEachSample` = joint count
-   - tokens **computed at load**: tokenize `descriptions.text` (chosen `source`) across all members with `buildVocabulary.py`'s rules, build the sorted vocabulary (or map through a pinned `index_to_word.json`), then apply the blacklist and synonym map
-   - `descriptor` = a pointer into the mmapped `descriptor_<model>` table, with D from the schema; `db_get_batch_descriptors` uses it. **Caveat (found 2026-09-22, §8 results):** with `L2_NORMALIZE_DESCRIPTORS` the DataLoader L2-normalises every vector at load (`load_descriptor_bin`), and the archive stores them raw (bit-identical to the `.dinov3` file), so a zero-copy pointer is only right if the table holds normalised vectors. Decision needed: store normalised vectors (pack time or `replace-table`; keeps zero-copy) or normalise a private copy at load (≈ 0.43 s for COCO train, still 2.4× faster than today)
-   - SuperPoint stays as today
+   - `sk[]` from `persons`; `joint[]` from `joints`
+   - `descriptor` = a pointer into `descriptor_<model>` (zero-copy), with D from the schema
 
-   The `DB1` parser and descriptor matching collapse into a ~100-line adapter plus a small C tokenizer.
-2. **Presence and validation at load:** per-sample presence (`hasAll`, `hasDepth`, `hasSeg`, `hasGeo`) comes from the blob table. This replaces `resolveSampleFiles`, `DL_FileKind` and every `fileExists`. Index metadata checks what `PrepareBatch.c` aborts on mid-epoch today (depth 1 ch / 16 bit, geo 1 ch / 16 bit, rgb 3 ch), plus rgb present, `persons.kp` length = 3 × joints, and identical joint sets across members. The decoder comes from the FourCC, not the extension.
-3. **Mask per sample:** `rgb | (hasAll && (DO_DEPTH || DO_SEG) ? all : depth? | seg?) | (addGeo && hasGeo ? geo)`. With the stream order `rgb, all, geo, depth, seg`, every real mask is one contiguous span, i.e. one `pread`.
-4. **Schedule:** after every shuffle (already drained): `clear`, then `submit` the whole epoch (`indices[pos]` through the filter map → ordinal, plus masks). A non-sequential `StartUpdate` re-anchors the schedule. The validation DB gets its own prefetcher on the same handle.
-5. **Worker:** `get(ord, mask)` → decode from `refs[]` in the existing order → `release` after geo. Erased samples are `release`d or `discard`ed.
-6. **Sizing and mode:** look-ahead ≥ batch k+2; 1 GiB ≈ 1 600 records at ~650 KB. AUTO per member: COCO on a RAM disk → MAP; COCO on NVMe → PAGECACHE; ImageNet on NVMe → BUFFERS + O_DIRECT. I/O threads are separate from decode workers. A tmpfs-staged archive replaces `USE_RAM_CACHE` / `preloadAllFiles`: it's shared across processes, and a `cp` is the only load step.
-7. **Removed per sample:** 3–5 × (probe + open + fadvise + read + DONTNEED + close). In their place: one pread done ahead of time by an I/O thread.
+   `ignoreNoSkeletonSamples` goes through a filter map (sample → ordinal). Presence (`hasAll`, `hasDepth`, `hasSeg`) and dims / channels / bits are checked from the index at load; today these checks abort mid-epoch. It aborts when:
+   - `descriptor_info.l2norm` ≠ `L2_NORMALIZE_DESCRIPTORS`
+   - D > 4096
+   - the sources' joint sets differ
+   - `addGeolocation` or `addSuperpoint` is set
 
-**Integration gates:**
-- the C tokenizer equals `buildVocabulary.py`
-- with a pinned vocabulary, the archive-built `PoseDatabase` equals the `.db`-built one field by field (incl. `ignoreNoSkeletonSamples`)
-- descriptors work for D = 768 and D = 1024 without recompiling
-- identical batches for a fixed seed from directories vs archive
+   Caption strings are handed on as strings (pointers into the `descriptions` table); the archive has nothing to do with tokens.
+   → **gate:** it equals the `.db`-built `PoseDatabase` field by field, incl. `ignoreNoSkeletonSamples`, except for tokens: the `.db` carries pre-computed token IDs, the archive the caption strings, which are compared with the caption files instead.
+3. **Tokenization: out of scope for this work.** The archive and the adapter deliver caption strings only. Resolving them to tokens (vocabulary, tokenizer, train / validation consistency) belongs to the DataLoader and is handled separately. No legacy tokenizer mode is needed (existing checkpoints are not kept compatible).
+4. **Read path (no prefetcher yet).** For archive sources, `PrepareBatch.c` skips `resolveSampleFiles` / `signalPrefetchFile`: it takes the stream's bytes (`pzpd_view` / `read_record`) and decodes with `readImageFromMemory()`, with the codec chosen from the blob's FourCC. Per-sample mask: `rgb | (hasAll && (DO_DEPTH || DO_SEG) ? all : depth? | seg?)`; since the converter stores no depth / seg next to an `all` file, every mask is one contiguous span.
+   → **gate:** identical batches for a fixed seed, `.db` + directories vs archive, incl. the erase / background paths (image and heatmap outputs; token outputs are excluded, tokenization is out of scope, step 3).
+5. **Prefetcher.**
+   - Created after the DB load.
+   - After every shuffle (already drained): `clear`, then `submit` the whole epoch (`indices[pos]` → filter map → ordinal, plus masks). A non-sequential `StartUpdate` re-anchors the schedule.
+   - Workers call `get` → decode → `release`; erased samples are `discard`ed.
+   - Destroyed in `db_destroy` before `pzpd_close()`.
+   - The validation DB gets its own prefetcher on its own handle.
+   - New setters: `db_set_prefetch_mode`, `db_set_prefetch_budget`, `db_set_prefetch_io_threads`. Look-ahead ≥ batch k+2; AUTO picks the mode per member (§5, D15).
+
+   → **gate:** batches still identical, ASan clean, and throughput with the §6b harness at 6 and 30 threads, cold and warm, is no worse than directories.
+6. **Remove the legacy path.** Delete:
+   - the DB1 parser and descriptor matching
+   - `resolveSampleFiles` / `resolvePathToRequestedFiles` / `DL_FileKind`
+   - `signalPrefetchFile`
+   - `USE_RAM_CACHE` / `cache.c` / `preloadAllFiles` (confirmed 2026-09-22; replaced by staging the archive to `/dev/shm`)
+   - geolocation and SuperPoint loading
+   - the directory columns of `db_set_source_entry`
+
+   Then update `checkDatasets.py`, the `configuration.json` dataset entries, the other training scripts' dataset handling if any differs, and the README (convert, check, stage).
+   → **gate:** training and validation run from archives only, and the gates above still pass against a saved reference (batch hashes and `PoseDatabase` dump from before the removal).
+
+**Removed per sample:** 2–4 × (probe + open + fadvise + read + DONTNEED + close). In their place: one pread done ahead of time by an I/O thread.
 
 ## 8. Test and benchmark dataset
 
@@ -577,7 +671,7 @@ ext4, 16 cores, 31 GB RAM). There are 5 000 samples, and every stem is present i
 - **Workloads:** read sets rgb+all+geo and rgb+depth+seg+geo, T ∈ {1, 4, 8, 16}; `dataloader-replay` = the exact worker trace (strided, per-sample masks, k+1 double buffer); `--decode` for end-to-end.
 - **Reported:** samples/s, MB/s, p50/p99 latency, syscalls per sample, over-read bytes, open time, pack time, size vs `du`. Also startup time to build `PoseDatabase` from `cocoTrain.db` (49 MB text parse) vs from archive tables.
 - **Correctness:** `diff -r` after `unpack`, SHA-256 of every blob, `find()` resolves all 25 000 original names, metadata matches full decodes, and the table gates of phase 1c.
-- **Regression fixture:** the record list produced by `scripts/pzpdir_list_from_db.py` for val2017 is `src/pzpdir/tests/fixtures/coco_val2017.tsv` (5 streams, 25 000 lines, 3.9 MB; this machine's absolute source paths). The tables list (91 MB, with descriptors) stays out of git.
+- **Regression fixture:** the record list produced by `scripts/pzpdir_list_from_db.py` for val2017 (5 streams, 25 000 lines, 3.9 MB, with this machine's absolute source paths) is kept **outside git**, next to the archives: `/media/ammar/games/PZPD_Test/val2017.tsv` (decided 2026-09-22: data lists don't belong in the tree). The tables list (91 MB, with descriptors) is there too, as `val2017_tables.tsv`.
 - **Hard disk (2026-09-22, the WD1001FALS above, cold, rgb+all+geo, 1 000 of the 5 000 shuffled samples):** copying the 9.8 GB of test archives onto it: 68 MB/s including `sync`; sequential read (`verify --blobs`, 4.8 GB): 73 MB/s ≈ 112 samples/s. Shuffled reads are seek-bound, about 60 % of that, and more consumer threads don't help (one spindle):
 
   | T | pzpd-record | pf-pagecache | pf-buffers |
@@ -587,7 +681,7 @@ ext4, 16 cores, 31 GB RAM). There are 5 000 samples, and every stem is present i
 
   More I/O threads let the drive's queue (mq-deadline, NCQ depth 32) reorder requests: BUFFERS at T=1 gives 60 / 69 / 72 / 72 /s with 1 / 4 / 16 / 32 I/O threads. At ~70 samples/s the DataLoader (≈ 480 /s at 6 workers, §6) would be I/O-bound 7×, so a hard disk only suits a first epoch whose member fits in RAM (AUTO → PAGECACHE, later epochs come from the page cache) or cold storage that is staged to NVMe / RAM with one sequential copy (4.8 GB ≈ 66 s here). Reading each window of the schedule in file order could at most approach the sequential ~112 /s.
 - **Results of the remaining §8 items (2026-09-22; NVMe = a copy of `coco_val2017` in `/tmp` on `/`, sources on `/home`, same Samsung 980 PRO):**
-  - **`find(name)`:** all 25 000 original names resolve to the right record and stream, all 5 000 keys to the right record (fixture list, Python, 8 µs per lookup + check)
+  - **`find(name)`:** all 25 000 original names resolve to the right record and stream, all 5 000 keys to the right record (`val2017.tsv`, Python, 8 µs per lookup + check)
   - **Pack time:** 14.3 s to the NVMe (336 MB/s, sources evicted first), 80.9 s to the hard disk (59 MB/s), incl. `sync`. **Size:** archive 4.816 GB = sources' data + 0.33 % (4.800 GB, `du -sb`); on disk 0.74 % *smaller* than the 25 000 files (4.852 GB, `du`: 4 KiB block rounding)
   - **Staging to `/dev/shm`** (cold, 4.8 GB): `cp -rL` of the 5 source dirs (25 004 files) 9.2 s (520 MB/s); `cp` of the 3 archive files 4.4 s (1.09 GB/s), **2.1× faster**; from the hard disk 65.5 s (74 MB/s)
   - **`PoseDatabase` startup, COCO train** (118 287 samples, 262 465 persons, 17 joints, DINOv3 768-D; the DataLoader's own `createPoseDatabase` / `load_descriptor_bin` / `readPoseDatabase` from a scratch `libDataLoader.so` vs the same structs filled from archive tables the way the planned adapter would; GloVe embeddings excluded, same for both at ~0.05 s):
@@ -643,7 +737,7 @@ ext4, 16 cores, 31 GB RAM). There are 5 000 samples, and every stem is present i
 | Format detection wrong or ambiguous (CSV vs TEXT, truncated headers) | Magic bytes first, extension only as fallback, `RAW ` when unsure; `blob_ex` override; metadata checked against full decodes |
 | Index growth from metadata (32 B per blob) | ≈ 0.2 % at ImageNet scale; mmapped and paged lazily |
 | Token IDs go stale when the dataset mix changes | Descriptions stored as text; vocabulary built at load, or pinned for existing checkpoints |
-| C tokenizer diverges from `buildVocabulary.py` (Unicode `\w`, `lower()`) | Exact-parity integration gate on all description sets. Found in phase 1c: COCO val2017's `vocabulary.json` was built before `buildVocabulary.py` dropped non-ASCII words (7 samples differ). The DataLoader's tokenizer must match the tokenizer version of the checkpoint's vocabulary (legacy = keep non-ASCII) |
+| C tokenizer diverges from `buildVocabulary.py` (Unicode `\w`, `lower()`) | Exact-parity integration gate on all description sets. Found in phase 1c: COCO val2017's `vocabulary.json` was built before `buildVocabulary.py` dropped non-ASCII words (7 samples differ). The DataLoader's tokenizer must match the tokenizer version of the checkpoint's vocabulary (legacy = keep non-ASCII) **Out of scope since 2026-09-22 (§7 step 3): tokenization is handled on the DataLoader side, and no legacy mode is needed** |
 | Descriptor length differs per model (DINOv2 / v3 / others) | D from each table's schema; one table per model; members must agree per table name |
 | Losing annotations is costly (keypoints can't be regenerated) | Non-bulk rows copied into every record header (`salvage`); global tables in every shard + manifest |
 | Schema mismatch across collection members (e.g. different joint sets) | Checked at open; per-member `pzpd_global_rows`; the loader checks joint sets match |

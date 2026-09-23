@@ -234,6 +234,29 @@ static char *read_all(const char *path, size_t *len)
     return buf;
 }
 
+/** @brief Split a record-list line at tabs (in place) and unescape the fields.
+ *  @return Field count, or -1 on a bad escape. */
+static int split_fields(char *line, size_t ll, char **f, size_t *fl, int max)
+{
+    int nf = 0;
+    char *q = line;
+    while (nf < max)
+    {
+        char *tab = memchr(q, '\t', (size_t)(line + ll - q));
+        f[nf] = q;
+        fl[nf] = (tab != NULL) ? (size_t)(tab - q) : (size_t)(line + ll - q);
+        if (tab != NULL) { *tab = 0; }
+        size_t u = unescape(f[nf], fl[nf]);
+        if (u == (size_t) -1) { return -1; }
+        fl[nf] = u;
+        f[nf][u] = 0;
+        nf++;
+        if (tab == NULL) { break; }
+        q = tab + 1;
+    }
+    return nf;
+}
+
 /** @brief Parsed record list plus the stream names it uses. */
 struct record_list
 {
@@ -372,29 +395,12 @@ static int parse_list(const char *path, const char *fixed_streams, struct record
         // key <TAB> stream <TAB> path [<TAB> name]
         char *f[5] = {0};
         size_t fl[5] = {0};
-        int nf = 0;
-        char *q = line;
-        while (nf < 5)
-        {
-            char *tab = memchr(q, '\t', (size_t)(line + ll - q));
-            f[nf] = q;
-            fl[nf] = (tab != NULL) ? (size_t)(tab - q) : (size_t)(line + ll - q);
-            nf++;
-            if (tab == NULL) { break; }
-            *tab = 0;
-            q = tab + 1;
-        }
+        int nf = split_fields(line, ll, f, fl, 5);
+        if (nf < 0) { fprintf(stderr, CLI_RED "%s:%zu: bad escape (use \\t \\n \\\\ \\# \\@)" CLI_NORMAL "\n", path, lineNo); return 0; }
         if ( (nf < 3) || (nf > 4) )
         {
             fprintf(stderr, CLI_RED "%s:%zu: expected key<TAB>stream<TAB>path[<TAB>name], found %d field(s)" CLI_NORMAL "\n", path, lineNo, nf);
             return 0;
-        }
-        for (int i = 0; i < nf; i++)
-        {
-            size_t u = unescape(f[i], fl[i]);
-            if (u == (size_t) -1) { fprintf(stderr, CLI_RED "%s:%zu: bad escape in field %d (use \\t \\n \\\\ \\# \\@)" CLI_NORMAL "\n", path, lineNo, i + 1); return 0; }
-            fl[i] = u;
-            f[i][u] = 0;
         }
         if ( (fl[0] == 0) || (fl[2] == 0) ) { fprintf(stderr, CLI_RED "%s:%zu: empty key or path" CLI_NORMAL "\n", path, lineNo); return 0; }
         int tix = table_index(L, f[1]);
@@ -995,6 +1001,23 @@ static int make_parents(char *path)
     return 1;
 }
 
+/** @brief Write a whole file (creating its parent directories). @return 1 on success. */
+static int write_file(char *path, const void *data, size_t size)
+{
+    int fd = -1;
+    if ( !make_parents(path) || ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) ) { return 0; }
+    const unsigned char *p = (const unsigned char *) data;
+    size_t left = size;
+    while (left > 0)
+    {
+        ssize_t w = write(fd, p, left);
+        if (w < 0) { if (errno == EINTR) { continue; } break; }
+        p += w;
+        left -= (size_t) w;
+    }
+    return (close(fd) == 0) && (left == 0);
+}
+
 /** @brief `pzpdir unpack`. @return exit code. */
 static int cmd_unpack(const char *const *paths, int np, const char *dir)
 {
@@ -1039,23 +1062,12 @@ static int cmd_unpack(const char *const *paths, int np, const char *dir)
             full[o + bi.name_len] = 0;
             size_t size = 0;
             const void *data = pzpd_view(a, i, s, &size);
-            int fd = -1;
-            if ( (data == NULL) || !make_parents(full) || ((fd = open(full, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) )
+            if ( (data == NULL) || !write_file(full, data, size) )
             {
                 fprintf(stderr, CLI_RED "cannot write %s: %s" CLI_NORMAL "\n", full, (data == NULL) ? pzpd_last_error() : strerror(errno));
                 failed++;
                 continue;
             }
-            const unsigned char *p = (const unsigned char *) data;
-            size_t left = size;
-            while (left > 0)
-            {
-                ssize_t w = write(fd, p, left);
-                if (w < 0) { if (errno == EINTR) { continue; } break; }
-                p += w;
-                left -= (size_t) w;
-            }
-            if ( (close(fd) != 0) || (left != 0) ) { fprintf(stderr, CLI_RED "write failed: %s" CLI_NORMAL "\n", full); failed++; continue; }
             files++;
         }
         if ( ((i + 1) % 1000 == 0) || (i + 1 == n) ) { fprintf(stderr, "\runpacked %llu / %llu records", (unsigned long long)(i + 1), (unsigned long long) n); }
@@ -1065,23 +1077,6 @@ static int cmd_unpack(const char *const *paths, int np, const char *dir)
     pzpd_close(a);
     fprintf(stderr, "%llu files written, %llu unsafe names refused, %llu failures\n", (unsigned long long) files, (unsigned long long) refused, (unsigned long long) failed);
     return ( (refused == 0) && (failed == 0) ) ? 0 : 1;
-}
-
-/** @brief Write a whole file (creating its parent directories). @return 1 on success. */
-static int write_file(char *path, const void *data, size_t size)
-{
-    int fd = -1;
-    if ( !make_parents(path) || ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) ) { return 0; }
-    const unsigned char *p = (const unsigned char *) data;
-    size_t left = size;
-    while (left > 0)
-    {
-        ssize_t w = write(fd, p, left);
-        if (w < 0) { if (errno == EINTR) { continue; } break; }
-        p += w;
-        left -= (size_t) w;
-    }
-    return (close(fd) == 0) && (left == 0);
 }
 
 /** @brief State of `pzpdir salvage` across records. */
@@ -1266,29 +1261,6 @@ static int cmd_rebuild_manifest(const char *const *shards, int n, const char *ou
     if (!pzpd_manifest_rebuild(out, shards, (unsigned) n)) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
     fprintf(stderr, CLI_GREEN "wrote %s from %d shard(s)" CLI_NORMAL "\n", out, n);
     return 0;
-}
-
-/** @brief Split a record-list line at tabs (in place) and unescape the fields.
- *  @return Field count, or -1 on a bad escape. */
-static int split_fields(char *line, size_t ll, char **f, size_t *fl, int max)
-{
-    int nf = 0;
-    char *q = line;
-    while (nf < max)
-    {
-        char *tab = memchr(q, '\t', (size_t)(line + ll - q));
-        f[nf] = q;
-        fl[nf] = (tab != NULL) ? (size_t)(tab - q) : (size_t)(line + ll - q);
-        if (tab != NULL) { *tab = 0; }
-        size_t u = unescape(f[nf], fl[nf]);
-        if (u == (size_t) -1) { return -1; }
-        fl[nf] = u;
-        f[nf][u] = 0;
-        nf++;
-        if (tab == NULL) { break; }
-        q = tab + 1;
-    }
-    return nf;
 }
 
 /** @brief `pzpdir add-table | replace-table | drop-table <archive> TABLE [LIST|-]`. @return exit code. */

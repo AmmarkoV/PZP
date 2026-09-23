@@ -173,6 +173,7 @@ loop       = PZP.get_loop_count("anim.pzp")   # 0 = forever
 delays     = PZP.get_delays("anim.pzp")        # list of int (ms per frame)
 
 frame0     = PZP.read_frame("anim.pzp", 0)    # numpy (H, W, C) uint8
+frames     = PZP.read_frames("anim.pzp")       # all frames, one pass (use this to load an animation)
 audio, fmt = PZP.get_audio("anim.pzp")         # (bytes, format_str) or (None, None)
 meta       = PZP.get_metadata("anim.pzp")      # bytes or None
 ```

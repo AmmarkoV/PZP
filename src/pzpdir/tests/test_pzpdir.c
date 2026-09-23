@@ -24,6 +24,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <zstd.h>
 #include <lz4.h>
@@ -56,6 +59,17 @@ static long resident_file_pages(void)
     if (fscanf(f, "%ld %ld %ld", &size, &resident, &shared) != 3) { shared = -1; }
     fclose(f);
     return shared;
+}
+
+/** @brief Open file descriptors of this process (entries of /proc/self/fd), -1 if unknown. */
+static long count_fds(void)
+{
+    DIR *d = opendir("/proc/self/fd");
+    if (d == NULL) { return -1; }
+    long n = 0;
+    while (readdir(d) != NULL) { n++; }
+    closedir(d);
+    return n - 3;                                                // ".", ".." and the directory stream itself
 }
 
 /** @brief Deterministic pseudo-random bytes for (record, stream). */
@@ -268,6 +282,31 @@ static void test_rejections(void)
     CHECK(pzpd_writer_create(path, &ob) == NULL, "stream name > 23 bytes rejected");
     pzpd_writer_opts oa = { streams, 2, 0, 100 };
     CHECK(pzpd_writer_create(path, &oa) == NULL, "alignment 100 rejected");
+    // Stream names go unescaped into the shard metadata JSON that recovery reads back
+    const char *quoted[3][1] = { { "a\"b" }, { "a\\b" }, { "a\tb" } };
+    for (int k = 0; k < 3; k++)
+    {
+        pzpd_writer_opts oq = { quoted[k], 1, 0, 0 };
+        CHECK( (pzpd_writer_create(path, &oq) == NULL) && (pzpd_last_error_code() == PZPD_E_ARG) && (strstr(pzpd_last_error(), "stream 0: ") == pzpd_last_error()),
+               "stream name with a quote / backslash / tab rejected");
+    }
+
+    // A file over the 4 GiB blob limit is refused before it is read (sparse: no disk space used)
+    char big[1300];
+    snprintf(big, sizeof(big), "%s/rej_big.bin", dir);
+    int bfd = open(big, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK( (bfd >= 0) && (ftruncate(bfd, 5ll << 30) == 0), "sparse 5 GiB file");
+    if (bfd >= 0) { close(bfd); }
+    w = pzpd_writer_create(path, &o);
+    CHECK( (w != NULL) && pzpd_writer_begin(w, "k", 1, PZPD_NO_GROUP, 0) && !pzpd_writer_blob_file(w, 0, "big", 3, big) && (pzpd_last_error_code() == PZPD_E_ARG) &&
+           (strstr(pzpd_last_error(), "4 GiB") != NULL), "5 GiB file refused up front");
+    pzpd_writer_abort(w);
+    unlink(big);
+
+    // Errors wrapped with context keep the cause: "<shard path>: <why it failed>"
+    const char *missing[1] = { "/nonexistent/x.00000.pzpd" };
+    CHECK(!pzpd_manifest_rebuild(path, missing, 1) && (pzpd_last_error_code() == PZPD_E_IO) && (strstr(pzpd_last_error(), "/nonexistent/x.00000.pzpd: cannot open") == pzpd_last_error()),
+          "rebuild-manifest names the shard and the cause");
 }
 
 /** @brief Build a single-frame PZP: 40-byte header (+ pixels), size prefix, zstd or lz4. */
@@ -321,6 +360,20 @@ static void test_formats(void)
     npy[8] = (unsigned char) strlen(hdr); npy[9] = 0;
     memcpy(npy + 10, hdr, strlen(hdr));
     CHECK(pzpd_detect_format(npy, 10 + strlen(hdr), NULL, 0, &m) == PZPD_FORMAT_NPY && m.width == 3 && m.height == 4 && m.channels == 5 && m.bits == 32 && (m.meta_flags & PZPD_META_FLOAT), "NPY f4 (3,4,5)");
+    {
+        // A header longer than the probe's 4 KiB copy, cut right after the dtype's opening quote: the
+        // probe must not read the dtype past the end of the copy (ASan: stack-buffer-overflow)
+        size_t hl = 6000;
+        unsigned char *big = (unsigned char *) malloc(10 + hl);
+        memcpy(big, "\x93NUMPY\x01\x00", 8);
+        big[8] = (unsigned char)(hl & 0xFF); big[9] = (unsigned char)(hl >> 8);
+        memset(big + 10, ' ', hl);
+        const char *head = "{'shape': (1,), 'descr':";
+        memcpy(big + 10, head, strlen(head));
+        big[10 + 4094] = '\'';                                   // the last byte the probe keeps (4095 bytes + NUL)
+        CHECK(pzpd_detect_format(big, 10 + hl, NULL, 0, &m) == PZPD_FORMAT_NPY && !(m.meta_flags & PZPD_META_VALID), "NPY with a cut dtype: format known, metadata not");
+        free(big);
+    }
 
     const char *js = "  {\"a\": 1,\n \"b\": [1,2]}\n";
     CHECK(pzpd_detect_format(js, strlen(js), "x.json", 6, &m) == PZPD_FORMAT_JSON && m.width == 2, "JSON 2 lines");
@@ -509,6 +562,31 @@ static void test_misc(void)
     b = pzpd_open(crafted, 0);
     CHECK( (b == NULL) && (pzpd_last_error_code() == PZPD_E_FORMAT), "manifest with a wrapping hash_count refused (code %d)", pzpd_last_error_code());
     if (b != NULL) { pzpd_find(b, "zz-not-there", 12, NULL); pzpd_close(b); }   // without the check: out-of-bounds read here
+
+    // A finish that fails while writing the last shard's index (here: the file size limit, as a full disk
+    // would) closes that shard's descriptor and removes its .tmp file, as pzpd_writer_abort() does
+    {
+        char fp[1200], tmp[1300];
+        snprintf(fp, sizeof(fp), "%s/fail_finish.pzpd", dir);
+        snprintf(tmp, sizeof(tmp), "%s/fail_finish.00000.pzpd.tmp", dir);
+        const char *fs[1] = { "data" };
+        pzpd_writer_opts fo = { fs, 1, 0, 64 };
+        pzpd_writer *fw = pzpd_writer_create(fp, &fo);
+        CHECK( (fw != NULL) && pzpd_writer_begin(fw, "k", 1, PZPD_NO_GROUP, 0) && pzpd_writer_blob(fw, 0, "n", 1, "abc", 3) && pzpd_writer_end(fw), "one small record");
+        long fdsBefore = count_fds();
+        struct rlimit old, lim;
+        getrlimit(RLIMIT_FSIZE, &old);
+        lim = old;
+        lim.rlim_cur = 8192;                                     // the record fits, the index sections at 8192 don't
+        void (*oldSig)(int) = signal(SIGXFSZ, SIG_IGN);
+        setrlimit(RLIMIT_FSIZE, &lim);
+        int fok = (fw != NULL) && pzpd_writer_finish(fw);
+        setrlimit(RLIMIT_FSIZE, &old);
+        signal(SIGXFSZ, oldSig);
+        CHECK(!fok && (pzpd_last_error_code() == PZPD_E_IO), "finish fails when the index can't be written");
+        CHECK(access(tmp, F_OK) != 0, "...and leaves no .tmp shard behind");
+        CHECK(count_fds() == fdsBefore - 1, "...and closes the shard's descriptor (%ld -> %ld open)", fdsBefore, count_fds());
+    }
 }
 
 /** @brief Phase 1c: table schemas, CSV, binary rows, strings, global tables, collections. */
@@ -1691,6 +1769,27 @@ static void test_recovery(void)
     CHECK(e != NULL && pzpd_table_rows(e, 1, 1, NULL) == 2 && pzpd_table_csv(e, 1, 1, c1, sizeof(c1)) > 0 && !strncmp(c1, "7,a,1,2,3,4,5,6\n8,b,", 20) &&
           pzpd_table_rows(e, 2, 1, NULL) == 2 && pzpd_table_rows(e, 0, 1, NULL) == 0, "record 1 has the new rows, record 2 kept its 2 rows, record 0 still none");
     pzpd_close(e);
+    {
+        // Both superblocks of the edited (not yet compacted) shard lost: the section scan sees the replaced
+        // persons section and its replacement, and must take the newest one, in the table's directory slot
+        char es[1300], eb2[1400];
+        snprintf(es, sizeof(es), "%s/edit.00000.pzpd", src);
+        snprintf(eb2, sizeof(eb2), "%s.bak", es);
+        struct stat est;
+        CHECK(copy_file(es, eb2) && (stat(es, &est) == 0), "back up the edited shard");
+        damage(es, 0, 4096, 0);
+        damage(es, (uint64_t) est.st_size - 4096, 4096, 0);
+        pzpd_shard_info esi;
+        e = pzpd_open(es, 0);
+        CHECK(e != NULL && pzpd_shard_info_get(e, 0, &esi) && esi.recovery == 2 && pzpd_table_count(e) == 3 && pzpd_table_id(e, "persons") == 1 &&
+              pzpd_table_csv(e, 1, 1, c1, sizeof(c1)) > 0 && !strncmp(c1, "7,a,1,2,3,4,5,6\n8,b,", 20), "standalone: 3 tables, persons has the replaced rows");
+        pzpd_close(e);
+        e = pzpd_open(ed, 0);
+        CHECK(e != NULL && pzpd_table_csv(e, 1, 1, c1, sizeof(c1)) > 0 && !strncmp(c1, "7,a,1,2,3,4,5,6\n8,b,", 20) && pzpd_shard_info_get(e, 0, &esi) && esi.recovery == 2,
+              "through the manifest: the recovered shard agrees with it");
+        pzpd_close(e);
+        CHECK(rename(eb2, es) == 0, "restore the shard");
+    }
     CHECK(pzpd_edit_table(ed, PZPD_EDIT_REPLACE, "joints", "name:str parent:u16", 0, NULL, 0, "hip,0\nknee,0\nankle,1\n", strlen("hip,0\nknee,0\nankle,1\n"), 0, NULL), "replace a global table");
     e = pzpd_open(ed, 0);
     CHECK(e != NULL && pzpd_global_rows(e, 0, 0, NULL) == 3, "the global table has 3 rows in the manifest copy");

@@ -38,6 +38,7 @@ done
 
 if [ -d "$DL" ]; then
   SRC="$DL/codecs/codecs.c $DL/codecs/asciiInput.c $DL/codecs/bmpInput.c $DL/codecs/jpgInput.c $DL/codecs/pfmInput.c $DL/codecs/pngInput.c $DL/codecs/ppmInput.c $DL/codecs/pzpInput.c $DL/PrepareBatch.c $DL/DataLoader.c $DL/HeatmapGenerator.c $DL/DBLoader.c $DL/cache.c"
+  if [ -f "$DL/PZPDLoader.c" ]; then SRC="$SRC $DL/PZPDLoader.c"; fi   # the archive adapter (DataLoader branch pzpdir)
   if gcc -shared -o "$T/libDataLoader_with_pzpdir.so" ${FLAGS[avx2]} -DPZPDIR_WITH_PZP=0 -I"$DL" $SRC "$T/pzpdir/pzpdir.c" -Wl,--no-undefined $LIBS 2>"$T/link.log"; then
     echo -e "\033[32mok\033[0m   link with the DataLoader's own sources into one .so (no clashes, no undefined symbols)"
   else

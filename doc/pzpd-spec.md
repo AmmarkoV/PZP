@@ -153,8 +153,9 @@ dated revisions, recorded in the changelog below.
   - **Metadata JSON** also holds `first_ordinal`, `align` and `generation`, so a shard with both superblocks gone can
     place itself; for shards written before, `first_ordinal` comes from the manifest (standalone: 0).
   - **Step 2 details:** the section scan runs backwards from EOF over 4 KiB boundaries, accepts a section only if its
-    XXH64 matches, and stops at the first record-table section it meets. Kinds 2–5 are the first of each after it,
-    tables are every table section after it in order. Stream names come from the metadata (placeholders `streamN`
+    XXH64 matches, and stops at the first record-table section it meets. Kinds 2–5 are the first of each after it.
+    Tables: per name, the newest section (table edits append and leave the old one until `compact`) in the slot of
+    that name's first section; a table dropped since the last `compact` comes back. Stream names come from the metadata (placeholders `streamN`
     when they're lost); `index_checksum` is recomputed. It runs automatically on open; `pzpd_shard_info.recovery`
     reports 0 (primary), 1 (backup) or 2 (sections). A file whose first bytes aren't a known magic is tried as a shard.
   - **Table directory check:** a table section's name, flags and row stride must equal its directory slot.

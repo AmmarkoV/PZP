@@ -107,7 +107,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *  - A pzpd handle may be used by any number of threads at once for lookups and reads.
  *    Shards are opened lazily; the first touch of a shard takes a mutex once.
  *  - A pzpd_writer must be used by one thread at a time.
- *  - A pzpd_prefetcher may be used by any number of threads at once (every call takes its mutex briefly);
+ *  - A pzpd_prefetcher may be used by any number of threads at once (a call locks only the lane of its record: the schedule is split by ordinal into lanes with their own locks);
  *    it runs its own I/O threads.
  *  - pzpd_last_error() is per thread.
  *  - The library has no global mutable state besides that thread-local error.
@@ -132,7 +132,7 @@ extern "C"
 #include <sys/types.h>
 
 /** @brief Library version, printed by programs that vendor pzpdir so copies can be told apart. */
-static const char pzpdirVersion[]="0.8"; //0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
+static const char pzpdirVersion[]="0.10"; //0.10: prefetcher lanes (a lock per lane, atomic window / budget), batched I/O-thread takes and wake-ups, stream names checked for the metadata JSON, faster resumed edit-stream; 0.9: review fixes (section-scan recovery after table edits, writer finish cleanup, NPY probe bound, faster edit-stream name check); 0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
 
 #ifndef PZPDIR_WITH_PZP
 /** @brief 1 enables pzpd_read_pzp() (includes pzp.h). Build with 0 when the program decodes PZP itself. */

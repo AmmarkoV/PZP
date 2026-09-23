@@ -262,15 +262,18 @@ static unsigned int pzp_palette_write(
     return off;
 }
 
-/* Parse palette data from src. Returns bytes consumed. */
+/* Parse palette data from src ( src_bytes long ). Returns bytes consumed, or 0 if the palette
+   would run past src_bytes. */
 static unsigned int pzp_palette_read(
-        const unsigned char *src, unsigned int channels,
+        const unsigned char *src, unsigned int src_bytes, unsigned int channels,
         unsigned char palette[8][256], unsigned int counts[8])
 {
     unsigned int off = 0;
     for (unsigned int ch = 0; ch < channels; ch++)
     {
+        if (off >= src_bytes) return 0;
         counts[ch] = (unsigned int)src[off++] + 1;
+        if (counts[ch] > src_bytes - off) return 0;
         memcpy(palette[ch], src + off, counts[ch]);
         off += counts[ch];
     }
@@ -395,16 +398,20 @@ static unsigned char *pzp_compress_frame_to_memory(
     {
         paletteDataBytes = pzp_palette_build_and_encode(
                 buffers, width * height, ch_int, palette, palette_counts);
+        #if PZP_VERBOSE
         fprintf(stderr, "Palette mode: %u channels, palette data %u bytes\n",
                 ch_int, paletteDataBytes);
         for (unsigned int ch = 0; ch < ch_int; ch++)
             fprintf(stderr, "  ch%u: %u unique values\n", ch, palette_counts[ch]);
+        #endif
     }
 
     /* ── delta filter ── */
     if (configuration & USE_RLE)
     {
+        #if PZP_VERBOSE
         fprintf(stderr, "Using RLE for compression (mode %u)\n", configuration);
+        #endif
         pzp_RLE_filter(buffers, ch_int, width, height);
     }
 
@@ -600,8 +607,10 @@ static int pzp_container_write(
         if (!do_delta) cfg &= ~(unsigned int)USE_INTER_DELTA;
 
         /* Copy the CURRENT original channel data before any modification so it
-           can serve as the reference for the next frame. */
-        unsigned char **cur_orig = (unsigned char **)malloc(ch_int * sizeof(unsigned char *));
+           can serve as the reference for the next frame - only if that frame
+           asks for a delta ( never for single images or the last frame ). */
+        int need_orig = (f + 1 < frame_count) && (configurations[f + 1] & USE_INTER_DELTA);
+        unsigned char **cur_orig = need_orig ? (unsigned char **)calloc(ch_int, sizeof(unsigned char *)) : NULL;
         int orig_ok = (cur_orig != NULL);
         if (orig_ok)
         {
@@ -856,6 +865,11 @@ static int pzp_container_attach(
     unsigned int idx_size         = hdr.frame_count * (unsigned int)frameEntrySize;
     unsigned int frame_area_start = (unsigned int)containerHeaderSize + idx_size;
     unsigned int data_end         = frame_area_start + total_frame_bytes;
+    if ((size_t)frame_area_start + total_frame_bytes > file_size)
+    {
+        fprintf(stderr, "pzp_container_attach: frame data extends beyond file end\n");
+        free(entries); free(file_data); return 0;
+    }
 
     unsigned int new_meta_offset  = (metadata && metadata_bytes > 0) ? data_end : 0;
     unsigned int new_audio_offset = 0;
@@ -940,129 +954,6 @@ static int pzp_compress_combined(unsigned char **buffers,
 //-----------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------
 #if INTEL_OPTIMIZATIONS
-static void pzp_prefix_sum_sse2(unsigned char *src, unsigned char *dst, unsigned int size)
-{
-    __m128i carry = _mm_setzero_si128();
-    unsigned int i = 0;
-    for (; i + 15 < size; i += 16)
-    {
-        __m128i v = _mm_loadu_si128((__m128i *)(src + i));
-        v = _mm_add_epi8(v, _mm_slli_si128(v, 1));
-        v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
-        v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
-        v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
-        v = _mm_add_epi8(v, carry);
-        _mm_storeu_si128((__m128i *)(dst + i), v);
-        unsigned char last = (unsigned char)_mm_cvtsi128_si32(_mm_srli_si128(v, 15));
-        carry = _mm_set1_epi8((char)last);
-    }
-    for (; i < size; i++)
-        dst[i] = src[i] + (i > 0 ? dst[i - 1] : 0);
-}
-
-static void pzp_extractAndReconstruct_SSE2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
-{
-    unsigned int total_size = width * height;
-    unsigned char *src = decompressed_bytes;
-    unsigned char *r   = reconstructed;
-
-    if (restoreRLEChannels)
-    {
-        switch (channels)
-        {
-            case 1:
-            {
-                pzp_prefix_sum_sse2(src, r, total_size);
-                break;
-            }
-            case 2:
-            {
-                // Each channel accumulates independently with stride 2.
-                // Kogge-Stone with shifts 2, 4, 8 covers all 8 pixel pairs in 16 bytes.
-                // Carry = last pixel (2 bytes), broadcast to all 8 pixel positions.
-                __m128i carry = _mm_setzero_si128();
-                unsigned int i = 0;
-
-                for (; i + 7 < total_size; i += 8)
-                {
-                    __m128i v = _mm_loadu_si128((__m128i *)(src + i * 2));
-
-                    // Within-block prefix sum per channel (stride 2)
-                    v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
-                    v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
-                    v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
-
-                    // Add cross-block carry to every element
-                    v = _mm_add_epi8(v, carry);
-                    _mm_storeu_si128((__m128i *)(r + i * 2), v);
-
-                    // Carry: last 2 bytes (one pixel) broadcast to all 8 pixel positions.
-                    // _mm_set1_epi16 replicates a 16-bit pattern to all 8 epi16 lanes,
-                    // which is exactly the [ch0_acc, ch1_acc] pair repeated 8 times.
-                    int tmp = _mm_cvtsi128_si32(_mm_srli_si128(v, 14));
-                    carry = _mm_set1_epi16((short)(tmp & 0xFFFF));
-                }
-
-                // Scalar tail (also handles total_size < 8)
-                for (; i < total_size; i++)
-                {
-                    r[i * 2]     = src[i * 2]     + (i > 0 ? r[(i - 1) * 2]     : 0);
-                    r[i * 2 + 1] = src[i * 2 + 1] + (i > 0 ? r[(i - 1) * 2 + 1] : 0);
-                }
-                break;
-            }
-            case 3:
-            {
-                // Scalar prefix sum for 3-channel interleaved data.
-                r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    r[i*3]   = src[i*3]   + r[(i-1)*3];
-                    r[i*3+1] = src[i*3+1] + r[(i-1)*3+1];
-                    r[i*3+2] = src[i*3+2] + r[(i-1)*3+2];
-                }
-                break;
-            }
-            default:
-            {
-                for (unsigned int ch = 0; ch < channels; ch++) { r[ch] = src[ch]; }
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
-                    }
-                }
-                break;
-            }
-        }
-    }
-    else // Non-RLE: data is already in final interleaved layout
-    {
-        memcpy(r, src, total_size * channels);
-    }
-}
-
-
-static void pzp_memcpy_avx2(unsigned char *dst, unsigned char *src, unsigned int size)
-{
-    unsigned int i = 0;
-    __m256i v;
-
-    // Process 32 bytes at a time
-    for (; i + 31 < size; i += 32)
-    {
-        v = _mm256_loadu_si256((__m256i *)(src + i));
-        _mm256_storeu_si256((__m256i *)(dst + i), v);
-    }
-
-    // Process remaining bytes
-    for (; i < size; i++)
-    {
-        dst[i] = src[i];
-    }
-}
-
 /**
  * @brief Computes the prefix sum of an array using AVX2 SIMD operations.
  *
@@ -1352,192 +1243,130 @@ static void pzp_interleave_3ch(
 }
 
 
-static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+static void pzp_extractAndReconstruct_AVX2(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels)
 {
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r = reconstructed;
 
-    if (restoreRLEChannels)
+    switch (channels)
     {
-        switch (channels)
-        {
-            case 1: {
-                pzp_prefix_sum_avx2(src, r, total_size);
-                break;
-            }
-            case 2: {
-                pzp_prefix_sum_avx2_2ch(src,r,total_size);
-                break;
-            }
-            case 3: {
-                // De-interleave via SSSE3 shuffle (16 px/iter), run AVX2 prefix
-                // sum on each planar buffer, then re-interleave via SSSE3 shuffle.
-                // Replaces the previous scalar stride-3 loops (~6.66B instructions
-                // callgrind hotspot) with ~16× faster SIMD scatter/gather.
-                unsigned char *ch0 = (unsigned char *)malloc(total_size);
-                unsigned char *ch1 = (unsigned char *)malloc(total_size);
-                unsigned char *ch2 = (unsigned char *)malloc(total_size);
-                if (ch0 && ch1 && ch2) {
-                    pzp_deinterleave_3ch(src, ch0, ch1, ch2, total_size);
-                    pzp_prefix_sum_avx2(ch0, ch0, total_size);
-                    pzp_prefix_sum_avx2(ch1, ch1, total_size);
-                    pzp_prefix_sum_avx2(ch2, ch2, total_size);
-                    pzp_interleave_3ch(ch0, ch1, ch2, r, total_size);
-                } else {
-                    // OOM fallback: scalar
-                    r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
-                    for (unsigned int i = 1; i < total_size; ++i) {
-                        r[i*3]   = src[i*3]   + r[(i-1)*3];
-                        r[i*3+1] = src[i*3+1] + r[(i-1)*3+1];
-                        r[i*3+2] = src[i*3+2] + r[(i-1)*3+2];
-                    }
+        case 1: {
+            pzp_prefix_sum_avx2(src, r, total_size);
+            break;
+        }
+        case 2: {
+            pzp_prefix_sum_avx2_2ch(src,r,total_size);
+            break;
+        }
+        case 3: {
+            // De-interleave via SSSE3 shuffle (16 px/iter), run AVX2 prefix
+            // sum on each planar buffer, then re-interleave via SSSE3 shuffle.
+            // Replaces the previous scalar stride-3 loops (~6.66B instructions
+            // callgrind hotspot) with ~16× faster SIMD scatter/gather.
+            unsigned char *planes = (unsigned char *)malloc((size_t)total_size * 3);
+            if (planes) {
+                unsigned char *ch0 = planes, *ch1 = planes + total_size, *ch2 = planes + 2 * (size_t)total_size;
+                pzp_deinterleave_3ch(src, ch0, ch1, ch2, total_size);
+                pzp_prefix_sum_avx2(ch0, ch0, total_size);
+                pzp_prefix_sum_avx2(ch1, ch1, total_size);
+                pzp_prefix_sum_avx2(ch2, ch2, total_size);
+                pzp_interleave_3ch(ch0, ch1, ch2, r, total_size);
+                free(planes);
+            } else {
+                // OOM fallback: scalar
+                r[0] = src[0]; r[1] = src[1]; r[2] = src[2];
+                for (unsigned int i = 1; i < total_size; ++i) {
+                    r[i*3]   = src[i*3]   + r[(i-1)*3];
+                    r[i*3+1] = src[i*3+1] + r[(i-1)*3+1];
+                    r[i*3+2] = src[i*3+2] + r[(i-1)*3+2];
                 }
-                free(ch0); free(ch1); free(ch2);
-                break;
             }
-            default: {
-                // Generic case (scalar fallback)
+            break;
+        }
+        default: {
+            // Generic case (scalar fallback)
+            for (unsigned int ch = 0; ch < channels; ++ch)
+            {
+                r[ch] = src[ch];
+            }
+            for (unsigned int i = 1; i < total_size; ++i)
+            {
                 for (unsigned int ch = 0; ch < channels; ++ch)
                 {
-                    r[ch] = src[ch];
+                    r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
                 }
-                for (unsigned int i = 1; i < total_size; ++i)
-                {
-                    for (unsigned int ch = 0; ch < channels; ++ch)
-                    {
-                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
-                    }
-                }
-                break;
             }
-        }
-    } else
-    {
-        // Non-RLE path
-        switch (channels)
-        {
-            case 1:
-                memcpy(r, src, total_size);
-                break;
-            case 2:
-            {
-                // Copy 32 bytes at a time (16 pixels)
-                unsigned int i = 0;
-                for (; i + 15 < total_size; i += 16)
-                {
-                    __m256i data = _mm256_loadu_si256((__m256i*)(src + 2 * i));
-                    _mm256_storeu_si256((__m256i*)(r + 2 * i), data);
-                }
-                // Remaining elements
-                for (; i < total_size; ++i)
-                {
-                    r[2 * i] = src[2 * i];
-                    r[2 * i + 1] = src[2 * i + 1];
-                }
-                break;
-            }
-            case 3:
-            {
-                // Copy 24 bytes at a time (8 pixels)
-                unsigned int i = 0;
-                for (; i + 7 < total_size; i += 8)
-                {
-                    __m256i data = _mm256_loadu_si256((__m256i*)(src + 3 * i));
-                    _mm256_storeu_si256((__m256i*)(r + 3 * i), data);
-                }
-                // Remaining elements
-                for (; i < total_size; ++i)
-                {
-                    r[3 * i]     = src[3 * i];
-                    r[3 * i + 1] = src[3 * i + 1];
-                    r[3 * i + 2] = src[3 * i + 2];
-                }
-                break;
-            }
-            default: {
-                // Generic case (scalar fallback)
-                for (unsigned int i = 0; i < total_size; ++i)
-                {
-                    for (unsigned int ch = 0; ch < channels; ++ch)
-                    {
-                        r[i * channels + ch] = src[i * channels + ch];
-                    }
-                }
-                break;
-            }
+            break;
         }
     }
 }
 #endif // INTEL_OPTIMIZATIONS
-static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+static void pzp_extractAndReconstruct_Naive(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels)
 {
     unsigned int total_size = width * height;
     unsigned char *src = decompressed_bytes;
     unsigned char *r   = reconstructed;
 
-    if (restoreRLEChannels)
+    switch (channels)
     {
-        switch (channels)
-        {
-            case 1:
-                r[0] = src[0];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    r[i] = src[i] + r[i - 1];
-                }
-                break;
-            case 2:
-                r[0] = src[0];
-                r[1] = src[1];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    r   += 2;
-                    src += 2;
-                    r[0] = src[0] + r[-2];
-                    r[1] = src[1] + r[-1];
-                }
-                break;
-            case 3:
-                r[0] = src[0];
-                r[1] = src[1];
-                r[2] = src[2];
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    r   += 3;
-                    src += 3;
-                    r[0] = src[0] + r[-3];
-                    r[1] = src[1] + r[-2];
-                    r[2] = src[2] + r[-1];
-                }
-                break;
-            default:
+        case 1:
+            r[0] = src[0];
+            for (unsigned int i = 1; i < total_size; i++)
+            {
+                r[i] = src[i] + r[i - 1];
+            }
+            break;
+        case 2:
+            r[0] = src[0];
+            r[1] = src[1];
+            for (unsigned int i = 1; i < total_size; i++)
+            {
+                r   += 2;
+                src += 2;
+                r[0] = src[0] + r[-2];
+                r[1] = src[1] + r[-1];
+            }
+            break;
+        case 3:
+            r[0] = src[0];
+            r[1] = src[1];
+            r[2] = src[2];
+            for (unsigned int i = 1; i < total_size; i++)
+            {
+                r   += 3;
+                src += 3;
+                r[0] = src[0] + r[-3];
+                r[1] = src[1] + r[-2];
+                r[2] = src[2] + r[-1];
+            }
+            break;
+        default:
+            for (unsigned int ch = 0; ch < channels; ch++)
+            {
+                r[ch] = src[ch];
+            }
+            for (unsigned int i = 1; i < total_size; i++)
+            {
                 for (unsigned int ch = 0; ch < channels; ch++)
                 {
-                    r[ch] = src[ch];
+                    r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
                 }
-                for (unsigned int i = 1; i < total_size; i++)
-                {
-                    for (unsigned int ch = 0; ch < channels; ch++)
-                    {
-                        r[i * channels + ch] = src[i * channels + ch] + r[(i - 1) * channels + ch];
-                    }
-                }
-                break;
-        }
-    }
-    else // Non-RLE path: data is already in final interleaved layout
-    {
-        memcpy(reconstructed, src, total_size * channels);
+            }
+            break;
     }
 }
 //-----------------------------------------------------------------------------------------------
-static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels, int restoreRLEChannels)
+/* Undo the USE_RLE left-pixel delta filter: reconstructed[i] = decompressed_bytes[i] + reconstructed[i-1]
+ * per channel. Safe in place with reconstructed <= decompressed_bytes ( the decoder passes its own
+ * buffer start and the pixel data further inside it ): every path reads a source byte before any
+ * write can reach it. */
+static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigned char *reconstructed, unsigned int width, unsigned int height, unsigned int channels)
 {
    #if INTEL_OPTIMIZATIONS
-     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     pzp_extractAndReconstruct_AVX2(decompressed_bytes,reconstructed,width,height,channels);
    #else
-     pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels,restoreRLEChannels);
+     pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels);
    #endif // INTEL_OPTIMIZATIONS
 }
 
@@ -1545,14 +1374,25 @@ static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigne
 // ─── Inner frame decompressor (from memory) ──────────────────────────────────
 //
 // Forward-declared here so container reader functions below can call it.
-// Full definition follows after this section.
+// Full definition follows after this section. It decodes one inner frame only
+// ( no container detection ), so a frame can never recurse into its container.
 //-----------------------------------------------------------------------------------------------
-static unsigned char* pzp_decompress_combined_from_memory(
+static unsigned char* pzp_frame_decode_from_memory(
                                 const void *file_data, size_t file_size,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
                                 unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput,
                                 unsigned int *configuration);
+
+/* One decoded container frame ( pzp_container_read_frames ). pixels is malloc'd, caller frees. */
+typedef struct {
+    unsigned char *pixels;
+    unsigned int   width, height;
+    unsigned int   bpp_ext, ch_ext;
+    unsigned int   bpp_int, ch_int;
+    unsigned int   configuration;
+    unsigned int   delay_ms;
+} PZPFrame;
 
 //-----------------------------------------------------------------------------------------------
 // ─── Container read helpers ──────────────────────────────────────────────────
@@ -1604,8 +1444,45 @@ static int pzp_container_parse_header(
     return 1;
 }
 
+/* Decode ( without inter-frame reconstruction ) the frame that index entry e points at. */
+static int pzp_container_decode_entry(
+        const void *file_data, size_t file_size,
+        const PZPFrameEntry *e, unsigned int frame_index,
+        PZPFrame *fr)
+{
+    fr->pixels = NULL;
+    if ((size_t)e->frame_offset + e->compressed_size > file_size)
+    {
+        fprintf(stderr, "pzp: frame %u extends beyond file end\n", frame_index);
+        return 0;
+    }
+    fr->pixels = pzp_frame_decode_from_memory(
+            (const unsigned char *)file_data + e->frame_offset, e->compressed_size,
+            &fr->width, &fr->height, &fr->bpp_ext, &fr->ch_ext,
+            &fr->bpp_int, &fr->ch_int, &fr->configuration);
+    fr->delay_ms = e->delay_ms;
+    return (fr->pixels != NULL);
+}
+
+/* A USE_INTER_DELTA frame stores frame[N] - frame[N-1]: add the reconstructed previous frame back.
+ * A reference with a different layout is ignored ( the encoder never deltas across layouts ). */
+static void pzp_frame_add_reference(PZPFrame *cur, const PZPFrame *prev)
+{
+    if (prev->width == cur->width && prev->height == cur->height && prev->ch_int == cur->ch_int)
+    {
+        /* Internal buffers are always 8-bit planar; plain byte addition
+           reconstructs the original pixel values (wrapping mod 256). */
+        size_t n = (size_t)cur->width * cur->height * cur->ch_int;
+        for (size_t i = 0; i < n; i++)
+            cur->pixels[i] += prev->pixels[i];
+    }
+}
+
 /*
  * Decompress frame 'frame_index' from a container held in memory.
+ * A delta frame needs every frame back to the nearest keyframe: those are decoded once each,
+ * newest first, then reconstructed oldest first. To decode many frames in order use
+ * pzp_container_read_frames(), which decodes each frame exactly once.
  */
 static unsigned char *pzp_container_read_frame_from_memory(
         const void *file_data, size_t file_size,
@@ -1628,39 +1505,33 @@ static unsigned char *pzp_container_read_frame_from_memory(
         return NULL;
     }
 
-    PZPFrameEntry e = entries[frame_index];
+    /* chain[0] = frame_index, chain[n-1] = the keyframe it depends on */
+    PZPFrame    *chain = (PZPFrame *)malloc(((size_t)frame_index + 1) * sizeof(PZPFrame));
+    unsigned int n     = 0;
+    int          ok    = (chain != NULL);
+    for (unsigned int k = frame_index; ok; k--)
+    {
+        ok = pzp_container_decode_entry(file_data, file_size, &entries[k], k, &chain[n]);
+        if (!ok) break;
+        n++;
+        if (!(chain[n - 1].configuration & USE_INTER_DELTA) || (k == 0)) break;
+    }
     free(entries);
 
-    if ((size_t)e.frame_offset + e.compressed_size > file_size)
+    unsigned char *out = NULL;
+    if (ok)
     {
-        fprintf(stderr, "pzp: frame %u extends beyond file end\n", frame_index);
-        return NULL;
+        for (unsigned int j = n - 1; j-- > 0; )
+            pzp_frame_add_reference(&chain[j], &chain[j + 1]);
+        out            = chain[0].pixels;
+        *width         = chain[0].width;   *height = chain[0].height;
+        *bpp_ext       = chain[0].bpp_ext; *ch_ext = chain[0].ch_ext;
+        *bpp_int       = chain[0].bpp_int; *ch_int = chain[0].ch_int;
+        *configuration = chain[0].configuration;
     }
-
-    const void *frame_data = (const unsigned char *)file_data + e.frame_offset;
-    unsigned char *out = pzp_decompress_combined_from_memory(
-            frame_data, e.compressed_size,
-            width, height, bpp_ext, ch_ext, bpp_int, ch_int, configuration);
-    if (!out) return NULL;
-
-    /* If this frame was encoded as a delta, reconstruct by adding frame[N-1]. */
-    if ((*configuration & USE_INTER_DELTA) && frame_index > 0)
-    {
-        unsigned int pw = 0, ph = 0, pbe = 0, pce = 0, pbi = 0, pci = 0, pcfg = 0;
-        unsigned char *prev = pzp_container_read_frame_from_memory(
-                file_data, file_size, frame_index - 1,
-                &pw, &ph, &pbe, &pce, &pbi, &pci, &pcfg);
-        if (prev && pw == *width && ph == *height && pci == *ch_int)
-        {
-            /* Internal buffers are always 8-bit planar; plain byte addition
-               reconstructs the original pixel values (wrapping mod 256). */
-            size_t n = (size_t)(*width) * (*height) * (*ch_int);
-            for (size_t i = 0; i < n; i++)
-                out[i] += prev[i];
-        }
-        free(prev);
-    }
-
+    else if (n > 0) free(chain[0].pixels);
+    for (unsigned int j = 1; j < n; j++) free(chain[j].pixels);
+    free(chain);
     return out;
 }
 
@@ -1684,6 +1555,54 @@ static unsigned char *pzp_container_read_frame(
             width, height, bpp_ext, ch_ext, bpp_int, ch_int, configuration);
     free(file_data);
     return result;
+}
+
+/*
+ * Decode the first min(frame_count, max_frames) frames of a container held in memory, in order,
+ * each exactly once ( a delta frame reuses the previous, already reconstructed frame ).
+ * Fills frames[0..n-1]; the caller frees each frames[i].pixels.
+ * Returns n, or 0 on failure ( nothing left allocated ).
+ */
+static unsigned int pzp_container_read_frames_from_memory(
+        const void *file_data, size_t file_size,
+        PZPFrame *frames, unsigned int max_frames)
+{
+    PZPContainerHeader hdr;
+    PZPFrameEntry     *entries = NULL;
+
+    if (!pzp_container_parse_header(file_data, file_size, &hdr, &entries))
+        return 0;
+
+    unsigned int n = (hdr.frame_count < max_frames) ? hdr.frame_count : max_frames;
+    for (unsigned int f = 0; f < n; f++)
+    {
+        if (!pzp_container_decode_entry(file_data, file_size, &entries[f], f, &frames[f]))
+        {
+            for (unsigned int j = 0; j < f; j++) { free(frames[j].pixels); frames[j].pixels = NULL; }
+            free(entries);
+            return 0;
+        }
+        if ((frames[f].configuration & USE_INTER_DELTA) && (f > 0))
+            pzp_frame_add_reference(&frames[f], &frames[f - 1]);
+    }
+    free(entries);
+    return n;
+}
+
+/*
+ * pzp_container_read_frames_from_memory() on a container file on disk ( read once ).
+ */
+static unsigned int pzp_container_read_frames(
+        const char *filename,
+        PZPFrame   *frames, unsigned int max_frames)
+{
+    size_t file_size = 0;
+    void  *file_data = pzp_read_file_to_memory(filename, &file_size);
+    if (!file_data) return 0;
+
+    unsigned int n = pzp_container_read_frames_from_memory(file_data, file_size, frames, max_frames);
+    free(file_data);
+    return n;
 }
 
 /*
@@ -1727,6 +1646,11 @@ static unsigned char *pzp_container_get_metadata(
 
     if (!(hdr.container_flags & PZP_CONTAINER_HAS_METADATA) || hdr.metadata_bytes == 0)
     { free(file_data); return NULL; }
+    if ((size_t)hdr.metadata_offset + hdr.metadata_bytes > file_size)
+    {
+        fprintf(stderr, "pzp: metadata extends beyond file end\n");
+        free(file_data); return NULL;
+    }
 
     unsigned char *blob = (unsigned char *)malloc(hdr.metadata_bytes);
     if (blob)
@@ -1762,6 +1686,11 @@ static unsigned char *pzp_container_get_audio(
 
     if (!(hdr.container_flags & PZP_CONTAINER_HAS_AUDIO) || hdr.audio_bytes == 0)
     { free(file_data); return NULL; }
+    if ((size_t)hdr.audio_offset + hdr.audio_bytes > file_size)
+    {
+        fprintf(stderr, "pzp: audio extends beyond file end\n");
+        free(file_data); return NULL;
+    }
 
     unsigned char *blob = (unsigned char *)malloc(hdr.audio_bytes);
     if (blob)
@@ -1777,7 +1706,7 @@ static unsigned char *pzp_container_get_audio(
 //-----------------------------------------------------------------------------------------------
 // ─── Inner frame decompressor (full definition) ──────────────────────────────
 
-static unsigned char* pzp_decompress_combined_from_memory(
+static unsigned char* pzp_frame_decode_from_memory(
                                 const void *file_data, size_t file_size,
                                 unsigned int *widthOutput, unsigned int *heightOutput,
                                 unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
@@ -1790,29 +1719,7 @@ static unsigned char* pzp_decompress_combined_from_memory(
         return NULL;
     }
 
-    /* ── Container detection ────────────────────────────────────────────────
-     * If the first 4 bytes equal the PZP0 magic this is a new-format container.
-     * Read frame 0 through the container reader.
-     * The inner frame data the container reader passes back here will NOT start
-     * with the magic (it starts with a small uncompressed_size uint32), so
-     * there is no infinite recursion risk.
-     */
-    if (file_size >= (size_t)containerHeaderSize)
-    {
-        unsigned int first_word;
-        memcpy(&first_word, file_data, sizeof(unsigned int));
-        if (first_word == convert_header(pzp_header))
-        {
-            return pzp_container_read_frame_from_memory(
-                    file_data, file_size, 0,
-                    widthOutput, heightOutput,
-                    bitsperpixelExternalOutput, channelsExternalOutput,
-                    bitsperpixelInternalOutput, channelsInternalOutput,
-                    configuration);
-        }
-    }
-
-    /* ── Legacy inner-frame format ──────────────────────────────────────── */
+    /* ── Inner frame: [4-byte size prefix][zstd or lz4 stream] ─────────── */
     const unsigned char *input_ptr = (const unsigned char *)file_data;
 
     // Read stored size prefix (bit 31 = codec: 0=ZSTD, 1=LZ4; bits 0-30 = uncompressed size)
@@ -1873,6 +1780,13 @@ static unsigned char* pzp_decompress_combined_from_memory(
         return 0;
     }
 
+    if (decompressed_size < (size_t)headerSize)
+    {
+        free(decompressed_buffer);
+        fprintf(stderr, "PZP frame too small for its header (%zu bytes)\n", decompressed_size);
+        return NULL;
+    }
+
     // Read header information
     unsigned int *memStartAsUINT = (unsigned int *)decompressed_buffer;
 
@@ -1919,6 +1833,23 @@ static unsigned char* pzp_decompress_combined_from_memory(
     *channelsInternalOutput     = channelsIn;
     *configuration              = compressionCfg;
 
+    // The header fields come from the file: check that the palette and the pixel data they
+    // describe fit in what was decompressed ( overflow-safe ) before reading any of it.
+    size_t avail      = decompressed_size - (size_t)headerSize;
+    size_t pixel_size = (size_t)width * height;
+    unsigned int bytesPerSample = bitsperpixelIn / 8;
+    if ( (paletteDataBytes > avail) ||
+         (pixel_size == 0) || (channelsIn == 0) || (bytesPerSample == 0) ||
+         (pixel_size > (avail - paletteDataBytes) / channelsIn / bytesPerSample) ||
+         ((compressionCfg & USE_PALETTE) && (channelsIn > 8)) )
+    {
+        free(decompressed_buffer);
+        fprintf(stderr, "PZP frame header does not match its data (%ux%ux%u@%ubit, palette %u, %zu bytes)\n",
+                width, height, channelsIn, bitsperpixelIn, paletteDataBytes, decompressed_size);
+        return NULL;
+    }
+    pixel_size *= (size_t)bytesPerSample * channelsIn;
+
     // After the 40-byte header comes optional palette data, then the pixel/index data.
     unsigned char *after_header = (unsigned char *)decompressed_buffer + headerSize;
     unsigned char *index_data   = after_header + paletteDataBytes;
@@ -1926,10 +1857,13 @@ static unsigned char* pzp_decompress_combined_from_memory(
     // Parse palette (if present) before checksum so we can validate index data.
     unsigned char palette[8][256];
     unsigned int  palette_counts[8];
-    if (compressionCfg & USE_PALETTE)
-        pzp_palette_read(after_header, channelsIn, palette, palette_counts);
-
-    size_t pixel_size = (size_t)width * height * (bitsperpixelIn / 8) * channelsIn;
+    if ( (compressionCfg & USE_PALETTE) &&
+         (pzp_palette_read(after_header, paletteDataBytes, channelsIn, palette, palette_counts) != paletteDataBytes) )
+    {
+        free(decompressed_buffer);
+        fprintf(stderr, "PZP palette does not match its declared size (%u bytes)\n", paletteDataBytes);
+        return NULL;
+    }
 
 #if PZP_VERIFY_CHECKSUM
     // Checksum covers the index/pixel data only (not the palette prefix).
@@ -1945,27 +1879,13 @@ static unsigned char* pzp_decompress_combined_from_memory(
     }
 #endif
 
-    unsigned int restoreRLEChannels = compressionCfg & USE_RLE;
-
-    // ── Non-RLE path ──────────────────────────────────────────────────────────
-    if (!restoreRLEChannels)
-    {
-        memmove(decompressed_buffer, index_data, pixel_size);
-        if (compressionCfg & USE_PALETTE)
-            pzp_palette_apply((unsigned char *)decompressed_buffer,
-                              width * height, channelsIn, palette);
-        return (unsigned char *)decompressed_buffer;
-    }
-
-    // ── RLE path ──────────────────────────────────────────────────────────────
-    unsigned char *reconstructed = malloc(pixel_size);
-    if (reconstructed == NULL)
-    {
-        free(decompressed_buffer);
-        return NULL;
-    }
-    pzp_extractAndReconstruct(index_data, reconstructed, width, height, channelsIn, restoreRLEChannels);
-    free(decompressed_buffer);
+    // Both paths move the pixels to the start of decompressed_buffer and return it ( no second
+    // image-sized allocation ): a plain move, or the RLE reconstruction done in place.
+    unsigned char *reconstructed = (unsigned char *)decompressed_buffer;
+    if (compressionCfg & USE_RLE)
+        pzp_extractAndReconstruct(index_data, reconstructed, width, height, channelsIn);
+    else
+        memmove(reconstructed, index_data, pixel_size);
 
     if (compressionCfg & USE_PALETTE)
         pzp_palette_apply(reconstructed, width * height, channelsIn, palette);
@@ -1973,6 +1893,36 @@ static unsigned char* pzp_decompress_combined_from_memory(
     return reconstructed;
 }
 
+
+/* Decode a whole .pzp held in memory: frame 0 of a container ( the PZP0 magic ), or a bare inner
+ * frame ( the legacy single-image format ). */
+static unsigned char* pzp_decompress_combined_from_memory(
+                                const void *file_data, size_t file_size,
+                                unsigned int *widthOutput, unsigned int *heightOutput,
+                                unsigned int *bitsperpixelExternalOutput, unsigned int *channelsExternalOutput,
+                                unsigned int *bitsperpixelInternalOutput, unsigned int *channelsInternalOutput,
+                                unsigned int *configuration)
+{
+    if (file_data && file_size >= (size_t)containerHeaderSize)
+    {
+        unsigned int first_word;
+        memcpy(&first_word, file_data, sizeof(unsigned int));
+        if (first_word == convert_header(pzp_header))
+        {
+            return pzp_container_read_frame_from_memory(
+                    file_data, file_size, 0,
+                    widthOutput, heightOutput,
+                    bitsperpixelExternalOutput, channelsExternalOutput,
+                    bitsperpixelInternalOutput, channelsInternalOutput,
+                    configuration);
+        }
+    }
+    return pzp_frame_decode_from_memory(file_data, file_size,
+                                        widthOutput, heightOutput,
+                                        bitsperpixelExternalOutput, channelsExternalOutput,
+                                        bitsperpixelInternalOutput, channelsInternalOutput,
+                                        configuration);
+}
 
 static unsigned char* pzp_decompress_combined(const char *input_filename,
                                 unsigned int *widthOutput, unsigned int *heightOutput,

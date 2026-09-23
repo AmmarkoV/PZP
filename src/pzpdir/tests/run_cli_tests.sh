@@ -287,6 +287,7 @@ if [ $S2 -lt $S1 ] && [ $S2 = $S3 ] && same_as_ref x "text score persons" && "$B
 PZPDIR_TEST_CRASH=shard:2 "$BIN" add-stream "$E/arc/a.pzpd" depth "$E/depth.tsv" >/dev/null 2>&1; RC=$?
 if [ $RC = 99 ] && shard_ok "$E/arc"; then ok "add-stream killed after 2 of $NSH shards: every shard still verifies"; else bad "crash in add-stream (rc $RC)"; fi
 "$BIN" add-stream "$E/arc/a.pzpd" depth "$E/depth.tsv" >/dev/null 2>"$T/err" || bad "rerun add-stream: `cat $T/err`"
+if grep -q "match no record key" "$T/err"; then bad "rerun add-stream counted the done shards' files as unmatched: `cat $T/err`"; else ok "rerun add-stream still matches every file (done shards included)"; fi
 rm -rf "$E/u1" "$E/u2"; "$BIN" unpack "$E/arc/a.pzpd" "$E/u1" >/dev/null 2>&1; "$BIN" unpack "$E/ref/a.pzpd" "$E/u2" >/dev/null 2>&1
 if diff -r "$E/u1" "$E/u2" >/dev/null && same_as_ref x "text score persons" && "$BIN" verify "$E/arc/a.pzpd" --blobs >/dev/null 2>&1 && cmp -s "$E/u1/depth/d7.png" "$E/src/d7.png"; then ok "interrupted + rerun add-stream = uninterrupted (files, names, rows)"; else bad "add-stream after crash differs"; fi
 for i in $(seq 0 19); do printf 'k%d\tdepth\t%s\tdepth2/e%d.png\n' $i "$E/src/d$((39-i)).png" $i; done > "$E/depth2.tsv"

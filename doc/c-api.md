@@ -134,6 +134,22 @@ unsigned char *pzp_container_get_frame(
     unsigned int *bpp_int,       unsigned int *channels_int,
     unsigned int *configuration);
 
+// Decompress the first min(frame_count, max_frames) frames in one pass (file
+// read once, each frame decoded once). Use this to load an animation: a delta
+// frame fetched with pzp_container_get_frame() decodes every frame back to its
+// keyframe. Caller frees each frames[i].pixels with pzp_free.
+// Returns the number of frames filled, 0 on error.
+typedef struct {
+    unsigned char *pixels;
+    unsigned int   width, height;
+    unsigned int   bpp_ext, ch_ext;
+    unsigned int   bpp_int, ch_int;
+    unsigned int   configuration;
+    unsigned int   delay_ms;
+} PZPFrame;
+unsigned int pzp_container_get_frames(const char *filename,
+                                      PZPFrame *frames, unsigned int max_frames);
+
 // Read the embedded metadata blob (caller frees with pzp_free).
 unsigned char *pzp_container_read_metadata(const char *filename,
                                             unsigned int *bytes_out);

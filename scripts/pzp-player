@@ -103,12 +103,8 @@ def load_animation(path: str):
     print(f"  {n} frame(s)  |  loop={'∞' if loop_count == 0 else loop_count}  "
           f"|  delays={raw_delays} ms")
 
-    surfaces = []
-    for i in range(n):
-        arr = PZP.read_frame(path, i)
-        surfaces.append(_make_surface(_to_rgb8(arr)))
-        print(f"\r  loading frame {i + 1}/{n} …", end="", flush=True)
-    print()
+    print(f"  loading {n} frame(s) …", flush=True)
+    surfaces = [_make_surface(_to_rgb8(arr)) for arr in PZP.read_frames(path)]
 
     delays = [d if d > 0 else DEFAULT_DELAY_MS for d in raw_delays]
 

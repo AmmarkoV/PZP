@@ -123,6 +123,27 @@ _lib.pzp_container_get_frame.argtypes = [
     ctypes.POINTER(ctypes.c_uint), # configuration
 ]
 
+class _PZPFrame(ctypes.Structure):
+    """Mirror of PZPFrame in pzp.h (one decoded container frame)."""
+    _fields_ = [
+        ("pixels",        ctypes.POINTER(ctypes.c_ubyte)),
+        ("width",         ctypes.c_uint),
+        ("height",        ctypes.c_uint),
+        ("bpp_ext",       ctypes.c_uint),
+        ("ch_ext",        ctypes.c_uint),
+        ("bpp_int",       ctypes.c_uint),
+        ("ch_int",        ctypes.c_uint),
+        ("configuration", ctypes.c_uint),
+        ("delay_ms",      ctypes.c_uint),
+    ]
+
+_lib.pzp_container_get_frames.restype  = ctypes.c_uint
+_lib.pzp_container_get_frames.argtypes = [
+    ctypes.c_char_p,               # filename
+    ctypes.POINTER(_PZPFrame),     # frames
+    ctypes.c_uint,                 # max_frames
+]
+
 _lib.pzp_container_read_metadata.restype  = ctypes.POINTER(ctypes.c_ubyte)
 _lib.pzp_container_read_metadata.argtypes = [
     ctypes.c_char_p,
@@ -541,11 +562,46 @@ def read_frame(filename: str, index: int = 0, *, return_flags: bool = False):
     if not ptr:
         raise RuntimeError(f"PZP: failed to read frame {index} from '{filename}'")
 
-    w, h, be, ce, bi, ci = (width.value, height.value,
-                             bpp_ext.value, ch_ext.value,
-                             bpp_int.value, ch_int.value)
+    return _frame_result(ptr, width.value, height.value,
+                         bpp_ext.value, ch_ext.value,
+                         bpp_int.value, ch_int.value,
+                         config.value, return_flags)
+
+
+def read_frames(filename: str, *, return_flags: bool = False) -> list:
+    """
+    Decompress every frame of a PZP container in one pass (file read once,
+    each frame decoded once) and return them as a list of read() results.
+    Use this to load an animation: read_frame() in a loop re-decodes, for
+    every delta frame, all frames back to the previous keyframe.
+    """
+    filename_b = filename.encode(sys.getfilesystemencoding())
+    n = _lib.pzp_container_frame_count(filename_b)
+    if n == 0:
+        raise RuntimeError(f"PZP: '{filename}' is not a readable PZP container")
+    frames = (_PZPFrame * n)()
+    if _lib.pzp_container_get_frames(filename_b, frames, n) != n:
+        raise RuntimeError(f"PZP: failed to read the frames of '{filename}'")
+
+    out = []
+    try:
+        for f in frames:
+            addr = ctypes.cast(f.pixels, ctypes.c_void_p).value
+            f.pixels = None                  # _frame_result() owns (and frees) it now
+            out.append(_frame_result(addr, f.width, f.height,
+                                     f.bpp_ext, f.ch_ext, f.bpp_int, f.ch_int,
+                                     f.configuration, return_flags))
+    finally:
+        for f in frames:
+            if f.pixels:
+                _lib.pzp_free(f.pixels)
+    return out
+
+
+def _frame_result(ptr, w, h, be, ce, bi, ci, flags, return_flags):
+    """Copy one decoded frame (pointer or address) out of C memory, free it, and shape it like read()."""
     n_bytes = w * h * ci * (bi // 8)
-    addr    = ctypes.cast(ptr, ctypes.c_void_p).value
+    addr    = ptr if isinstance(ptr, int) else ctypes.cast(ptr, ctypes.c_void_p).value
     c_arr   = (ctypes.c_ubyte * n_bytes).from_address(addr)
 
     if _NUMPY:
@@ -553,9 +609,8 @@ def read_frame(filename: str, index: int = 0, *, return_flags: bool = False):
     else:
         raw_buf = bytes(c_arr)
 
-    _lib.pzp_free(ptr)
+    _lib.pzp_free(addr)
 
-    flags = config.value
     if _NUMPY:
         if be == 8:
             arr = raw_buf.reshape(h, w, ce)

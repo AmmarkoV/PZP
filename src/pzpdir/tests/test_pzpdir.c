@@ -563,6 +563,31 @@ static void test_misc(void)
     CHECK( (b == NULL) && (pzpd_last_error_code() == PZPD_E_FORMAT), "manifest with a wrapping hash_count refused (code %d)", pzpd_last_error_code());
     if (b != NULL) { pzpd_find(b, "zz-not-there", 12, NULL); pzpd_close(b); }   // without the check: out-of-bounds read here
 
+    // A shard whose (re-sealed) superblocks point the metadata section past the end of the file (meta_offset
+    // sits at byte 1696): refused at open, not read out of bounds by verify / compact / table edits
+    {
+        int in = open(shard, O_RDONLY), out = open(crafted, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        struct stat st;
+        fstat(in, &st);
+        unsigned char *all = (unsigned char *) malloc((size_t) st.st_size);
+        CHECK(read(in, all, (size_t) st.st_size) == st.st_size, "copy shard");
+        for (int copy = 0; copy < 2; copy++)
+        {
+            unsigned char *sb = all + ((copy == 0) ? 0 : (size_t) st.st_size - 4096);
+            uint64_t mo = 1ull << 40;
+            memcpy(sb + 1696, &mo, 8);
+            uint64_t cs = XXH64(sb, 1728, 0);
+            memcpy(sb + 1728, &cs, 8);
+        }
+        CHECK(write(out, all, (size_t) st.st_size) == st.st_size, "write crafted shard");
+        free(all);
+        close(in);
+        close(out);
+    }
+    b = pzpd_open(crafted, 0);
+    CHECK( (b == NULL) && (pzpd_last_error_code() == PZPD_E_FORMAT), "shard with a metadata section outside the file refused (code %d)", pzpd_last_error_code());
+    if (b != NULL) { pzpd_verify_shard(b, 0); pzpd_close(b); }   // without the check: out-of-bounds read here
+
     // A finish that fails while writing the last shard's index (here: the file size limit, as a full disk
     // would) closes that shard's descriptor and removes its .tmp file, as pzpd_writer_abort() does
     {
@@ -686,6 +711,12 @@ static void test_tables(void)
     CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, " -1", 3) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: \" -1\" rejected");
     CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, "\t-5", 3) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: tab then -5 rejected");
     CHECK(pzpd_writer_rows_csv(wu, (unsigned) tu, " 7", 2), "u64: \" 7\" still accepted");
+    // Around the digits-only fast path of integer fields: same answers as strtoull / strtoll
+    CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, "-0", 2) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: \"-0\" rejected");
+    CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, "-", 1), "u64: \"-\" rejected");
+    CHECK(pzpd_writer_rows_csv(wu, (unsigned) tu, "123456789012345678\n18446744073709551615\n+3\n007", 45), "u64: 18 / 20 digits, '+', leading zeros accepted");
+    CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, "18446744073709551616", 20) && strstr(pzpd_last_error(), "out of range") != NULL, "u64: 2^64 rejected");
+    CHECK(!pzpd_writer_rows_csv(wu, (unsigned) tu, "7 ", 2) && strstr(pzpd_last_error(), "not a valid") != NULL, "u64: trailing space rejected");
     pzpd_writer_abort(wu);
 
     //--- read back ------------------------------------------------------------------------
@@ -2114,6 +2145,14 @@ static void test_words(void)
     CHECK(!pzpd_words_open(a, "descriptions", "nope", NULL, 0, 0, &c) && (pzpd_last_error_code() == PZPD_E_NOTFOUND), "no such word index");
     pzpd_words_close(m);
     pzpd_close(a);
+
+    // One source value more than a shard's word index allows: refused cleanly (the builder overran a stack array)
+    static char srcRows[PZPD_MAX_WORD_SOURCES + 1][32];
+    const char *rowsC[PZPD_MAX_WORD_SOURCES + 1];
+    for (int i = 0; i <= PZPD_MAX_WORD_SOURCES; i++) { snprintf(srcRows[i], sizeof(srcRows[i]), "s%d,word\n", i); rowsC[i] = srcRows[i]; }
+    char p3[1100];
+    snprintf(p3, sizeof(p3), "%s/words3.pzpd", dir);
+    CHECK(!words_archive(p3, NULL, PZPD_MAX_WORD_SOURCES + 1, rowsC, 0) && (pzpd_last_error_code() == PZPD_E_ARG), "%d source values in one shard are refused (%s)", PZPD_MAX_WORD_SOURCES + 1, pzpd_last_error());
 }
 
 int main(void)

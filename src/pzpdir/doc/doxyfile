@@ -8,20 +8,20 @@ PROJECT_NAME           = PZPDIR
 PROJECT_BRIEF          = "PZP directory archives: many files grouped into records, in a few self-contained shards"
 OUTPUT_DIRECTORY       = $(DOXYGEN_OUTPUT)
 INPUT                  = $(DOXYGEN_INPUT)/pzpdir.h \
-                         $(DOXYGEN_INPUT)/pzpdir.c \
-                         $(DOXYGEN_INPUT)/pzpdir_format.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_detect.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_tables.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_words_build.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_writer.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_reader.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_handle.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_words_read.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_collections.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_prefetch.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_recovery.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_edit.inc.c \
-                         $(DOXYGEN_INPUT)/pzpdir_groups.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_internal.h \
+                         $(DOXYGEN_INPUT)/pzpdir_format.c \
+                         $(DOXYGEN_INPUT)/pzpdir_detect.c \
+                         $(DOXYGEN_INPUT)/pzpdir_tables.c \
+                         $(DOXYGEN_INPUT)/pzpdir_words_build.c \
+                         $(DOXYGEN_INPUT)/pzpdir_writer.c \
+                         $(DOXYGEN_INPUT)/pzpdir_reader.c \
+                         $(DOXYGEN_INPUT)/pzpdir_handle.c \
+                         $(DOXYGEN_INPUT)/pzpdir_words_read.c \
+                         $(DOXYGEN_INPUT)/pzpdir_collections.c \
+                         $(DOXYGEN_INPUT)/pzpdir_prefetch.c \
+                         $(DOXYGEN_INPUT)/pzpdir_recovery.c \
+                         $(DOXYGEN_INPUT)/pzpdir_edit.c \
+                         $(DOXYGEN_INPUT)/pzpdir_groups.c \
                          $(DOXYGEN_INPUT)/pzpdir_cli.c \
                          $(DOXYGEN_INPUT)/doc/pzpdir.md
 FILE_PATTERNS          = *.c *.h *.md
@@ -31,6 +31,10 @@ OPTIMIZE_OUTPUT_FOR_C  = YES
 JAVADOC_AUTOBRIEF      = NO
 EXTRACT_ALL            = NO
 EXTRACT_STATIC         = NO
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = PZPD_INTERNAL=static "__attribute__(x)="
 EXTRACT_LOCAL_CLASSES  = YES
 WARN_IF_UNDOCUMENTED   = YES
 WARN_IF_DOC_ERROR      = YES

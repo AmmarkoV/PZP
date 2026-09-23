@@ -14,11 +14,11 @@ dated revisions, recorded in the changelog below.
   - storage awareness (MAP mode for RAM disks, AUTO per shard);
   - typed annotation tables (`joints`, `image`, `persons` u16, `descriptions` as text, `descriptor_<model>` with schema-defined D) replacing `.db` and descriptor files, with cheap table edits;
   - DataLoader access plan;
-  - packaging as `pzpdir.h` + `pzpdir.c` (`libpzpdir.so` / `.a`, CLI `pzpdir_cli.c`), vendored xxHash;
+  - packaging as `pzpdir.h` + `pzpdir.c` (`libpzpdir.so` / `.a`, CLI `pzpdir_cli.c`), vendored xxHash (since 2026-09-23: `pzpdir_*.c` files, see §5);
   - stream/table names ≤ 23 bytes;
   - collection write/refresh C API, `find_all` returns the total match count.
 - **v0.4 revision 1 (2026-09-21):** compile switch `PZPDIR_WITH_PZP` (default 1). With 0,
-  `pzpdir.c` doesn't include `pzp.h`. `pzpd_read_pzp()` is then unavailable, and PZP
+  the library doesn't include `pzp.h`. `pzpd_read_pzp()` is then unavailable, and PZP
   header probing is skipped when writing (the metadata comes from `blob_ex` or stays
   invalid). Reading is unaffected, since FourCC metadata is stored at pack time.
   Needed by the first client (the DataLoader), which vendors its own `pzp.h`.
@@ -38,7 +38,7 @@ dated revisions, recorded in the changelog below.
     hash. Superblock and manifest `*_offset` fields point at the section **data**, right after
     its header. The shard `index_checksum` covers the data of the record, blob, hash, heap and meta
     sections, in that order.
-  - **Exact byte layouts** are defined, and size-checked with `_Static_assert`, in `pzpdir.c` (its part `pzpdir_format.inc.c`):
+  - **Exact byte layouts** are defined, and size-checked with `_Static_assert`, in `pzpdir_internal.h`:
     - shard superblock: adds `hash_count` and `file_bytes`; `sb_checksum` at byte 1728;
     - record header: 40 bytes, followed by one 40-byte descriptor per blob
       `{stream, meta_flags, bits, format, rel_offset, size, width, height, channels, frames, name_len, xxh32}`,
@@ -975,16 +975,18 @@ Each sub-index has these parts:
   and `fwd_index[records] == postings` are checked. Each lookup checks the ranges it uses, and a full check
   (sortedness, and forward = transpose of postings) runs in `verify`.
 
-## 5. C API (`pzpdir.h` + `pzpdir.c`; built as `libpzpdir.so` / `libpzpdir.a`)
+## 5. C API (`pzpdir.h`; built as `libpzpdir.so` / `libpzpdir.a`)
 
-Packaging: `pzpdir.h` holds only declarations, types and constants. The whole
-implementation (format, writer, reader, tables, prefetcher with pthreads) is in
-`pzpdir.c`, which builds into `libpzpdir.so` (Python, DataLoader) and
-`libpzpdir.a` (static linking). Consumers link the library or vendor both files.
-`pzpdir.c` is split into parts, `pzpdir_*.inc.c` (format, detection, tables, word index,
-writer, reader, handle, collections, prefetcher, recovery, edits, groups), which it `#include`s
-in order: it stays one translation unit, so clients still compile only `pzpdir.c` (the parts
-must sit next to it) and every internal function stays `static`.
+Packaging: `pzpdir.h` holds only declarations, types and constants. The implementation
+(format, writer, reader, tables, prefetcher with pthreads) is a set of ordinary translation
+units, `pzpdir_*.c` (format, detection, tables, word index build / read, writer, reader, handle,
+collections, prefetcher, recovery, edits, groups), which share the on-disk structures and
+internal declarations through `pzpdir_internal.h`. They build into `libpzpdir.so` (Python,
+DataLoader) and `libpzpdir.a` (static linking). Consumers include `pzpdir.h` and link the
+library. Internal functions shared between files are marked `PZPD_INTERNAL` (hidden
+visibility): `libpzpdir.so` exports the public `pzpd_*` API only. The DataLoader vendors the
+sources and builds its own `pzpdir/libpzpdir.so` with its flags, linked with
+`DT_RPATH $ORIGIN/pzpdir` (searched before `LD_LIBRARY_PATH`).
 Hashing uses the official single-header **xxHash** (BSD-2), vendored as
 `third_party/xxhash.h`: XXH32 for blobs and record headers, XXH64 for index
 sections, superblocks and key hashes. There is no new system dependency beyond zstd / lz4.

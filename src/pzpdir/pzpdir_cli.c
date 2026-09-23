@@ -1458,7 +1458,7 @@ static int cmd_groups(const char *const *paths, int np)
             continue;
         }
         pzpd_blob_info bi;
-        pzpd_blob_info_get(a, i, 0, &bi);
+        if (!pzpd_blob_info_get(a, i, 0, &bi)) { fprintf(stderr, CLI_RED "record %llu: %s" CLI_NORMAL "\n", (unsigned long long) i, pzpd_last_error()); pzpd_close(a); return 1; }
         if (g.name_len > 0) { put_escaped(stdout, g.name, g.name_len, 1); } else { printf("(group %u)", g.id); }
         printf("\t%llu\t%u\tshard %u\n", (unsigned long long) g.first_ordinal, g.frames, bi.shard);
         groups++;

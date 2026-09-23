@@ -23,8 +23,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *  @author Ammar Qammaz (AmmarkoV)
  *
  *  The format is specified in doc/pzpd-spec.md (v0.4). This header is the public API; the
- *  implementation lives in pzpdir.c, which builds into libpzpdir.so / libpzpdir.a, or is
- *  vendored as-is into a program's own build (the DataLoader does this).
+ *  implementation is the pzpdir_*.c files (internal declarations in pzpdir_internal.h), built
+ *  into libpzpdir.so / libpzpdir.a. Programs include this header and link the library (the
+ *  DataLoader builds libpzpdir.so from vendored sources and links it).
  *
  *  @section pzpd_overview Overview
  *  - An **archive** is a small manifest `<name>.pzpd` plus shards `<name>.NNNNN.pzpd`

@@ -1,6 +1,8 @@
-/** @file pzpdir_detect.inc.c
- *  @brief pzpdir.c, part 2 of 13: format detection (header-only probes).
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_detect.c
+ *  @brief PZPD library: format detection (header-only probes).
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Format detection (header-only probes)

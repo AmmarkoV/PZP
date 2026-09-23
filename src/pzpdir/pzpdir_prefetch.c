@@ -1,6 +1,8 @@
-/** @file pzpdir_prefetch.inc.c
- *  @brief pzpdir.c, part 10 of 13: prefetcher.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_prefetch.c
+ *  @brief PZPD library: prefetcher.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Prefetcher (spec §6). Each shard gets one of three modes:
@@ -664,7 +666,7 @@ static uint64_t pzpd_member_bytes(const struct pzpd_member *mb)
 {
     const struct pzpd_archive *ar = mb->arch;
     if (ar == NULL) { return 0; }
-    if (ar->standalone) { return ar->shards[0].sb.file_bytes; }   // loaded by arch_open()
+    if (ar->standalone) { return ar->shards[0].sb.file_bytes; }   // loaded by pzpd_arch_open()
     uint64_t bytes = 0;
     for (unsigned k = 0; k < ar->shard_count; k++) { bytes += ar->mshards[k].file_bytes; }
     return bytes;

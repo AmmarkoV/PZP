@@ -1,6 +1,8 @@
-/** @file pzpdir_collections.inc.c
- *  @brief pzpdir.c, part 9 of 13: collection files, storage kind.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_collections.c
+ *  @brief PZPD library: collection files, storage kind.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Collection files

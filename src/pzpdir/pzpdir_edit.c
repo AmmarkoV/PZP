@@ -1,6 +1,8 @@
-/** @file pzpdir_edit.inc.c
- *  @brief pzpdir.c, part 12 of 13: edits: tables, streams, compaction.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_edit.c
+ *  @brief PZPD library: edits: tables, streams, compaction.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Edits (spec §7): table edits and compaction append a new superblock generation to each shard;
@@ -156,9 +158,9 @@ static size_t pzpd_ekey_find(const struct pzpd_ekey *k, size_t n, uint64_t h)
 /** @brief Open an archive for editing: its manifest (shards not loaded), which must not be a lone shard. */
 static struct pzpd_archive *pzpd_edit_open(const char *manifest)
 {
-    struct pzpd_archive *m = arch_open(manifest, 0);
+    struct pzpd_archive *m = pzpd_arch_open(manifest, 0);
     if (m == NULL) { return NULL; }
-    if (m->standalone) { arch_close(m); pzpd_set_error(PZPD_E_ARG, "%s is a shard; edits take the archive's manifest", manifest); return NULL; }
+    if (m->standalone) { pzpd_arch_close(m); pzpd_set_error(PZPD_E_ARG, "%s is a shard; edits take the archive's manifest", manifest); return NULL; }
     return m;
 }
 
@@ -230,18 +232,24 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
     for (size_t i = 0; ok && (i < n); i++) { keys[i].hash = XXH64(rows[i].key, rows[i].key_len, 0); keys[i].idx = i; }
     if (ok && (n > 0)) { qsort(keys, n, sizeof(struct pzpd_ekey), pzpd_cmp_ekey); }
 
-    // Every row must parse before any shard is touched
-    struct pzpd_buf grows = {0}, gheap = {0};
+    // Every row must parse before any shard is touched. The parsed rows are kept (entry i's are rows
+    // pfirst[i] .. pfirst[i + 1] of prows, strings in pheap), so the shard pass doesn't parse them again
+    struct pzpd_buf grows = {0}, gheap = {0}, prows = {0}, pheap = {0};
+    uint64_t *pfirst = (n > 0) ? (uint64_t *) malloc((n + 1) * sizeof(uint64_t)) : NULL;
+    if ( (n > 0) && (pfirst == NULL) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+    uint64_t parsed = 0;
     for (size_t i = 0; ok && (op != PZPD_EDIT_DROP) && (i < n); i++)
     {
-        grows.len = gheap.len = 0;
-        if (pzpd_csv_parse(&nsc, rows[i].csv, rows[i].csv_len, &grows, &gheap) < 0)
+        pfirst[i] = parsed;
+        int64_t got = pzpd_csv_parse(&nsc, rows[i].csv, rows[i].csv_len, &prows, &pheap);
+        if (got < 0)
         {
             pzpd_error_wrap(PZPD_E_ARG, "rows of \"%.*s\" (entry %zu)", (int)(rows[i].key_len > 200 ? 200 : rows[i].key_len), rows[i].key, i + 1);
             ok = 0;
         }
+        else { parsed += (uint64_t) got; }
     }
-    grows.len = gheap.len = 0;
+    if (pfirst != NULL) { pfirst[n] = parsed; }
 
     // Global rows are parsed once
     int64_t gn = 0;
@@ -259,7 +267,7 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
     struct pzpd_buf secbuf = {0}, trows = {0}, theap = {0}, tindex = {0};
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
-        struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
+        struct pzpd_archive *sa = pzpd_arch_open(m->shards[k].path, 0);
         if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         struct pzpd_rshard *s = &sa->shards[0];
         int so = -1;
@@ -269,7 +277,7 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
         if ( !done && (op != PZPD_EDIT_ADD) && (so < 0) ) { pzpd_set_error(PZPD_E_FORMAT, "%s lacks table %s", s->path, table); ok = 0; }
         if ( !done && (op == PZPD_EDIT_ADD) && (so >= 0) ) { pzpd_set_error(PZPD_E_DUPLICATE, "%s already has a different table %s", s->path, table); ok = 0; }
         if (ok && done) { ok = pzpd_finish_flip(s); }
-        if (!ok || done) { arch_close(sa); continue; }
+        if (!ok || done) { pzpd_arch_close(sa); continue; }
 
         // The new section (record tables: rows of every record from the input, or kept / empty)
         secbuf.len = trows.len = theap.len = tindex.len = 0;
@@ -281,7 +289,7 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
                 uint32_t start = (uint32_t) nrows;
                 ok = pzpd_buf_append(&tindex, &start, 4);
                 size_t kl = 0;
-                const char *key = arch_record_key(sa, i, &kl);
+                const char *key = pzpd_arch_record_key(sa, i, &kl);
                 if (key == NULL) { ok = 0; break; }
                 uint64_t h = XXH64(key, kl, 0);
                 int any = 0;
@@ -291,18 +299,15 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
                     if ( (r->key_len != kl) || memcmp(r->key, key, kl) ) { continue; }
                     matched[keys[e].idx] = 1;
                     any = 1;
-                    int64_t got = pzpd_csv_parse(&nsc, r->csv, r->csv_len, &trows, &theap);
-                    if (got < 0)
-                    {
-                        pzpd_error_wrap(PZPD_E_ARG, "rows of \"%.*s\"", (int)(kl > 200 ? 200 : kl), key);
-                        ok = 0;
-                    }
-                    else { nrows += (uint64_t) got; }
+                    uint64_t got = pfirst[keys[e].idx + 1] - pfirst[keys[e].idx];
+                    if (got > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows in one shard", table); ok = 0; break; }
+                    if (got > 0) { ok = pzpd_stage_rows(&nsc, prows.data + pfirst[keys[e].idx] * nsc.stride, (uint32_t) got, pheap.data, pheap.len, &trows, &theap); }
+                    nrows += got;
                 }
                 if (ok && !any && (flags & PZPD_EDIT_KEEP_MISSING))
                 {
                     const void *orows = NULL;
-                    uint32_t on = arch_table_rows(sa, i, (unsigned) so, &orows);
+                    uint32_t on = pzpd_arch_table_rows(sa, i, (unsigned) so, &orows);
                     if ( (on == 0) && (pzpd_errorCode != PZPD_OK) ) { ok = 0; }
                     else if (on > 0) { ok = pzpd_stage_rows(&nsc, orows, on, s->tv[so].heap, s->tv[so].heap_bytes, &trows, &theap); nrows += on; }
                 }
@@ -383,7 +388,7 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
             }
         }
         for (unsigned j = 0; j < PZPD_MAX_WORD_INDEXES; j++) { pzpd_buf_free(&wbufs[j]); }
-        arch_close(sa);
+        pzpd_arch_close(sa);
     }
     if (ok) { ok = pzpd_edit_finish(manifest, m); }
     uint64_t um = 0;
@@ -392,10 +397,11 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
     struct pzpd_saved_error e;
     pzpd_error_save(&e);
     pzpd_buf_free(&secbuf); pzpd_buf_free(&trows); pzpd_buf_free(&theap); pzpd_buf_free(&tindex);
-    pzpd_buf_free(&grows); pzpd_buf_free(&gheap);
+    pzpd_buf_free(&grows); pzpd_buf_free(&gheap); pzpd_buf_free(&prows); pzpd_buf_free(&pheap);
+    free(pfirst);
     free(keys);
     free(matched);
-    arch_close(m);
+    pzpd_arch_close(m);
     if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
@@ -412,7 +418,7 @@ int pzpd_edit_words(const char *manifest, unsigned op, const char *table, const 
     struct pzpd_buf wbuf = {0};
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
-        struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
+        struct pzpd_archive *sa = pzpd_arch_open(m->shards[k].path, 0);
         if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         struct pzpd_rshard *s = &sa->shards[0];
         unsigned nw = s->words_bad ? 0 : pzpd_words_used(s->sb.words);   // a damaged directory: only the named index is rebuilt
@@ -429,7 +435,7 @@ int pzpd_edit_words(const char *manifest, unsigned op, const char *table, const 
         }
         if ( ok && !done && (op != PZPD_EDIT_DROP) && (j < 0) && (nw >= PZPD_MAX_WORD_INDEXES) ) { pzpd_set_error(PZPD_E_ARG, "more than %d word indexes", PZPD_MAX_WORD_INDEXES); ok = 0; }
         if (ok && done) { ok = pzpd_finish_flip(s); }
-        if (!ok || done) { arch_close(sa); continue; }
+        if (!ok || done) { pzpd_arch_close(sa); continue; }
 
         // The new directory: kept sections stay where they are
         struct pzpd_wslot ws[PZPD_MAX_WORD_INDEXES];
@@ -474,13 +480,13 @@ int pzpd_edit_words(const char *manifest, unsigned op, const char *table, const 
                 close(fd);
             }
         }
-        arch_close(sa);
+        pzpd_arch_close(sa);
     }
     if (ok) { ok = pzpd_edit_finish(manifest, m); }
     struct pzpd_saved_error e;
     pzpd_error_save(&e);
     pzpd_buf_free(&wbuf);
-    arch_close(m);
+    pzpd_arch_close(m);
     if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
@@ -494,10 +500,10 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed)
     int ok = 1, changed = 0;
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
-        struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
+        struct pzpd_archive *sa = pzpd_arch_open(m->shards[k].path, 0);
         if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         struct pzpd_rshard *s = &sa->shards[0];
-        if (!pzpd_finish_flip(s)) { arch_close(sa); ok = 0; break; }
+        if (!pzpd_finish_flip(s)) { pzpd_arch_close(sa); ok = 0; break; }
         struct pzpd_disk_superblock sb = s->sb;
         if (s->map_len > sb.file_bytes)
         {
@@ -507,7 +513,7 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed)
             if (fd >= 0) { close(fd); }
             if (ok && (reclaimed != NULL)) { *reclaimed += s->map_len - sb.file_bytes; }
             changed = 1;
-            if (!ok) { arch_close(sa); break; }
+            if (!ok) { pzpd_arch_close(sa); break; }
         }
         // Where the tables should start: after the last non-table index section
         uint64_t idxEnd = sb.meta_offset + sb.meta_bytes;
@@ -567,12 +573,12 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed)
         }
         for (unsigned t = 0; t < T; t++) { free(copies[t]); }
         for (unsigned j = 0; j < PZPD_MAX_WORD_INDEXES; j++) { free(wcopies[j]); }
-        arch_close(sa);
+        pzpd_arch_close(sa);
     }
     if (ok && changed) { ok = pzpd_edit_finish(manifest, m); }
     struct pzpd_saved_error e;
     pzpd_error_save(&e);
-    arch_close(m);
+    pzpd_arch_close(m);
     if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
@@ -644,7 +650,7 @@ static int pzpd_rewrite_shard(struct pzpd_archive *sa, unsigned newS, char names
     {
         const struct pzpd_disk_record *r = &s->rtab[i];
         size_t kl = 0;
-        const char *key = arch_record_key(sa, i, &kl);
+        const char *key = pzpd_arch_record_key(sa, i, &kl);
         ok = (key != NULL) && pzpd_writer_begin(w, key, kl, r->group, r->frame);
         const pzpd_edit_blob *src = NULL;
         if (ok && (n > 0))
@@ -670,7 +676,7 @@ static int pzpd_rewrite_shard(struct pzpd_archive *sa, unsigned newS, char names
         {
             if (sa->tables[t].flags & PZPD_TABLE_GLOBAL) { continue; }
             const void *rows = NULL;
-            uint32_t cnt = arch_table_rows(sa, i, t, &rows);
+            uint32_t cnt = pzpd_arch_table_rows(sa, i, t, &rows);
             if ( (cnt == 0) && (pzpd_errorCode != PZPD_OK) ) { ok = 0; break; }
             if (cnt > 0) { ok = pzpd_writer_rows(w, t, rows, cnt, s->tv[t].heap, s->tv[t].heap_bytes); }
         }
@@ -683,11 +689,11 @@ static int pzpd_rewrite_shard(struct pzpd_archive *sa, unsigned newS, char names
     // Verify the new shard completely before it replaces the old one
     if (ok)
     {
-        struct pzpd_archive *v = arch_open(final, 0);
-        ok = (v != NULL) && (v->shards[0].sb.record_count == sb.record_count) && arch_verify_shard(v, 0);
-        for (uint64_t i = 0; ok && (i < sb.record_count); i++) { ok = arch_verify_record(v, i, 1); }
+        struct pzpd_archive *v = pzpd_arch_open(final, 0);
+        ok = (v != NULL) && (v->shards[0].sb.record_count == sb.record_count) && pzpd_arch_verify_shard(v, 0);
+        for (uint64_t i = 0; ok && (i < sb.record_count); i++) { ok = pzpd_arch_verify_record(v, i, 1); }
         if ( (v != NULL) && !ok && (pzpd_errorCode == PZPD_OK) ) { pzpd_set_error(PZPD_E_FORMAT, "%s: the rewritten shard failed verification", final); }
-        if (v != NULL) { arch_close(v); }
+        if (v != NULL) { pzpd_arch_close(v); }
     }
     if (ok) { pzpd_test_crash("rewrite"); }                    // the new shard is written, the old one not replaced yet
     if (ok && (rename(final, s->path) != 0)) { pzpd_set_error(PZPD_E_IO, "rename %s -> %s: %s", final, s->path, strerror(errno)); ok = 0; }
@@ -768,7 +774,7 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
     if (todo == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
-        struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
+        struct pzpd_archive *sa = pzpd_arch_open(m->shards[k].path, 0);
         if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         int has = 0;
         for (unsigned u = 0; u < sa->S; u++) { if (!strcmp(sa->streams[u], stream)) { has = 1; } }
@@ -788,7 +794,7 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
                 const pzpd_edit_blob *bl = &blobs[nk[j].idx];
                 if (!pzpd_match(sa, he->local_ordinal, he->stream, PZPD_KIND_NAME, bl->name, bl->name_len)) { continue; }
                 size_t kl = 0;
-                const char *key = arch_record_key(sa, he->local_ordinal, &kl);
+                const char *key = pzpd_arch_record_key(sa, he->local_ordinal, &kl);
                 // The name may already be the edited stream's blob of the same record (replace, or a resumed add)
                 int same = (key != NULL) && (kl == bl->key_len) && !memcmp(key, bl->key, kl) && (he->stream < sa->S) && !strcmp(sa->streams[he->stream], stream);
                 if (!same) { pzpd_set_error(PZPD_E_DUPLICATE, "name \"%.*s\" already exists in the archive", (int)(bl->name_len > 200 ? 200 : bl->name_len), bl->name); ok = 0; }
@@ -804,7 +810,7 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
             for (uint64_t i = 0; ok && (i < s->sb.record_count); i++)
             {
                 size_t kl = 0;
-                const char *key = arch_record_key(sa, i, &kl);
+                const char *key = pzpd_arch_record_key(sa, i, &kl);
                 int gets = 0;
                 if ( (key != NULL) && (n > 0) )
                 {
@@ -826,17 +832,17 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
                 if (left == 0) { pzpd_set_error(PZPD_E_ARG, "record \"%.*s\" would be left without blobs", (int)(kl > 200 ? 200 : kl), key ? key : ""); ok = 0; }
             }
         }
-        arch_close(sa);
+        pzpd_arch_close(sa);
     }
 
     // The rewrite, shard by shard
     for (unsigned k = 0; ok && (k < m->shard_count); k++)
     {
         if (!todo[k]) { continue; }
-        struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
+        struct pzpd_archive *sa = pzpd_arch_open(m->shards[k].path, 0);
         if (sa == NULL) { ok = 0; break; }
         ok = pzpd_rewrite_shard(sa, newS, names, map, target, blobs, n, keys, matched, flags);
-        arch_close(sa);
+        pzpd_arch_close(sa);
         if (ok) { pzpd_test_crash("shard"); }                 // between shards
     }
     if (ok) { ok = pzpd_edit_finish(manifest, m); }
@@ -849,7 +855,7 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
     free(nk);
     free(matched);
     free(todo);
-    arch_close(m);
+    pzpd_arch_close(m);
     if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }

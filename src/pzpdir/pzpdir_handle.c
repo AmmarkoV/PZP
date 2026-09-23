@@ -1,80 +1,14 @@
-/** @file pzpdir_handle.inc.c
- *  @brief pzpdir.c, part 7 of 13: collections behind one handle: routing, tables through the handle.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_handle.c
+ *  @brief PZPD library: collections behind one handle: routing, tables through the handle.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Collections: one or several archives behind one handle. Every public read call goes through
 // here: an ordinal is routed to its member archive, stream ids are mapped between the merged
-// ("union") stream list and the member's own, and the arch_* functions above do the work.
+// ("union") stream list and the member's own, and the pzpd_arch_* functions above do the work.
 //-----------------------------------------------------------------------------------------------
-
-#pragma pack(push,1)
-/** @brief Collection file header: a 4 KiB slot at offset 0 of the collection file. */
-struct pzpd_disk_collection
-{
-    char     magic[8];          ///< PZPD_MAGIC_COLL
-    uint32_t version;           ///< PZPD_FORMAT_VERSION
-    uint32_t flags;             ///< Reserved, 0
-    uint64_t total_records;     ///< Sum of the members' record counts
-    uint32_t member_count;      ///< Members
-    uint32_t stream_count;      ///< Merged streams
-    struct pzpd_disk_stream streams[PZPD_MAX_STREAMS]; ///< Merged stream names (first-seen order)
-    uint64_t members_offset;    ///< Member table data
-    uint64_t heap_offset;       ///< Paths and aliases
-    uint64_t heap_bytes;        ///< Size of the heap
-    uint64_t remap_offset;      ///< Stream remap tables (member_count × PZPD_MAX_STREAMS bytes)
-    uint64_t file_bytes;        ///< Collection file size
-    uint64_t index_checksum;    ///< XXH64 of the member, heap and remap section data
-    uint64_t sb_checksum;       ///< XXH64 of every byte of this structure before this field
-};
-
-/** @brief Collection member entry (56 bytes). */
-struct pzpd_disk_member
-{
-    uint64_t first_ordinal;     ///< First ordinal of the member in the collection
-    uint64_t record_count;      ///< Records of the member when the collection was written
-    uint8_t  archive_uuid[16];  ///< Identity of the member archive when the collection was written
-    uint32_t path_offset;       ///< Member path in the heap (relative to the collection file's directory, or absolute)
-    uint32_t path_len;          ///< Path length
-    uint32_t alias_offset;      ///< Alias in the heap
-    uint32_t alias_len;         ///< Alias length
-    uint32_t flags;             ///< bit0: path is absolute
-    uint32_t pad;               ///< 0
-};
-#pragma pack(pop)
-
-_Static_assert(sizeof(struct pzpd_disk_collection) <= PZPD_BLOCK, "collection header fits its slot");
-_Static_assert(sizeof(struct pzpd_disk_member) == 56, "collection member entry");
-
-/** @brief One member of an open handle. */
-struct pzpd_member
-{
-    char    *alias;                          ///< Member name
-    char    *path;                           ///< Path the archive was opened from
-    struct pzpd_archive *arch;               ///< The open archive, NULL when missing
-    char     error[512];                     ///< Why it is missing
-    uint64_t first;                          ///< First ordinal over the whole handle
-    uint64_t count;                          ///< Records (from the archive, or the collection file when missing)
-    unsigned shard_base;                     ///< Index of its shard 0 among all members' shards
-    unsigned shards;                         ///< Its shard count (0 when missing)
-    int      to_member[PZPD_MAX_STREAMS];    ///< Merged stream -> member stream, -1 if the member lacks it
-    int      to_union[PZPD_MAX_STREAMS];     ///< Member stream -> merged stream
-    int      to_mtable[PZPD_MAX_TABLES];     ///< Merged table -> member table, -1 if the member lacks it
-};
-
-/** @brief Public handle: members plus the merged stream list. A single archive is one member. */
-struct pzpd
-{
-    unsigned flags;                          ///< Open flags
-    unsigned S;                              ///< Merged stream count
-    char     streams[PZPD_MAX_STREAMS][24];  ///< Merged stream names
-    uint64_t total;                          ///< Records over all members
-    unsigned member_count;                   ///< Members
-    struct pzpd_member *m;                   ///< Members, in ordinal order
-    unsigned shard_total;                    ///< Shards over all members
-    unsigned T;                              ///< Merged tables
-    const struct pzpd_tschema *tables[PZPD_MAX_TABLES]; ///< Their schemas (owned by the first member that has each)
-};
 
 /** @brief Merge a member's tables by name; a same-named table must have the same schema.
  *  @return 1 on success, 0 on failure (error set). */
@@ -187,7 +121,7 @@ void pzpd_close(pzpd *a)
     if (a == NULL) { return; }
     for (unsigned i = 0; (a->m != NULL) && (i < a->member_count); i++)
     {
-        arch_close(a->m[i].arch);
+        pzpd_arch_close(a->m[i].arch);
         free(a->m[i].alias);
         free(a->m[i].path);
     }
@@ -207,7 +141,7 @@ pzpd *pzpd_open_many(const char *const *paths, const char *const *aliases, unsig
         mb->path  = strdup(paths[i]);
         mb->alias = ( (aliases != NULL) && (aliases[i] != NULL) ) ? strdup(aliases[i]) : pzpd_default_alias(paths[i]);
         if ( (mb->path == NULL) || (mb->alias == NULL) ) { pzpd_close(a); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
-        mb->arch = arch_open(paths[i], flags & ~PZPD_O_ALLOW_MISSING);   // VERIFY, HUGEPAGE, POPULATE act per archive
+        mb->arch = pzpd_arch_open(paths[i], flags & ~PZPD_O_ALLOW_MISSING);   // VERIFY, HUGEPAGE, POPULATE act per archive
         if (mb->arch == NULL)
         {
             snprintf(mb->error, sizeof(mb->error), "%s", pzpd_errorText);
@@ -251,20 +185,9 @@ static unsigned char *pzpd_slurp(const char *path, size_t *len)
     return b;
 }
 
-/** @brief A parsed collection file (pointers into its buffer). */
-struct pzpd_coll_file
-{
-    unsigned char *buf;                        ///< Whole file
-    size_t         len;                        ///< File size
-    struct pzpd_disk_collection h;             ///< Header copy
-    const struct pzpd_disk_member *members;    ///< Member table
-    const char    *heap;                       ///< Paths and aliases
-    const uint8_t *remap;                      ///< Remap tables
-};
-
 /** @brief Read and validate a collection file.
  *  @return 1 on success, 0 on failure (error set; c->buf freed). */
-static int pzpd_coll_parse(const char *path, struct pzpd_coll_file *c)
+PZPD_INTERNAL int pzpd_coll_parse(const char *path, struct pzpd_coll_file *c)
 {
     memset(c, 0, sizeof(*c));
     c->buf = pzpd_slurp(path, &c->len);
@@ -301,7 +224,7 @@ static int pzpd_coll_parse(const char *path, struct pzpd_coll_file *c)
 }
 
 /** @brief Copy a heap string into a new NUL-terminated buffer. */
-static char *pzpd_heap_str(const char *heap, uint32_t off, uint32_t len)
+PZPD_INTERNAL char *pzpd_heap_str(const char *heap, uint32_t off, uint32_t len)
 {
     char *r = (char *) malloc((size_t) len + 1);
     if (r != NULL) { memcpy(r, heap + off, len); r[len] = 0; }
@@ -309,7 +232,7 @@ static char *pzpd_heap_str(const char *heap, uint32_t off, uint32_t len)
 }
 
 /** @brief Resolve a stored member path: absolute as is, relative to the collection file's directory. */
-static char *pzpd_resolve_member_path(const char *collPath, const char *stored)
+PZPD_INTERNAL char *pzpd_resolve_member_path(const char *collPath, const char *stored)
 {
     if (stored[0] == '/') { return strdup(stored); }
     const char *slash = strrchr(collPath, '/');
@@ -342,7 +265,7 @@ static pzpd *pzpd_coll_open(const char *path, unsigned flags)
         mb->count = dm->record_count;
         for (unsigned u = 0; u < PZPD_MAX_STREAMS; u++) { mb->to_member[u] = -1; mb->to_union[u] = -1; }
         for (unsigned u = 0; u < PZPD_MAX_TABLES; u++)  { mb->to_mtable[u] = -1; }
-        mb->arch = arch_open(mb->path, flags & ~PZPD_O_ALLOW_MISSING);
+        mb->arch = pzpd_arch_open(mb->path, flags & ~PZPD_O_ALLOW_MISSING);
         if (mb->arch == NULL)
         {
             // Missing member: its ordinal range stays reserved, only its reads fail
@@ -413,7 +336,7 @@ static int pzpd_member_index(const pzpd *a, uint64_t ordinal)
 
 /** @brief Route an ordinal to its member archive and local ordinal.
  *  @return The archive, or NULL (error set: out of range, or PZPD_E_MEMBER_MISSING). */
-static struct pzpd_archive *pzpd_route(pzpd *a, uint64_t ordinal, unsigned *member, uint64_t *local)
+PZPD_INTERNAL struct pzpd_archive *pzpd_route(pzpd *a, uint64_t ordinal, unsigned *member, uint64_t *local)
 {
     if (a == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL handle"); return NULL; }
     int mi = pzpd_member_index(a, ordinal);
@@ -426,7 +349,7 @@ static struct pzpd_archive *pzpd_route(pzpd *a, uint64_t ordinal, unsigned *memb
 }
 
 /** @brief Map a merged stream mask to a member's own stream mask. */
-static uint32_t pzpd_member_mask(const struct pzpd_member *mb, uint32_t mask)
+PZPD_INTERNAL uint32_t pzpd_member_mask(const struct pzpd_member *mb, uint32_t mask)
 {
     uint32_t r = 0;
     for (unsigned u = 0; u < PZPD_MAX_STREAMS; u++) { if ( (mask & (1u << u)) && (mb->to_member[u] >= 0) ) { r |= 1u << mb->to_member[u]; } }
@@ -488,7 +411,7 @@ int pzpd_shard_info_get(pzpd *a, unsigned shard, pzpd_shard_info *out)
     {
         struct pzpd_member *mb = &a->m[i];
         if ( (mb->arch == NULL) || (shard < mb->shard_base) || (shard >= mb->shard_base + mb->shards) ) { continue; }
-        if (!arch_shard_info_get(mb->arch, shard - mb->shard_base, out)) { return 0; }
+        if (!pzpd_arch_shard_info_get(mb->arch, shard - mb->shard_base, out)) { return 0; }
         out->first_ordinal += mb->first;
         out->member = i;
         return 1;
@@ -509,7 +432,7 @@ int64_t pzpd_find(pzpd *a, const char *key, size_t len, int *stream_out)
             struct pzpd_member *mb = &a->m[i];
             if (mb->arch == NULL) { continue; }
             int ms = -1;
-            int64_t r = arch_find(mb->arch, key, len, &ms, kind);
+            int64_t r = pzpd_arch_find(mb->arch, key, len, &ms, kind);
             if (r >= 0)
             {
                 if (stream_out != NULL) { *stream_out = (ms < 0) ? -1 : mb->to_union[ms]; }
@@ -529,7 +452,7 @@ int64_t pzpd_find_in(pzpd *a, unsigned member, const char *key, size_t len, int 
     struct pzpd_member *mb = &a->m[member];
     if (mb->arch == NULL) { pzpd_set_error(PZPD_E_MEMBER_MISSING, "member \"%s\" is unavailable: %s", mb->alias, mb->error); return -1; }
     int ms = -1;
-    int64_t r = arch_find(mb->arch, key, len, &ms, -1);
+    int64_t r = pzpd_arch_find(mb->arch, key, len, &ms, -1);
     if (r < 0) { return -1; }
     if (stream_out != NULL) { *stream_out = (ms < 0) ? -1 : mb->to_union[ms]; }
     return (int64_t)(mb->first + (uint64_t) r);
@@ -547,7 +470,7 @@ size_t pzpd_find_all(pzpd *a, const char *key, size_t len, int64_t *ordinals_out
             struct pzpd_member *mb = &a->m[i];
             if (mb->arch == NULL) { continue; }
             int ms = -1;
-            int64_t r = arch_find(mb->arch, key, len, &ms, kind);   // keys and names are unique within an archive
+            int64_t r = pzpd_arch_find(mb->arch, key, len, &ms, kind);   // keys and names are unique within an archive
             if (r < 0) { continue; }
             if (total < max)
             {
@@ -567,7 +490,7 @@ const char *pzpd_record_key(pzpd *a, uint64_t ordinal, size_t *len)
     unsigned mi; uint64_t local;
     pzpd_clear_error();
     struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
-    return (ar == NULL) ? NULL : arch_record_key(ar, local, len);
+    return (ar == NULL) ? NULL : pzpd_arch_record_key(ar, local, len);
 }
 
 int pzpd_blob_info_get(pzpd *a, uint64_t ordinal, unsigned stream, pzpd_blob_info *out)
@@ -589,7 +512,7 @@ int pzpd_blob_info_get(pzpd *a, uint64_t ordinal, unsigned stream, pzpd_blob_inf
         out->frame = s->rtab[sl].frame;
         out->shard = (unsigned)(s - ar->shards);
     }
-    else if (!arch_blob_info_get(ar, local, (unsigned) ms, out)) { return 0; }
+    else if (!pzpd_arch_blob_info_get(ar, local, (unsigned) ms, out)) { return 0; }
     out->member = mi;
     out->shard += a->m[mi].shard_base;
     return 1;
@@ -603,7 +526,7 @@ ssize_t pzpd_read_into(pzpd *a, uint64_t ordinal, unsigned stream, void *buf, si
     struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
     if (ar == NULL) { return (ssize_t) pzpd_errorCode; }
     int ms = a->m[mi].to_member[stream];
-    return (ms < 0) ? 0 : arch_read_into(ar, local, (unsigned) ms, buf, cap);
+    return (ms < 0) ? 0 : pzpd_arch_read_into(ar, local, (unsigned) ms, buf, cap);
 }
 
 void *pzpd_read_alloc(pzpd *a, uint64_t ordinal, unsigned stream, size_t *size)
@@ -615,7 +538,7 @@ void *pzpd_read_alloc(pzpd *a, uint64_t ordinal, unsigned stream, size_t *size)
     struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
     if (ar == NULL) { return NULL; }
     int ms = a->m[mi].to_member[stream];
-    return (ms < 0) ? NULL : arch_read_alloc(ar, local, (unsigned) ms, size);
+    return (ms < 0) ? NULL : pzpd_arch_read_alloc(ar, local, (unsigned) ms, size);
 }
 
 const void *pzpd_view(pzpd *a, uint64_t ordinal, unsigned stream, size_t *size)
@@ -627,7 +550,7 @@ const void *pzpd_view(pzpd *a, uint64_t ordinal, unsigned stream, size_t *size)
     struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
     if (ar == NULL) { return NULL; }
     int ms = a->m[mi].to_member[stream];
-    return (ms < 0) ? NULL : arch_view(ar, local, (unsigned) ms, size);
+    return (ms < 0) ? NULL : pzpd_arch_view(ar, local, (unsigned) ms, size);
 }
 
 size_t pzpd_record_span(pzpd *a, uint64_t ordinal, uint32_t stream_mask)
@@ -636,7 +559,7 @@ size_t pzpd_record_span(pzpd *a, uint64_t ordinal, uint32_t stream_mask)
     pzpd_clear_error();
     struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
     if (ar == NULL) { return 0; }
-    return arch_record_span(ar, local, pzpd_member_mask(&a->m[mi], stream_mask));
+    return pzpd_arch_record_span(ar, local, pzpd_member_mask(&a->m[mi], stream_mask));
 }
 
 ssize_t pzpd_read_record(pzpd *a, uint64_t ordinal, uint32_t stream_mask, void *buf, size_t cap, pzpd_blob_ref *refs)
@@ -647,7 +570,7 @@ ssize_t pzpd_read_record(pzpd *a, uint64_t ordinal, uint32_t stream_mask, void *
     if (ar == NULL) { return (ssize_t) pzpd_errorCode; }
     struct pzpd_member *mb = &a->m[mi];
     pzpd_blob_ref mine[PZPD_MAX_STREAMS];
-    ssize_t r = arch_read_record(ar, local, pzpd_member_mask(mb, stream_mask), buf, cap, mine);
+    ssize_t r = pzpd_arch_read_record(ar, local, pzpd_member_mask(mb, stream_mask), buf, cap, mine);
     if (refs != NULL)
     {
         memset(refs, 0, sizeof(pzpd_blob_ref) * a->S);
@@ -667,7 +590,7 @@ int pzpd_verify_record(pzpd *a, uint64_t ordinal, int check_blobs)
     unsigned mi; uint64_t local;
     pzpd_clear_error();
     struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
-    return (ar == NULL) ? 0 : arch_verify_record(ar, local, check_blobs);
+    return (ar == NULL) ? 0 : pzpd_arch_verify_record(ar, local, check_blobs);
 }
 
 int pzpd_verify_shard(pzpd *a, unsigned shard)
@@ -677,7 +600,7 @@ int pzpd_verify_shard(pzpd *a, unsigned shard)
     for (unsigned i = 0; i < a->member_count; i++)
     {
         struct pzpd_member *mb = &a->m[i];
-        if ( (mb->arch != NULL) && (shard >= mb->shard_base) && (shard < mb->shard_base + mb->shards) ) { return arch_verify_shard(mb->arch, shard - mb->shard_base); }
+        if ( (mb->arch != NULL) && (shard >= mb->shard_base) && (shard < mb->shard_base + mb->shards) ) { return pzpd_arch_verify_shard(mb->arch, shard - mb->shard_base); }
     }
     pzpd_set_error(PZPD_E_ARG, "shard %u not found", shard);
     return 0;
@@ -695,7 +618,7 @@ unsigned char *pzpd_read_pzp(pzpd *a, uint64_t ordinal, unsigned stream,
     if (ar == NULL) { return NULL; }
     int ms = a->m[mi].to_member[stream];
     if (ms < 0) { pzpd_set_error(PZPD_E_NOTFOUND, "member \"%s\" has no stream \"%s\"", a->m[mi].alias, a->streams[stream]); return NULL; }
-    return arch_read_pzp(ar, local, (unsigned) ms, width, height, bpp, channels);
+    return pzpd_arch_read_pzp(ar, local, (unsigned) ms, width, height, bpp, channels);
 }
 #endif
 
@@ -736,7 +659,7 @@ uint32_t pzpd_table_rows(pzpd *a, uint64_t ordinal, unsigned table, const void *
     struct pzpd_archive *ar = pzpd_route_table(a, ordinal, table, &mi, &local, &mt);
     if (ar == NULL) { return 0; }
     if (mt < 0) { return 0; }                     // the member has no such table: no rows
-    return arch_table_rows(ar, local, (unsigned) mt, rows_out);
+    return pzpd_arch_table_rows(ar, local, (unsigned) mt, rows_out);
 }
 
 const char *pzpd_table_str(pzpd *a, uint64_t ordinal, unsigned table, const void *field, size_t *len)
@@ -833,7 +756,7 @@ ssize_t pzpd_table_csv(pzpd *a, uint64_t ordinal, unsigned table, char *out, siz
     if (ar == NULL) { return (ssize_t) pzpd_errorCode; }
     if (mt < 0) { return 0; }
     const void *rows = NULL;
-    uint32_t n = arch_table_rows(ar, local, (unsigned) mt, &rows);
+    uint32_t n = pzpd_arch_table_rows(ar, local, (unsigned) mt, &rows);
     if (pzpd_errorCode != PZPD_OK) { return (ssize_t) pzpd_errorCode; }
     uint64_t sl;
     struct pzpd_rshard *s = pzpd_locate(ar, local, &sl);

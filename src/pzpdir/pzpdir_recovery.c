@@ -1,6 +1,8 @@
-/** @file pzpdir_recovery.inc.c
- *  @brief pzpdir.c, part 11 of 13: recovery: rebuild-manifest, salvage.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_recovery.c
+ *  @brief PZPD library: recovery: rebuild-manifest, salvage.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Recovery (spec §4.1 / §4.7): rebuild a manifest from its shards, salvage a shard without its index
@@ -30,7 +32,7 @@ int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_pa
     // Open every shard on its own (the ladder applies: backup superblock, section scan) and order them
     for (unsigned i = 0; ok && (i < n); i++)
     {
-        ar[i] = arch_open(shard_paths[i], 0);
+        ar[i] = pzpd_arch_open(shard_paths[i], 0);
         if (ar[i] == NULL) { pzpd_error_wrap(PZPD_OK, "%s", shard_paths[i]); ok = 0; break; }
         if (!ar[i]->standalone) { pzpd_set_error(PZPD_E_ARG, "%s is not a shard", shard_paths[i]); ok = 0; break; }
         const struct pzpd_disk_superblock *sb = &ar[i]->shards[0].sb;
@@ -104,7 +106,7 @@ int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_pa
     pzpd_buf_free(&shardTab);
     pzpd_buf_free(&names);
     pzpd_buf_free(&ghash);
-    for (unsigned i = 0; (ar != NULL) && (i < n); i++) { if (ar[i] != NULL) { arch_close(ar[i]); } }
+    for (unsigned i = 0; (ar != NULL) && (i < n); i++) { if (ar[i] != NULL) { pzpd_arch_close(ar[i]); } }
     free(ar);
     free(byIndex);
     free(mdir);

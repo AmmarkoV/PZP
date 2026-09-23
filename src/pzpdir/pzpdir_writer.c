@@ -1,137 +1,12 @@
-/** @file pzpdir_writer.inc.c
- *  @brief pzpdir.c, part 5 of 13: writer.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_writer.c
+ *  @brief PZPD library: writer.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Writer
 //-----------------------------------------------------------------------------------------------
-
-/** @brief One blob of the record being assembled by the writer. */
-struct pzpd_wblob
-{
-    int            present;   ///< 1 if this stream has a blob in the current record
-    char          *name;      ///< Copy of the name
-    size_t         name_len;  ///< Name length
-    unsigned char *data;      ///< Copy of the payload
-    size_t         size;      ///< Payload bytes
-    pzpd_blob_meta meta;      ///< Format and metadata
-};
-
-/** @brief Entry of the writer's archive-wide duplicate check (open addressing). */
-struct pzpd_wdedup
-{
-    uint64_t hash;   ///< XXH64 of the bytes
-    uint64_t str;    ///< Offset of the bytes in pzpd_writer::strings
-    uint32_t len;    ///< Length of the bytes
-    uint8_t  kind;   ///< PZPD_KIND_KEY or PZPD_KIND_NAME
-    uint8_t  used;   ///< 1 if the slot is occupied
-};
-
-/** @brief A group registered with a name and a size hint (pzpd_writer_group()). */
-struct pzpd_wgroup
-{
-    uint32_t id;       ///< Group id
-    uint32_t used;     ///< 1 if the slot is occupied
-    uint64_t name;     ///< Offset of the name in pzpd_writer::strings
-    uint32_t name_len; ///< Name length
-    uint64_t hint;     ///< Expected bytes of the whole group (0 = unknown)
-};
-
-/** @brief A completed shard, remembered for the manifest. */
-struct pzpd_wshard
-{
-    char    *path;           ///< Final shard path
-    uint64_t first_ordinal;  ///< First record ordinal
-    uint64_t record_count;   ///< Records
-    uint64_t file_bytes;     ///< File size
-    uint64_t index_checksum; ///< Index checksum
-};
-
-/** @brief Writer state of one table. */
-struct pzpd_wtable
-{
-    struct pzpd_tschema sc;     ///< Schema
-    struct pzpd_buf index;      ///< Open shard: u32 first row of every record so far
-    struct pzpd_buf rows;       ///< Open shard: rows
-    struct pzpd_buf heap;       ///< Open shard: strings
-    uint64_t        nrows;      ///< Open shard: rows so far
-    struct pzpd_buf cur_rows;   ///< Current record: rows (str offsets relative to cur_heap)
-    struct pzpd_buf cur_heap;   ///< Current record: strings
-    uint32_t        cur_n;      ///< Current record: rows
-    struct pzpd_buf g_rows;     ///< Global table: rows
-    struct pzpd_buf g_heap;     ///< Global table: strings
-    uint64_t        g_n;        ///< Global table: rows
-};
-
-/** @brief A word index declared on a writer (pzpd_writer_words()). */
-struct pzpd_wwords
-{
-    char     table[24];    ///< Indexed table
-    char     column[24];   ///< Indexed column
-    char     source[24];   ///< Source column, "" for none
-    unsigned t;            ///< Table id
-    uint32_t text_off;     ///< Offset of the indexed field in a row
-    int64_t  source_off;   ///< Offset of the source field, -1 for none
-};
-
-/** @brief Writer state. Records are appended to the open shard; index sections are kept in
- *  memory until the shard closes. */
-struct pzpd_writer
-{
-    char    *manifest_path;              ///< Path of the manifest to write
-    char    *base;                       ///< manifest_path without ".pzpd"
-    unsigned S;                          ///< Stream count
-    char     streams[PZPD_MAX_STREAMS][24]; ///< Stream names
-    uint64_t shard_max;                  ///< Shard size limit
-    uint32_t align;                      ///< Record alignment
-    uint8_t  uuid[16];                   ///< Archive uuid
-
-    // Current record
-    int      in_record;                  ///< 1 between begin and end
-    char    *key;                        ///< Current key (copy)
-    size_t   key_len;                    ///< Current key length
-    uint32_t group;                      ///< Current group
-    uint32_t frame;                      ///< Current frame
-    struct pzpd_wblob blobs[PZPD_MAX_STREAMS]; ///< Current blobs, indexed by stream
-
-    // Open shard
-    int      fd;                         ///< Open shard file, -1 if none
-    char    *tmp_path;                   ///< "<final>.tmp"
-    char    *final_path;                 ///< Final shard path
-    unsigned shard_index;                ///< Index of the open shard
-    uint64_t cur_off;                    ///< Where the next record goes
-    uint64_t shard_first;                ///< Archive ordinal of the open shard's first record
-    uint64_t shard_records;              ///< Records in the open shard
-    uint32_t shard_last_group;           ///< Group of the last record in the open shard
-    struct pzpd_buf rtab;                ///< Record table of the open shard
-    struct pzpd_buf btab;                ///< Blob table of the open shard
-    struct pzpd_buf hash;                ///< Hash entries of the open shard (unsorted)
-    struct pzpd_buf heap;                ///< String heap of the open shard
-
-    // Archive-wide
-    uint64_t total_records;              ///< Records written so far
-    struct pzpd_wshard *shards;          ///< Completed shards
-    unsigned shard_count;                ///< Completed shards
-    struct pzpd_buf ghash;               ///< Global hash entries for the manifest (unsorted)
-    struct pzpd_buf strings;             ///< Every key and name, for the duplicate check
-    struct pzpd_wdedup *dedup;           ///< Duplicate-check table
-    uint64_t dedup_cap;                  ///< Slots in dedup (power of two)
-    uint64_t dedup_used;                 ///< Occupied slots
-    int      broken;                     ///< 1 after a failure that left the index inconsistent: every later call fails
-    unsigned T;                          ///< Tables declared
-    struct pzpd_wtable *tables;          ///< Tables (PZPD_MAX_TABLES entries, allocated once)
-    uint64_t generation;                 ///< Generation written into the shards (0 = 1; shard rewrites use old + 1)
-    struct pzpd_buf gtab;                ///< Group table of the open shard (pzpd_disk_group entries)
-    struct pzpd_wgroup *groups;          ///< Registered groups (open addressing by id)
-    uint64_t groups_cap;                 ///< Slots (power of two, 0 = none)
-    uint64_t groups_used;                ///< Registered groups
-    uint32_t next_group;                 ///< Next id pzpd_writer_group() tries
-    uint32_t last_group;                 ///< Group of the previous record (archive-wide), PZPD_NO_GROUP if none
-    uint32_t last_frame;                 ///< Its frame
-    int      shard_oversize;             ///< 1 once a group larger than the shard limit started in the open shard
-    unsigned W;                          ///< Word indexes declared
-    struct pzpd_wwords words[PZPD_MAX_WORD_INDEXES]; ///< Their declarations
-};
 
 /** @brief Drop the blobs of the record being assembled. */
 static void pzpd_writer_reset_record(pzpd_writer *w)
@@ -259,7 +134,7 @@ static int pzpd_cmp_ghash(const void *a, const void *b)
  *  @param data_off Set to the offset of the data (after the 32-byte header).
  *  @param idx  Streaming index checksum, updated with the data (may be NULL).
  *  @return 1 on success, 0 on failure. */
-static int pzpd_write_section(int fd, uint64_t *off, uint32_t kind, const void *data, uint64_t bytes, uint64_t *data_off, XXH64_state_t *idx)
+PZPD_INTERNAL int pzpd_write_section(int fd, uint64_t *off, uint32_t kind, const void *data, uint64_t bytes, uint64_t *data_off, XXH64_state_t *idx)
 {
     uint64_t start = pzpd_align_up(*off, PZPD_BLOCK);
     struct pzpd_disk_section sh;
@@ -278,7 +153,7 @@ static int pzpd_write_section(int fd, uint64_t *off, uint32_t kind, const void *
 }
 
 /** @brief Fill the stream table of a superblock or manifest. */
-static void pzpd_fill_streams(struct pzpd_disk_stream *slots, unsigned S, char names[][24])
+PZPD_INTERNAL void pzpd_fill_streams(struct pzpd_disk_stream *slots, unsigned S, char names[][24])
 {
     memset(slots, 0, sizeof(struct pzpd_disk_stream) * PZPD_MAX_STREAMS);
     for (unsigned s = 0; s < S; s++) { pzpd_put_slot_name(slots[s].name, names[s]); }
@@ -286,7 +161,7 @@ static void pzpd_fill_streams(struct pzpd_disk_stream *slots, unsigned S, char n
 
 /** @brief Checksum of a revision-12 header extension (the `len` bytes before ext_checksum): 0 when they are
  *  all zero, so a header without word indexes is byte-identical to one written before revision 12. */
-static uint64_t pzpd_ext_checksum(const void *ext, size_t len)
+PZPD_INTERNAL uint64_t pzpd_ext_checksum(const void *ext, size_t len)
 {
     const unsigned char *p = (const unsigned char *) ext;
     size_t i = 0;
@@ -297,7 +172,7 @@ static uint64_t pzpd_ext_checksum(const void *ext, size_t len)
 }
 
 /** @brief Seal a superblock: sb_checksum over the bytes before it, then the extension's ext_checksum. */
-static void pzpd_seal_superblock(struct pzpd_disk_superblock *sb)
+PZPD_INTERNAL void pzpd_seal_superblock(struct pzpd_disk_superblock *sb)
 {
     sb->sb_checksum  = XXH64(sb, offsetof(struct pzpd_disk_superblock, sb_checksum), 0);
     sb->ext_checksum = pzpd_ext_checksum(sb->words, offsetof(struct pzpd_disk_superblock, ext_checksum) - offsetof(struct pzpd_disk_superblock, words));
@@ -305,7 +180,7 @@ static void pzpd_seal_superblock(struct pzpd_disk_superblock *sb)
 
 /** @brief Write the index sections, the superblocks, fsync and rename the open shard.
  *  @return 1 on success, 0 on failure. */
-static int pzpd_writer_close_shard(pzpd_writer *w)
+PZPD_INTERNAL int pzpd_writer_close_shard(pzpd_writer *w)
 {
     struct pzpd_disk_superblock sb;
     memset(&sb, 0, sizeof(sb));
@@ -496,7 +371,7 @@ static struct pzpd_wgroup *pzpd_wgroup_find(pzpd_writer *w, uint32_t id)
 
 /** @brief Register group `id` with a name (unique in the archive) and a size hint.
  *  @return 1 on success, 0 on failure (error set). */
-static int pzpd_writer_group_as(pzpd_writer *w, uint32_t id, const char *name, size_t len, uint64_t hint)
+PZPD_INTERNAL int pzpd_writer_group_as(pzpd_writer *w, uint32_t id, const char *name, size_t len, uint64_t hint)
 {
     if (id == PZPD_NO_GROUP) { pzpd_set_error(PZPD_E_ARG, "group id 0xFFFFFFFF is reserved"); return 0; }
     if (pzpd_wgroup_find(w, id) != NULL) { pzpd_set_error(PZPD_E_DUPLICATE, "group %u is registered twice", id); return 0; }
@@ -696,7 +571,7 @@ int pzpd_writer_words(pzpd_writer *w, const char *table, const char *column, con
 
 /** @brief Validate and stage binary rows (str offsets relative to `strings`) into rows / heap.
  *  @return 1 on success, 0 on failure (error set). */
-static int pzpd_stage_rows(const struct pzpd_tschema *sc, const void *rows, uint32_t nrows, const void *strings, size_t strings_len,
+PZPD_INTERNAL int pzpd_stage_rows(const struct pzpd_tschema *sc, const void *rows, uint32_t nrows, const void *strings, size_t strings_len,
                            struct pzpd_buf *outRows, struct pzpd_buf *outHeap)
 {
     if ( (rows == NULL) && (nrows > 0) ) { pzpd_set_error(PZPD_E_ARG, "NULL rows"); return 0; }
@@ -1105,7 +980,7 @@ int pzpd_writer_end(pzpd_writer *w)
 
 /** @brief Rewrite shard_count / total_records in both superblocks of a completed shard.
  *  @return 1 on success, 0 on failure. */
-static int pzpd_patch_shard(const char *path, uint32_t shard_count, uint64_t total_records)
+PZPD_INTERNAL int pzpd_patch_shard(const char *path, uint32_t shard_count, uint64_t total_records)
 {
     int fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) { pzpd_set_error(PZPD_E_IO, "cannot reopen %s: %s", path, strerror(errno)); return 0; }
@@ -1125,7 +1000,7 @@ static int pzpd_patch_shard(const char *path, uint32_t shard_count, uint64_t tot
 }
 
 /** @brief Free everything a writer owns. */
-static void pzpd_writer_free(pzpd_writer *w)
+PZPD_INTERNAL void pzpd_writer_free(pzpd_writer *w)
 {
     pzpd_writer_reset_record(w);
     for (unsigned i = 0; i < w->shard_count; i++) { free(w->shards[i].path); }
@@ -1154,28 +1029,13 @@ static void pzpd_writer_free(pzpd_writer *w)
     free(w);
 }
 
-/** @brief One table as a manifest holds it: the schema, plus the rows for global tables. */
-struct pzpd_mtable
-{
-    const struct pzpd_tschema *sc;  ///< Schema
-    const void *rows;               ///< Global rows (NULL for record tables: schema only)
-    uint64_t    nrows;              ///< Global rows
-    const void *heap;               ///< Their strings
-    uint64_t    heap_len;           ///< Strings size
-};
-
-struct pzpd_archive;
-static struct pzpd_archive *arch_open(const char *path, unsigned int flags);
-static void arch_close(struct pzpd_archive *a);
-static int pzpd_mwords_sections(struct pzpd_archive *const *shards, unsigned n, struct pzpd_buf secs[PZPD_MAX_WORD_INDEXES],
-                                struct pzpd_disk_words dir[PZPD_MAX_WORD_INDEXES], unsigned *W);
 
 /** @brief Write a manifest atomically (temp file, fsync, rename, fsync of the directory): header,
  *  shard table, shard names, global hash (sorted here), table sections and, when `wshards` (the shards,
  *  opened standalone, in order) is given, the word indexes' merged vocabularies. Used by the writer and by
  *  pzpd_manifest_rebuild(), so a rebuilt manifest is byte-identical to the original.
  *  @return 1 on success, 0 on failure (error set). */
-static int pzpd_write_manifest(const char *path, const uint8_t *uuid, uint64_t total, unsigned S, char streams[][24], unsigned shard_count,
+PZPD_INTERNAL int pzpd_write_manifest(const char *path, const uint8_t *uuid, uint64_t total, unsigned S, char streams[][24], unsigned shard_count,
                                const struct pzpd_buf *shardTab, const struct pzpd_buf *names, struct pzpd_buf *ghash, unsigned T, const struct pzpd_mtable *tabs,
                                struct pzpd_archive *const *wshards)
 {
@@ -1307,10 +1167,10 @@ int pzpd_writer_finish(pzpd_writer *w)
     {
         wsh = (struct pzpd_archive **) calloc(w->shard_count ? w->shard_count : 1, sizeof(*wsh));
         if (wsh == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
-        for (unsigned i = 0; ok && (i < w->shard_count); i++) { wsh[i] = arch_open(w->shards[i].path, 0); ok = (wsh[i] != NULL); }
+        for (unsigned i = 0; ok && (i < w->shard_count); i++) { wsh[i] = pzpd_arch_open(w->shards[i].path, 0); ok = (wsh[i] != NULL); }
     }
     ok = ok && pzpd_write_manifest(w->manifest_path, w->uuid, w->total_records, w->S, w->streams, w->shard_count, &shardTab, &names, &w->ghash, w->T, tabs, wsh);
-    for (unsigned i = 0; (wsh != NULL) && (i < w->shard_count); i++) { if (wsh[i] != NULL) { arch_close(wsh[i]); } }
+    for (unsigned i = 0; (wsh != NULL) && (i < w->shard_count); i++) { if (wsh[i] != NULL) { pzpd_arch_close(wsh[i]); } }
     free(wsh);
     pzpd_buf_free(&shardTab);
     pzpd_buf_free(&names);

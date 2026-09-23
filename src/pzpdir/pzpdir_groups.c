@@ -1,6 +1,8 @@
-/** @file pzpdir_groups.inc.c
- *  @brief pzpdir.c, part 13 of 13: video groups.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_groups.c
+ *  @brief PZPD library: video groups.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Video groups (spec §3.3, §4.6): a group's frames are consecutive records in one shard
@@ -14,7 +16,7 @@ int64_t pzpd_group_find(pzpd *a, const char *name, size_t len)
     {
         struct pzpd_member *mb = &a->m[i];
         if (mb->arch == NULL) { continue; }
-        int64_t r = arch_find(mb->arch, name, len, NULL, PZPD_KIND_GROUP);
+        int64_t r = pzpd_arch_find(mb->arch, name, len, NULL, PZPD_KIND_GROUP);
         if (r >= 0) { return (int64_t) mb->first + r; }
     }
     pzpd_set_error(PZPD_E_NOTFOUND, "no group \"%.*s\"", (int)(len > 200 ? 200 : len), name);

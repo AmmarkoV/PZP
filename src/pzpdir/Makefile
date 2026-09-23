@@ -16,9 +16,8 @@ DEBUG    = -O0 -g3 -fno-omit-frame-pointer -fsanitize=address,undefined $(BASE)
 SIMD     = -O3 -mavx2 -DINTEL_OPTIMIZATIONS $(BASE)
 LIBS     = -lzstd -llz4 -lm
 
-LIB_SRC  = pzpdir.c
-LIB_PARTS = $(wildcard pzpdir_*.inc.c)
-LIB_DEPS = pzpdir.c $(LIB_PARTS) pzpdir.h pzpdir_unicode.h third_party/xxhash.h $(PZP_DIR)/pzp.h
+LIB_SRC  = $(filter-out pzpdir_cli.c,$(wildcard pzpdir_*.c))
+LIB_DEPS = $(LIB_SRC) pzpdir.h pzpdir_internal.h pzpdir_unicode.h third_party/xxhash.h $(PZP_DIR)/pzp.h
 CLI_SRC  = pzpdir_cli.c
 
 .PHONY: all clean test test-py fuzz doc check-client bench
@@ -38,9 +37,10 @@ libpzpdir.so: $(LIB_DEPS)
 	$(CC) -shared -fPIC $(RELEASE) $(LIB_SRC) -o $@ $(LIBS)
 
 libpzpdir.a: $(LIB_DEPS)
-	$(CC) -c -fPIC $(RELEASE) $(LIB_SRC) -o pzpdir.o
-	ar rcs $@ pzpdir.o
-	rm -f pzpdir.o
+	rm -rf obj_a && mkdir obj_a
+	for f in $(LIB_SRC); do $(CC) -c -fPIC $(RELEASE) $$f -o obj_a/$${f%.c}.o || exit 1; done
+	ar rcs $@ obj_a/*.o
+	rm -rf obj_a
 
 tests/test_pzpdir: tests/test_pzpdir.c $(LIB_DEPS)
 	$(CC) $(DEBUG) -Wno-unused-function $(LIB_SRC) tests/test_pzpdir.c -o $@ $(LIBS)
@@ -76,5 +76,5 @@ check-client:
 	./scripts/check_client_build.sh
 
 clean:
-	rm -f pzpdir dpzpdir spzpdir libpzpdir.so libpzpdir.a pzpdir.o tests/test_pzpdir tests/fuzz_pzpdir bench_pzpdir_early bench_dataloader_replay client_smoke
+	rm -f pzpdir dpzpdir spzpdir libpzpdir.so libpzpdir.a tests/test_pzpdir tests/fuzz_pzpdir bench_pzpdir_early bench_dataloader_replay client_smoke
 	rm -rf doc/html doc/latex PZPDIR.pdf

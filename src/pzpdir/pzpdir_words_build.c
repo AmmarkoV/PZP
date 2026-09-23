@@ -1,6 +1,9 @@
-/** @file pzpdir_words_build.inc.c
- *  @brief pzpdir.c, part 4 of 13: word index: tokenizer v1, shard section builder, section views.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_words_build.c
+ *  @brief PZPD library: word index: tokenizer v1, shard section builder, section views.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
+#include "pzpdir_unicode.h"
 
 //-----------------------------------------------------------------------------------------------
 // Word index (spec §3.7, §4.10): tokenizer v1, shard section builder, section views
@@ -137,26 +140,14 @@ size_t pzpd_tokenize(const char *text, size_t len, int (*emit)(const char *word,
 }
 
 /** @brief Order of words everywhere in the word index: bytes (memcmp), a prefix first. */
-static int pzpd_word_cmp(const char *a, size_t al, const char *b, size_t bl)
+PZPD_INTERNAL int pzpd_word_cmp(const char *a, size_t al, const char *b, size_t bl)
 {
     int c = memcmp(a, b, (al < bl) ? al : bl);
     if (c != 0) { return c; }
     return (al < bl) ? -1 : (al > bl);
 }
 
-/** @brief Distinct byte strings with dense ids (open addressing), for the word index builder. */
-struct pzpd_sdict
-{
-    uint32_t *slot;          ///< id + 1, 0 = empty
-    uint64_t  cap;           ///< Slots (power of two)
-    uint64_t *off;           ///< Bytes of id in `bytes`
-    uint32_t *len;           ///< Their length
-    uint64_t *hash;          ///< Their XXH64
-    uint32_t  n, ecap;       ///< Ids, capacity of off / len / hash
-    struct pzpd_buf bytes;   ///< Every string
-};
-
-static void pzpd_sdict_free(struct pzpd_sdict *d)
+PZPD_INTERNAL void pzpd_sdict_free(struct pzpd_sdict *d)
 {
     free(d->slot); free(d->off); free(d->len); free(d->hash);
     pzpd_buf_free(&d->bytes);
@@ -164,7 +155,7 @@ static void pzpd_sdict_free(struct pzpd_sdict *d)
 }
 
 /** @brief Id of a string without inserting it. @return The id, or -1 if absent. */
-static int64_t pzpd_sdict_find(const struct pzpd_sdict *d, const char *s, size_t n)
+PZPD_INTERNAL int64_t pzpd_sdict_find(const struct pzpd_sdict *d, const char *s, size_t n)
 {
     if (d->cap == 0) { return -1; }
     uint64_t h = XXH64(s, n, 0), k = h & (d->cap - 1);
@@ -178,7 +169,7 @@ static int64_t pzpd_sdict_find(const struct pzpd_sdict *d, const char *s, size_t
 }
 
 /** @brief Id of a string, inserting it if new. @return The id, or -1 on out of memory. */
-static int64_t pzpd_sdict_id(struct pzpd_sdict *d, const char *s, size_t n)
+PZPD_INTERNAL int64_t pzpd_sdict_id(struct pzpd_sdict *d, const char *s, size_t n)
 {
     if ( (d->cap == 0) || ((uint64_t)(d->n + 1) * 2 > d->cap) )
     {
@@ -221,20 +212,6 @@ static int64_t pzpd_sdict_id(struct pzpd_sdict *d, const char *s, size_t n)
     return id;
 }
 
-/** @brief A record table's rows in one shard, as the word index builder reads them. */
-struct pzpd_wsrc
-{
-    uint64_t             records;     ///< Records of the shard
-    const uint32_t      *index;       ///< records + 1 row starts (CSR)
-    const unsigned char *rows;        ///< Rows
-    uint64_t             nrows;       ///< Rows
-    uint32_t             stride;      ///< Bytes per row
-    const char          *heap;        ///< Strings
-    uint64_t             heap_bytes;  ///< Strings size
-    uint32_t             text_off;    ///< Offset of the indexed `str` field in a row
-    int64_t              source_off;  ///< Offset of the source `str` field, -1 for none
-};
-
 /** @brief One word occurrence in a record: (word id, source id; 0 = no source). */
 struct pzpd_wocc { uint32_t tid; uint32_t sid; };
 
@@ -258,7 +235,7 @@ static int pzpd_cmp_dict_ids(const void *a, const void *b)
     return pzpd_word_cmp((const char *) d->bytes.data + d->off[x], d->len[x], (const char *) d->bytes.data + d->off[y], d->len[y]);
 }
 
-static int pzpd_cmp_u32(const void *a, const void *b)
+PZPD_INTERNAL int pzpd_cmp_u32(const void *a, const void *b)
 {
     uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
     return (x < y) ? -1 : (x > y);
@@ -284,7 +261,7 @@ static int pzpd_wbuild_emit(const char *word, size_t len, void *user)
 }
 
 /** @brief Append zero bytes up to the next multiple of 8. */
-static int pzpd_buf_pad8(struct pzpd_buf *b)
+PZPD_INTERNAL int pzpd_buf_pad8(struct pzpd_buf *b)
 {
     static const unsigned char zeros[8] = {0};
     return pzpd_buf_append(b, zeros, (size_t)(pzpd_align_up(b->len, 8) - b->len));
@@ -377,7 +354,7 @@ static int pzpd_words_build_sub(const struct pzpd_sdict *words, const struct pzp
 
 /** @brief Build a shard's word index section (kind 14) from a record table's rows.
  *  @return 1 on success (section data in out), 0 on failure (error set). */
-static int pzpd_words_build(struct pzpd_buf *out, const struct pzpd_wsrc *in, const char *source_column)
+PZPD_INTERNAL int pzpd_words_build(struct pzpd_buf *out, const struct pzpd_wsrc *in, const char *source_column)
 {
     out->len = 0;
     if (in->records > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "word index: more than 4 G records in one shard"); return 0; }
@@ -443,8 +420,9 @@ static int pzpd_words_build(struct pzpd_buf *out, const struct pzpd_wsrc *in, co
         if (!ok && (pzpd_errorCode == PZPD_OK)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
     }
 
-    // Sub-index order: the merged one, then the sources by bytes
-    unsigned K = sources.n;
+    // Sub-index order: the merged one, then the sources by bytes (after the too-many-sources error the
+    // dictionary holds one more than `order` has room for)
+    unsigned K = ok ? sources.n : 0;
     uint32_t order[PZPD_MAX_WORD_SOURCES];
     for (unsigned k = 0; k < K; k++) { order[k] = k; }
     pzpd_sort_dict = &sources;
@@ -536,7 +514,7 @@ static int pzpd_is_one_word(const char *s, size_t len)
  *  word under tokenizer v1, a word at most once, one step (no canonical is also a word), no word mapped to itself.
  *  @param rows / n / heap  Its rows, or NULL / 0 to check the schema only.
  *  @return 1 if valid, 0 otherwise (error set, naming the row). */
-static int pzpd_synonyms_check(const struct pzpd_tschema *sc, const unsigned char *rows, uint64_t n, const char *heap, uint64_t heap_bytes)
+PZPD_INTERNAL int pzpd_synonyms_check(const struct pzpd_tschema *sc, const unsigned char *rows, uint64_t n, const char *heap, uint64_t heap_bytes)
 {
     if ( !(sc->flags & PZPD_TABLE_GLOBAL) || (sc->ncols != 2) || strcmp(sc->colname[0], "word") || strcmp(sc->colname[1], "canonical") ||
          (sc->type[0] != PZPD_TYPE_STR) || (sc->type[1] != PZPD_TYPE_STR) || (sc->count[0] != 1) || (sc->count[1] != 1) )
@@ -576,37 +554,9 @@ static int pzpd_synonyms_check(const struct pzpd_tschema *sc, const unsigned cha
     return ok;
 }
 
-/** @brief A validated view of one word index section (shard kind 14 or manifest kind 15). */
-struct pzpd_wsec
-{
-    const unsigned char *d;          ///< Section data
-    uint64_t             bytes;      ///< Its size
-    uint32_t             tokenizer;  ///< Tokenizer version
-    unsigned             nsub;       ///< Sub-indexes
-    char                 source_column[24]; ///< Source column ("" for none)
-    const char          *names;      ///< Source values
-    uint64_t             names_bytes;///< Their size
-    int                  manifest;   ///< 1 for kind 15
-};
-
-/** @brief One sub-index of a section: shard (postings, forward lists) or manifest (vocabulary with totals). */
-struct pzpd_wsub
-{
-    const char *source;              ///< Source value (NULL / 0 for the merged sub-index)
-    uint32_t    source_len;          ///< Its length
-    uint64_t    records;             ///< Shard: records covered by the forward index
-    uint64_t    words;               ///< Vocabulary size
-    uint64_t    postings;            ///< Shard: record-word pairs
-    const struct pzpd_disk_word  *vocab;   ///< Shard vocabulary
-    const struct pzpd_disk_mword *mvocab;  ///< Manifest vocabulary
-    const uint32_t *post_index, *post, *fwd_index, *fwd;  ///< Shard CSR parts
-    const char *heap;                ///< Word bytes
-    uint64_t    heap_bytes;          ///< Their size
-};
-
 /** @brief Validate a word index section's head (O(1) plus the sub-index heads).
  *  @return 1 if valid, 0 otherwise (error set). */
-static int pzpd_wsec_parse(const unsigned char *d, uint64_t bytes, int manifest, struct pzpd_wsec *v)
+PZPD_INTERNAL int pzpd_wsec_parse(const unsigned char *d, uint64_t bytes, int manifest, struct pzpd_wsec *v)
 {
     struct pzpd_disk_words_head h;
     if (bytes < sizeof(h)) { pzpd_set_error(PZPD_E_FORMAT, "word index section too small"); return 0; }
@@ -633,7 +583,7 @@ static int pzpd_wsec_u32s(const struct pzpd_wsec *v, uint64_t off, uint64_t n)
 /** @brief View of sub-index k (lazy validation: bounds and CSR ends; spec §4.10).
  *  @param expectRecords For shard sections: the shard's record count; -1 for manifests.
  *  @return 1 if valid, 0 otherwise (error set). */
-static int pzpd_wsec_sub(const struct pzpd_wsec *v, unsigned k, int64_t expectRecords, struct pzpd_wsub *s)
+PZPD_INTERNAL int pzpd_wsec_sub(const struct pzpd_wsec *v, unsigned k, int64_t expectRecords, struct pzpd_wsub *s)
 {
     memset(s, 0, sizeof(*s));
     if (k >= v->nsub) { pzpd_set_error(PZPD_E_ARG, "sub-index %u out of range", k); return 0; }
@@ -681,7 +631,7 @@ static int pzpd_wsec_sub(const struct pzpd_wsec *v, unsigned k, int64_t expectRe
 }
 
 /** @brief Sub-index of a section for a source value (NULL = merged). @return Its index, or -1 if the section lacks it. */
-static int pzpd_wsec_find(const struct pzpd_wsec *v, const char *source, size_t len, int64_t expectRecords)
+PZPD_INTERNAL int pzpd_wsec_find(const struct pzpd_wsec *v, const char *source, size_t len, int64_t expectRecords)
 {
     if (source == NULL) { return 0; }
     for (unsigned k = 1; k < v->nsub; k++)
@@ -694,7 +644,7 @@ static int pzpd_wsec_find(const struct pzpd_wsec *v, const char *source, size_t 
 }
 
 /** @brief Word k of a sub-index (bounds-checked). @return 1, or 0 if damaged (error set). */
-static int pzpd_wsub_word(const struct pzpd_wsub *s, uint64_t k, const char **w, size_t *len)
+PZPD_INTERNAL int pzpd_wsub_word(const struct pzpd_wsub *s, uint64_t k, const char **w, size_t *len)
 {
     uint32_t off = s->vocab ? s->vocab[k].heap_offset : s->mvocab[k].heap_offset;
     uint16_t l   = s->vocab ? s->vocab[k].len         : s->mvocab[k].len;
@@ -705,7 +655,7 @@ static int pzpd_wsub_word(const struct pzpd_wsub *s, uint64_t k, const char **w,
 }
 
 /** @brief Binary search of a word in a sub-index vocabulary. @return Its id, -1 if absent, -2 if damaged (error set). */
-static int64_t pzpd_wsub_find(const struct pzpd_wsub *s, const char *word, size_t len)
+PZPD_INTERNAL int64_t pzpd_wsub_find(const struct pzpd_wsub *s, const char *word, size_t len)
 {
     uint64_t lo = 0, hi = s->words;
     while (lo < hi)
@@ -722,7 +672,7 @@ static int64_t pzpd_wsub_find(const struct pzpd_wsub *s, const char *word, size_
 
 /** @brief Full check of a shard sub-index (verify): sorted vocabulary, ascending postings and forward lists,
  *  per-word counts, and forward lists = transpose of the postings. @return 1 if valid, 0 otherwise (error set). */
-static int pzpd_wsub_check_full(const struct pzpd_wsub *s)
+PZPD_INTERNAL int pzpd_wsub_check_full(const struct pzpd_wsub *s)
 {
     const char *pw = NULL; size_t pl = 0;
     for (uint64_t w = 0; w < s->words; w++)

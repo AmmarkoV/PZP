@@ -1,6 +1,8 @@
-/** @file pzpdir_words_read.inc.c
- *  @brief pzpdir.c, part 8 of 13: word index handle.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_words_read.c
+ *  @brief PZPD library: word index handle.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Word index handle (spec §3.7, §4.10)

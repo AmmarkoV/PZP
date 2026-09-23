@@ -1,27 +1,12 @@
-/** @file pzpdir_tables.inc.c
- *  @brief pzpdir.c, part 3 of 13: table schemas and CSV.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_tables.c
+ *  @brief PZPD library: table schemas and CSV.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
 
 //-----------------------------------------------------------------------------------------------
 // Table schemas and CSV
 //-----------------------------------------------------------------------------------------------
-
-/** @brief Parsed table schema. Lives at a fixed address (inside a writer / archive), because
- *  `cols` / `pub` point into it; call pzpd_schema_publish() after it is in place. */
-struct pzpd_tschema
-{
-    char        name[24];                        ///< Table name
-    unsigned    flags;                           ///< PZPD_TABLE_GLOBAL, PZPD_TABLE_BULK
-    unsigned    ncols;                           ///< Columns
-    uint32_t    stride;                          ///< Bytes per row
-    char        colname[PZPD_MAX_COLUMNS][24];   ///< Column names
-    uint8_t     type[PZPD_MAX_COLUMNS];          ///< enum pzpd_type
-    uint16_t    count[PZPD_MAX_COLUMNS];         ///< Array lengths
-    uint32_t    offset[PZPD_MAX_COLUMNS];        ///< Byte offsets in a row
-    int         has_str;                         ///< 1 if a column is `str`
-    pzpd_column cols[PZPD_MAX_COLUMNS];          ///< Public column view
-    pzpd_schema pub;                             ///< Public schema view
-};
 
 /** @brief Type table: name, size and alignment of every enum pzpd_type. */
 static const struct { const char *name; uint8_t type; uint8_t size; uint8_t align; } pzpd_types[] =
@@ -56,7 +41,7 @@ static const char *pzpd_type_name(uint8_t t)
 }
 
 /** @brief Point the public views of a schema at its own arrays (after it reached its final address). */
-static void pzpd_schema_publish(struct pzpd_tschema *sc)
+PZPD_INTERNAL void pzpd_schema_publish(struct pzpd_tschema *sc)
 {
     for (unsigned c = 0; c < sc->ncols; c++)
     {
@@ -97,7 +82,7 @@ static int pzpd_schema_layout(struct pzpd_tschema *sc)
 
 /** @brief Parse "name:type[count], ..." into a schema.
  *  @return 1 on success, 0 on failure (error set). */
-static int pzpd_schema_parse(const char *name, const char *text, unsigned flags, struct pzpd_tschema *sc)
+PZPD_INTERNAL int pzpd_schema_parse(const char *name, const char *text, unsigned flags, struct pzpd_tschema *sc)
 {
     memset(sc, 0, sizeof(*sc));
     if ( (name == NULL) || (name[0] == 0) || (strlen(name) > PZPD_MAX_TABLE_NAME) ) { pzpd_set_error(PZPD_E_ARG, "table names must be 1..%d bytes", PZPD_MAX_TABLE_NAME); return 0; }
@@ -145,7 +130,7 @@ static int pzpd_schema_parse(const char *name, const char *text, unsigned flags,
 }
 
 /** @brief Same schema? (name, flags, columns, stride) */
-static int pzpd_schema_equal(const struct pzpd_tschema *a, const struct pzpd_tschema *b)
+PZPD_INTERNAL int pzpd_schema_equal(const struct pzpd_tschema *a, const struct pzpd_tschema *b)
 {
     if ( strcmp(a->name, b->name) || (a->flags != b->flags) || (a->ncols != b->ncols) || (a->stride != b->stride) ) { return 0; }
     for (unsigned c = 0; c < a->ncols; c++)
@@ -205,6 +190,33 @@ static int pzpd_csv_store(const struct pzpd_tschema *sc, unsigned c, unsigned k,
     }
     char tmp[128];
     if ( (f->len == 0) || (f->len >= sizeof(tmp)) ) { pzpd_set_error(PZPD_E_ARG, "row %llu, column %s: %s value", (unsigned long long) rowNo, sc->colname[c], f->len ? "too long a" : "empty"); return 0; }
+    // Fast path for the common integer field: digits only (a leading '-' for signed types), short enough that it
+    // can't overflow 64 bits. Anything else (signs, spaces, long values) takes strtoull / strtoll below.
+    if ( (t != PZPD_TYPE_F32) && (t != PZPD_TYPE_F64) && (f->len <= 18) )
+    {
+        const unsigned char *q = f->data;
+        size_t n = f->len;
+        int neg = (q[0] == '-') && (t != PZPD_TYPE_U8) && (t != PZPD_TYPE_U16) && (t != PZPD_TYPE_U32) && (t != PZPD_TYPE_U64);
+        size_t i = neg ? 1 : 0;
+        uint64_t v = 0;
+        while ( (i < n) && (q[i] >= '0') && (q[i] <= '9') ) { v = v * 10 + (uint64_t)(q[i] - '0'); i++; }
+        if ( (i == n) && (n > (size_t) neg) )
+        {
+            int64_t sv = neg ? -(int64_t) v : (int64_t) v;
+            switch (t)
+            {
+                case PZPD_TYPE_U8:  if (v <= 0xFFull)       { uint8_t  x = (uint8_t)  v; memcpy(dst, &x, 1); return 1; } break;
+                case PZPD_TYPE_U16: if (v <= 0xFFFFull)     { uint16_t x = (uint16_t) v; memcpy(dst, &x, 2); return 1; } break;
+                case PZPD_TYPE_U32: if (v <= 0xFFFFFFFFull) { uint32_t x = (uint32_t) v; memcpy(dst, &x, 4); return 1; } break;
+                case PZPD_TYPE_U64:                         { memcpy(dst, &v, 8); return 1; }
+                case PZPD_TYPE_I8:  if ( (sv >= -128) && (sv <= 127) )                 { int8_t  x = (int8_t)  sv; memcpy(dst, &x, 1); return 1; } break;
+                case PZPD_TYPE_I16: if ( (sv >= -32768) && (sv <= 32767) )             { int16_t x = (int16_t) sv; memcpy(dst, &x, 2); return 1; } break;
+                case PZPD_TYPE_I32: if ( (sv >= -2147483648LL) && (sv <= 2147483647LL) ) { int32_t x = (int32_t) sv; memcpy(dst, &x, 4); return 1; } break;
+                default:                                    { memcpy(dst, &sv, 8); return 1; }
+            }
+            // out of range for the column: the slow path below reports it
+        }
+    }
     memcpy(tmp, f->data, f->len);
     tmp[f->len] = 0;
     char *e = NULL;
@@ -253,7 +265,7 @@ range:
 
 /** @brief Parse CSV text (one row per line) into rows appended to `rows`, strings to `heap`.
  *  @return Rows parsed, or -1 on error (error set, naming the row and column). */
-static int64_t pzpd_csv_parse(const struct pzpd_tschema *sc, const char *csv, size_t len, struct pzpd_buf *rows, struct pzpd_buf *heap)
+PZPD_INTERNAL int64_t pzpd_csv_parse(const struct pzpd_tschema *sc, const char *csv, size_t len, struct pzpd_buf *rows, struct pzpd_buf *heap)
 {
     const char *p = csv, *end = csv + len;
     struct pzpd_buf f = {0};
@@ -333,7 +345,7 @@ static int pzpd_fmt_f64(struct pzpd_buf *b, double v)
 /** @brief Render one row as a CSV line (with '\n'). `str` values are resolved in heap; a value that
  *  points outside the heap is rendered empty (damaged input never reads out of bounds).
  *  @return 1 on success, 0 on allocation failure. */
-static int pzpd_csv_render(const struct pzpd_tschema *sc, const unsigned char *row, const char *heap, uint64_t heapLen, struct pzpd_buf *out)
+PZPD_INTERNAL int pzpd_csv_render(const struct pzpd_tschema *sc, const unsigned char *row, const char *heap, uint64_t heapLen, struct pzpd_buf *out)
 {
     int first = 1;
     for (unsigned c = 0; c < sc->ncols; c++)
@@ -382,7 +394,7 @@ static int pzpd_csv_render(const struct pzpd_tschema *sc, const unsigned char *r
 
 /** @brief Serialise a table section: header, columns, [row index], rows, string heap.
  *  @param index records + 1 row starts, or NULL for global / schema-only tables. */
-static int pzpd_table_section(struct pzpd_buf *out, const struct pzpd_tschema *sc, uint64_t records, const uint32_t *index,
+PZPD_INTERNAL int pzpd_table_section(struct pzpd_buf *out, const struct pzpd_tschema *sc, uint64_t records, const uint32_t *index,
                               const void *rows, uint64_t nrows, const void *heap, uint64_t heapLen)
 {
     out->len = 0;
@@ -420,23 +432,10 @@ static int pzpd_table_section(struct pzpd_buf *out, const struct pzpd_tschema *s
     return ok;
 }
 
-/** @brief A validated view of one table section (pointers into a mapping). */
-struct pzpd_tview
-{
-    int                  present;     ///< 1 if the section exists
-    uint64_t             records;     ///< Records covered by the index
-    uint64_t             rows;        ///< Rows
-    const uint32_t      *index;       ///< records + 1 row starts, NULL for global tables
-    const unsigned char *rowdata;     ///< Rows
-    const char          *heap;        ///< Strings
-    uint64_t             heap_bytes;  ///< Strings size
-    int                  checked;     ///< 1 once the whole row index was verified monotonic (pzpd_table_shard_view()); atomic
-};
-
 /** @brief Validate a table section and extract its schema (sc may be NULL) and view.
  *  @param expectRecords For record tables in shards: the shard's record count (the index must cover it).
  *  @return 1 if valid, 0 otherwise (error set). */
-static int pzpd_table_parse(const unsigned char *d, uint64_t bytes, struct pzpd_tschema *sc, struct pzpd_tview *v, int64_t expectRecords)
+PZPD_INTERNAL int pzpd_table_parse(const unsigned char *d, uint64_t bytes, struct pzpd_tschema *sc, struct pzpd_tview *v, int64_t expectRecords)
 {
     struct pzpd_disk_table_head h;
     if (bytes < sizeof(h)) { pzpd_set_error(PZPD_E_FORMAT, "table section too small"); return 0; }

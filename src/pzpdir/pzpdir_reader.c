@@ -1,65 +1,24 @@
-/** @file pzpdir_reader.inc.c
- *  @brief pzpdir.c, part 6 of 13: reader: opening shards, lookup, reading data.
- *  Included by pzpdir.c in this order (one translation unit: everything stays static); not compiled on its own. */
+/** @file pzpdir_reader.c
+ *  @brief PZPD library: reader: opening shards, lookup, reading data.
+ *  Shared types and internal declarations are in pzpdir_internal.h. */
+
+#include "pzpdir_internal.h"
+
+#if PZPDIR_WITH_PZP
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wunused-function"
+ #pragma GCC diagnostic ignored "-Wunused-variable"
+ #include "pzp.h"
+ #pragma GCC diagnostic pop
+#endif
 
 //-----------------------------------------------------------------------------------------------
 // Reader
 //-----------------------------------------------------------------------------------------------
 
-/** @brief One shard of an open archive. Opened lazily; state goes 0 -> 1 (ok) or -1 (failed) once. */
-struct pzpd_rshard
-{
-    char    *path;             ///< Shard file path
-    uint64_t first_ordinal;    ///< Archive ordinal of the first record (from the manifest or superblock)
-    uint64_t record_count;     ///< Records (from the manifest or superblock)
-    int      state;            ///< 0 not opened yet, 1 open, -1 failed (read with acquire / written with release)
-    char     error[512];       ///< Why opening failed, when state is -1
-    int      error_code;       ///< enum pzpd_error of that failure
-    int      fd;               ///< File descriptor for pread()
-    unsigned char *map;        ///< Whole-file mapping
-    size_t   map_len;          ///< Mapping length
-    struct pzpd_disk_superblock sb; ///< Validated superblock
-    const struct pzpd_disk_record *rtab; ///< Record table (in map)
-    const struct pzpd_disk_blob   *btab; ///< Blob table (in map)
-    const struct pzpd_disk_hash   *hash; ///< Hash table (in map)
-    const char                    *heap; ///< String heap (in map)
-    struct pzpd_tview tv[PZPD_MAX_TABLES]; ///< Table sections (in map), validated at load
-    int      storage;          ///< enum pzpd_storage of the shard's file system
-    int      recovery;         ///< 0 primary superblock, 1 backup superblock, 2 superblock rebuilt from the index sections
-    const struct pzpd_disk_group  *groups; ///< Group table (in map), NULL when the shard has no groups
-    int      words_bad;        ///< 1 if the word index directory (revision-12 extension) failed its checksum
-};
-
-/** @brief One open archive (manifest + shards) or a single shard opened standalone: the unit a
- *  collection member refers to. Ordinals and stream ids here are local to the archive. */
-struct pzpd_archive
-{
-    unsigned flags;                     ///< Open flags (PZPD_O_VERIFY)
-    pthread_mutex_t lock;               ///< Taken once per shard, for its lazy open
-    unsigned S;                         ///< Stream count
-    char     streams[PZPD_MAX_STREAMS][24]; ///< Stream names
-    uint8_t  uuid[16];                  ///< Archive uuid
-    uint64_t total;                     ///< Records
-    unsigned shard_count;               ///< Shards
-    struct pzpd_rshard *shards;         ///< Shards
-    int      standalone;                ///< 1 when a single shard was opened (no manifest)
-    unsigned char *mmap_manifest;       ///< Manifest mapping (NULL when standalone)
-    size_t   manifest_len;              ///< Manifest mapping length
-    const struct pzpd_disk_manifest_shard *mshards; ///< Manifest shard table
-    const struct pzpd_disk_global_hash    *ghash;   ///< Manifest global hash
-    uint64_t ghash_count;               ///< Global hash entries
-    unsigned T;                         ///< Tables
-    struct pzpd_tschema *tables;        ///< Table schemas (PZPD_MAX_TABLES entries, fixed address)
-    struct pzpd_tview gview[PZPD_MAX_TABLES]; ///< Global tables' rows (manifest copy, or the standalone shard's)
-    struct pzpd_disk_words mwords[PZPD_MAX_WORD_INDEXES]; ///< Manifest word directory (merged vocabularies), zero when none
-    int      mwords_bad;                ///< 1 if the manifest's word directory failed its checksum
-};
-
 /** @brief Bytes of a header's revision-12 extension covered by ext_checksum. */
 #define PZPD_SB_EXT_BYTES (offsetof(struct pzpd_disk_superblock, ext_checksum) - offsetof(struct pzpd_disk_superblock, words))
 #define PZPD_MH_EXT_BYTES (offsetof(struct pzpd_disk_manifest, ext_checksum) - offsetof(struct pzpd_disk_manifest, words))
-
-static int pzpd_check_section(const unsigned char *map, uint64_t file, uint64_t data_off, uint32_t kind, uint64_t bytes);
 
 /** @brief Read a table directory (superblock or manifest) into schemas / views.
  *  @param a        Archive whose schemas are filled (define = 1) or compared (define = 0).
@@ -100,10 +59,9 @@ static int pzpd_read_table_dir(struct pzpd_archive *a, const struct pzpd_disk_ta
     return 1;
 }
 
-static void arch_close(struct pzpd_archive *a);   // used by arch_open() on failure
 
 /** @brief Check a section header in front of data_off, of the expected kind and size. */
-static int pzpd_check_section(const unsigned char *map, uint64_t file, uint64_t data_off, uint32_t kind, uint64_t bytes)
+PZPD_INTERNAL int pzpd_check_section(const unsigned char *map, uint64_t file, uint64_t data_off, uint32_t kind, uint64_t bytes)
 {
     if ( (data_off < sizeof(struct pzpd_disk_section)) || !pzpd_in_file(data_off, bytes, file) ) { return 0; }
     struct pzpd_disk_section sh;
@@ -113,7 +71,7 @@ static int pzpd_check_section(const unsigned char *map, uint64_t file, uint64_t 
 
 /** @brief Validate a superblock candidate (magic, version, checksum, geometry).
  *  @return 1 if valid, 0 otherwise (error set). */
-static int pzpd_superblock_valid(const struct pzpd_disk_superblock *sb, uint64_t file)
+PZPD_INTERNAL int pzpd_superblock_valid(const struct pzpd_disk_superblock *sb, uint64_t file)
 {
     if (memcmp(sb->magic, PZPD_MAGIC_SHARD, 8) != 0) { pzpd_set_error(PZPD_E_FORMAT, "bad shard magic"); return 0; }
     if (sb->version > PZPD_FORMAT_VERSION) { pzpd_set_error(PZPD_E_VERSION, "shard format version %u is newer than this library (%d)", sb->version, PZPD_FORMAT_VERSION); return 0; }
@@ -144,7 +102,7 @@ static int pzpd_storage_of_fd(int fd)
 
 /** @brief Make [p, p+len) of a read-only file mapping resident and its page tables filled:
  *  `MADV_POPULATE_READ`, or one read per page where the kernel lacks it. p need not be page-aligned. */
-static void pzpd_populate(const void *p, size_t len)
+PZPD_INTERNAL void pzpd_populate(const void *p, size_t len)
 {
     if (len == 0) { return; }
     uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
@@ -204,7 +162,7 @@ static unsigned pzpd_meta_streams(const char *json, size_t len, char names[][24]
  *  record-table section, so an archive stored as a blob inside this one is never mistaken for its index.
  *  @param hint_first First ordinal to use when the metadata lacks it (from the manifest, else 0).
  *  @return 1 on success (sealed superblock in *out), 0 if the index can't be found (error set). */
-static int pzpd_sb_from_sections(const unsigned char *map, uint64_t file, uint64_t hint_first, struct pzpd_disk_superblock *out)
+PZPD_INTERNAL int pzpd_sb_from_sections(const unsigned char *map, uint64_t file, uint64_t hint_first, struct pzpd_disk_superblock *out)
 {
     struct { uint32_t kind; uint64_t off, bytes; } found[64];
     // Table edits append a table's new section and leave the old one until compact: per name, the newest
@@ -385,6 +343,8 @@ static int pzpd_shard_load(struct pzpd_archive *a, struct pzpd_rshard *s)
          !pzpd_check_section(s->map, file, sb.btab_offset, PZPD_SECT_BLOBS,   n * S * sizeof(struct pzpd_disk_blob)) ||
          !pzpd_check_section(s->map, file, sb.hash_offset, PZPD_SECT_HASH,    sb.hash_count * sizeof(struct pzpd_disk_hash)) ||
          !pzpd_check_section(s->map, file, sb.heap_offset, PZPD_SECT_HEAP,    sb.heap_bytes) ||
+         // no metadata section (0 / 0) only after a section-scan recovery that didn't find one
+         ( ((sb.meta_offset != 0) || (sb.meta_bytes != 0)) && !pzpd_check_section(s->map, file, sb.meta_offset, PZPD_SECT_META, sb.meta_bytes) ) ||
          (sb.hash_count > n * (S + 1) + sb.group_count) || (sb.heap_bytes > 0xFFFFFFFFull) )
     {
         pzpd_set_error(PZPD_E_FORMAT, "%s: index sections are damaged", s->path);
@@ -439,7 +399,7 @@ static int pzpd_shard_load(struct pzpd_archive *a, struct pzpd_rshard *s)
 
 /** @brief Get shard i, opening it on first use.
  *  @return The shard, or NULL if it can't be opened (error set, PZPD_E_SHARD_MISSING or the cause). */
-static struct pzpd_rshard *pzpd_shard(struct pzpd_archive *a, unsigned i)
+PZPD_INTERNAL struct pzpd_rshard *pzpd_shard(struct pzpd_archive *a, unsigned i)
 {
     struct pzpd_rshard *s = &a->shards[i];
     int st = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
@@ -472,7 +432,7 @@ static struct pzpd_rshard *pzpd_shard(struct pzpd_archive *a, unsigned i)
 
 /** @brief Find the shard holding an ordinal (binary search over first ordinals).
  *  @return Shard index, or -1 if the ordinal is out of range (error set). */
-static int pzpd_shard_of(const struct pzpd_archive *a, uint64_t ordinal)
+PZPD_INTERNAL int pzpd_shard_of(const struct pzpd_archive *a, uint64_t ordinal)
 {
     if (ordinal >= a->total) { pzpd_set_error(PZPD_E_ARG, "ordinal %llu out of range (%llu records)", (unsigned long long) ordinal, (unsigned long long) a->total); return -1; }
     unsigned lo = 0, hi = a->shard_count;
@@ -486,7 +446,7 @@ static int pzpd_shard_of(const struct pzpd_archive *a, uint64_t ordinal)
 
 /** @brief Resolve an ordinal to its (open) shard and local record index, bounds-checking the record.
  *  @return The shard, or NULL on error (error set). */
-static struct pzpd_rshard *pzpd_locate(struct pzpd_archive *a, uint64_t ordinal, uint64_t *local)
+PZPD_INTERNAL struct pzpd_rshard *pzpd_locate(struct pzpd_archive *a, uint64_t ordinal, uint64_t *local)
 {
     int si = pzpd_shard_of(a, ordinal);
     if (si < 0) { return NULL; }
@@ -506,7 +466,7 @@ static struct pzpd_rshard *pzpd_locate(struct pzpd_archive *a, uint64_t ordinal,
 
 /** @brief Blob entry of (local record, stream), bounds-checked against its record and the heap.
  *  @return The entry (rel_offset may be PZPD_MISSING), or NULL if damaged (error set). */
-static const struct pzpd_disk_blob *pzpd_blob_entry(const struct pzpd_rshard *s, uint64_t local, unsigned stream)
+PZPD_INTERNAL const struct pzpd_disk_blob *pzpd_blob_entry(const struct pzpd_rshard *s, uint64_t local, unsigned stream)
 {
     const struct pzpd_disk_blob *b = &s->btab[local * s->sb.stream_count + stream];
     if (b->rel_offset == PZPD_MISSING) { return b; }
@@ -520,7 +480,7 @@ static const struct pzpd_disk_blob *pzpd_blob_entry(const struct pzpd_rshard *s,
 }
 
 /** @brief Single-archive part of pzpd_open(): ordinals, shards and stream ids are local to the archive. */
-static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
+PZPD_INTERNAL struct pzpd_archive *pzpd_arch_open(const char *path, unsigned int flags)
 {
     pzpd_clear_error();
     if (path == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL path"); return NULL; }
@@ -546,7 +506,7 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
         a->standalone  = 1;
         a->shard_count = 1;
         a->shards = (struct pzpd_rshard *) calloc(1, sizeof(struct pzpd_rshard));
-        if ( (a->shards == NULL) || ((a->shards[0].path = strdup(path)) == NULL) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); arch_close(a); return NULL; }
+        if ( (a->shards == NULL) || ((a->shards[0].path = strdup(path)) == NULL) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); pzpd_arch_close(a); return NULL; }
         a->shards[0].fd = -1;
         a->shards[0].record_count = 0xFFFFFFFFFFFFFFFFull;
         a->total = 0xFFFFFFFFFFFFFFFFull;                      // lets pzpd_shard_of() pick shard 0 before it is loaded
@@ -555,7 +515,7 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
             char msg[512];
             snprintf(msg, sizeof(msg), "%s", a->shards[0].error);
             int code = a->shards[0].error_code;
-            arch_close(a);
+            pzpd_arch_close(a);
             if (isShard) { pzpd_set_error(code, "%s", msg); }
             else         { pzpd_set_error(PZPD_E_FORMAT, "%s is not a PZPD file (bad magic)", path); }
             return NULL;
@@ -566,34 +526,33 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
     if (memcmp(magic, PZPD_MAGIC_COLL, 8) == 0)
     {
         close(fd);
-        arch_close(a);
+        pzpd_arch_close(a);
         pzpd_set_error(PZPD_E_FORMAT, "%s is a collection file; collections can't be members of collections", path);
         return NULL;
     }
-
 
     //----------------------------------------------------------------------
     // Manifest
     //----------------------------------------------------------------------
     struct stat st;
-    if ( (fstat(fd, &st) != 0) || ((uint64_t) st.st_size < PZPD_BLOCK) ) { close(fd); arch_close(a); pzpd_set_error(PZPD_E_FORMAT, "%s: manifest is truncated", path); return NULL; }
+    if ( (fstat(fd, &st) != 0) || ((uint64_t) st.st_size < PZPD_BLOCK) ) { close(fd); pzpd_arch_close(a); pzpd_set_error(PZPD_E_FORMAT, "%s: manifest is truncated", path); return NULL; }
     a->manifest_len  = (size_t) st.st_size;
     a->mmap_manifest = (unsigned char *) mmap(NULL, a->manifest_len, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
-    if (a->mmap_manifest == MAP_FAILED) { a->mmap_manifest = NULL; arch_close(a); pzpd_set_error(PZPD_E_IO, "cannot map %s: %s", path, strerror(errno)); return NULL; }
+    if (a->mmap_manifest == MAP_FAILED) { a->mmap_manifest = NULL; pzpd_arch_close(a); pzpd_set_error(PZPD_E_IO, "cannot map %s: %s", path, strerror(errno)); return NULL; }
 
     struct pzpd_disk_manifest mh;
     memcpy(&mh, a->mmap_manifest, sizeof(mh));
     uint64_t file = a->manifest_len;
-    if (mh.version > PZPD_FORMAT_VERSION) { arch_close(a); pzpd_set_error(PZPD_E_VERSION, "%s: manifest format version %u is newer than this library (%d)", path, mh.version, PZPD_FORMAT_VERSION); return NULL; }
-    if (mh.sb_checksum != XXH64(&mh, offsetof(struct pzpd_disk_manifest, sb_checksum), 0)) { arch_close(a); pzpd_set_error(PZPD_E_CHECKSUM, "%s: manifest header checksum mismatch", path); return NULL; }
+    if (mh.version > PZPD_FORMAT_VERSION) { pzpd_arch_close(a); pzpd_set_error(PZPD_E_VERSION, "%s: manifest format version %u is newer than this library (%d)", path, mh.version, PZPD_FORMAT_VERSION); return NULL; }
+    if (mh.sb_checksum != XXH64(&mh, offsetof(struct pzpd_disk_manifest, sb_checksum), 0)) { pzpd_arch_close(a); pzpd_set_error(PZPD_E_CHECKSUM, "%s: manifest header checksum mismatch", path); return NULL; }
     if ( (mh.stream_count == 0) || (mh.stream_count > PZPD_MAX_STREAMS) || (mh.shard_count == 0) ||
          !pzpd_check_section(a->mmap_manifest, file, mh.shards_offset, PZPD_SECT_MSHARDS, (uint64_t) mh.shard_count * sizeof(struct pzpd_disk_manifest_shard)) ||
          !pzpd_check_section(a->mmap_manifest, file, mh.names_offset,  PZPD_SECT_MNAMES,  mh.names_bytes) ||
          (mh.hash_count > file / sizeof(struct pzpd_disk_global_hash)) ||      // so the size below can't wrap around
          !pzpd_check_section(a->mmap_manifest, file, mh.hash_offset,   PZPD_SECT_MHASH,   mh.hash_count * sizeof(struct pzpd_disk_global_hash)) )
     {
-        arch_close(a);
+        pzpd_arch_close(a);
         pzpd_set_error(PZPD_E_FORMAT, "%s: manifest sections are damaged", path);
         return NULL;
     }
@@ -613,7 +572,7 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
     size_t dirLen = (slash == NULL) ? 0 : (size_t)(slash - path + 1);
     const char *names = (const char *) (a->mmap_manifest + mh.names_offset);
     a->shards = (struct pzpd_rshard *) calloc(a->shard_count, sizeof(struct pzpd_rshard));
-    if (a->shards == NULL) { arch_close(a); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
+    if (a->shards == NULL) { pzpd_arch_close(a); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
     uint64_t expect = 0;
     for (unsigned i = 0; i < a->shard_count; i++)
     {
@@ -622,7 +581,7 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
         s->fd = -1;
         if ( !pzpd_in_file(ms->name_offset, ms->name_len, mh.names_bytes) || (ms->first_ordinal != expect) )
         {
-            arch_close(a);
+            pzpd_arch_close(a);
             pzpd_set_error(PZPD_E_FORMAT, "%s: shard table is damaged", path);
             return NULL;
         }
@@ -630,13 +589,13 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
         s->first_ordinal = ms->first_ordinal;
         s->record_count  = ms->record_count;
         s->path = (char *) malloc(dirLen + ms->name_len + 1);
-        if (s->path == NULL) { arch_close(a); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
+        if (s->path == NULL) { pzpd_arch_close(a); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return NULL; }
         memcpy(s->path, path, dirLen);
         memcpy(s->path + dirLen, names + ms->name_offset, ms->name_len);
         s->path[dirLen + ms->name_len] = 0;
     }
-    if (expect != a->total) { arch_close(a); pzpd_set_error(PZPD_E_FORMAT, "%s: shard record counts don't add up", path); return NULL; }
-    if (!pzpd_read_table_dir(a, mh.tables, a->mmap_manifest, file, NULL, -1, 1, path)) { struct pzpd_saved_error e; pzpd_error_save(&e); arch_close(a); pzpd_error_restore(&e); return NULL; }
+    if (expect != a->total) { pzpd_arch_close(a); pzpd_set_error(PZPD_E_FORMAT, "%s: shard record counts don't add up", path); return NULL; }
+    if (!pzpd_read_table_dir(a, mh.tables, a->mmap_manifest, file, NULL, -1, 1, path)) { struct pzpd_saved_error e; pzpd_error_save(&e); pzpd_arch_close(a); pzpd_error_restore(&e); return NULL; }
     if (flags & PZPD_O_POPULATE)
     {
         for (unsigned i = 0; i < a->shard_count; i++) { (void) pzpd_shard(a, i); }   // missing shards fail later, on use
@@ -646,7 +605,7 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
 }
 
 /** @brief Single-archive part of pzpd_close(): ordinals, shards and stream ids are local to the archive. */
-static void arch_close(struct pzpd_archive *a)
+PZPD_INTERNAL void pzpd_arch_close(struct pzpd_archive *a)
 {
     if (a == NULL) { return; }
     for (unsigned i = 0; (a->shards != NULL) && (i < a->shard_count); i++)
@@ -664,7 +623,7 @@ static void arch_close(struct pzpd_archive *a)
 }
 
 /** @brief A shard's word index section for directory slot j, parsed. @return 1 on success, 0 on failure (error set). */
-static int pzpd_shard_wsec(const struct pzpd_rshard *s, unsigned j, struct pzpd_wsec *v)
+PZPD_INTERNAL int pzpd_shard_wsec(const struct pzpd_rshard *s, unsigned j, struct pzpd_wsec *v)
 {
     if (s->words_bad) { pzpd_set_error(PZPD_E_CHECKSUM, "%s: the word index directory is damaged (rebuild it with reindex)", s->path); return 0; }
     const struct pzpd_disk_words *d = &s->sb.words[j];
@@ -679,7 +638,7 @@ static int pzpd_shard_wsec(const struct pzpd_rshard *s, unsigned j, struct pzpd_
 }
 
 /** @brief Word directory slot of (table, column) in a directory, or -1. */
-static int pzpd_words_slot(const struct pzpd_disk_words *dir, const char *table, const char *column)
+PZPD_INTERNAL int pzpd_words_slot(const struct pzpd_disk_words *dir, const char *table, const char *column)
 {
     for (unsigned j = 0; (j < PZPD_MAX_WORD_INDEXES) && (dir[j].table[0] != 0); j++)
     {
@@ -689,21 +648,12 @@ static int pzpd_words_slot(const struct pzpd_disk_words *dir, const char *table,
 }
 
 /** @brief Word directory entries in use. */
-static unsigned pzpd_words_used(const struct pzpd_disk_words *dir)
+PZPD_INTERNAL unsigned pzpd_words_used(const struct pzpd_disk_words *dir)
 {
     unsigned n = 0;
     while ( (n < PZPD_MAX_WORD_INDEXES) && (dir[n].table[0] != 0) ) { n++; }
     return n;
 }
-
-/** @brief One (word, stats) entry gathered from several vocabularies before they are merged. */
-struct pzpd_went
-{
-    const char *w;       ///< Word bytes
-    uint32_t    len;     ///< Length
-    uint64_t    records; ///< Records containing it
-    uint64_t    count;   ///< Occurrences
-};
 
 static int pzpd_cmp_went(const void *a, const void *b)
 {
@@ -711,17 +661,14 @@ static int pzpd_cmp_went(const void *a, const void *b)
     return pzpd_word_cmp(x->w, x->len, y->w, y->len);
 }
 
-/** @brief A byte string pointer + length (source values). */
-struct pzpd_bstr { const char *s; uint32_t len; };
-
-static int pzpd_cmp_bstr(const void *a, const void *b)
+PZPD_INTERNAL int pzpd_cmp_bstr(const void *a, const void *b)
 {
     const struct pzpd_bstr *x = (const struct pzpd_bstr *) a, *y = (const struct pzpd_bstr *) b;
     return pzpd_word_cmp(x->s, x->len, y->s, y->len);
 }
 
 /** @brief Sort and fold entries with equal words (summing their stats). @return The number left. */
-static size_t pzpd_went_fold(struct pzpd_went *e, size_t n)
+PZPD_INTERNAL size_t pzpd_went_fold(struct pzpd_went *e, size_t n)
 {
     if (n == 0) { return 0; }
     qsort(e, n, sizeof(*e), pzpd_cmp_went);
@@ -738,7 +685,7 @@ static size_t pzpd_went_fold(struct pzpd_went *e, size_t n)
  *  (spec §4.10): per word index and per sub-index (merged, then the union of the shards' source values sorted),
  *  the vocabulary with totals over every shard. Every shard must declare the same word indexes.
  *  @return 1 on success (W sections in secs, directory in dir), 0 on failure (error set). */
-static int pzpd_mwords_sections(struct pzpd_archive *const *shards, unsigned n, struct pzpd_buf secs[PZPD_MAX_WORD_INDEXES],
+PZPD_INTERNAL int pzpd_mwords_sections(struct pzpd_archive *const *shards, unsigned n, struct pzpd_buf secs[PZPD_MAX_WORD_INDEXES],
                                 struct pzpd_disk_words dir[PZPD_MAX_WORD_INDEXES], unsigned *W)
 {
     memset(dir, 0, sizeof(struct pzpd_disk_words) * PZPD_MAX_WORD_INDEXES);
@@ -860,11 +807,8 @@ static int pzpd_mwords_sections(struct pzpd_archive *const *shards, unsigned n, 
     return ok;
 }
 
-
-
-
 /** @brief Single-archive part of pzpd_shard_info_get(): ordinals, shards and stream ids are local to the archive. */
-static int arch_shard_info_get(struct pzpd_archive *a, unsigned shard, pzpd_shard_info *out)
+PZPD_INTERNAL int pzpd_arch_shard_info_get(struct pzpd_archive *a, unsigned shard, pzpd_shard_info *out)
 {
     pzpd_clear_error();
     if ( (a == NULL) || (out == NULL) || (shard >= a->shard_count) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
@@ -916,7 +860,7 @@ static uint64_t pzpd_lower_bound(const unsigned char *base, uint64_t n, size_t s
 /** @brief Compare stored key / name bytes of (ordinal, stream, kind) with the query.
  *  @return 1 if they match, 0 if not or if the shard is unavailable. */
 /** @brief Group-table entry holding a record of a shard (binary search), or NULL if the record is in no group. */
-static const struct pzpd_disk_group *pzpd_group_at(const struct pzpd_rshard *s, uint64_t local)
+PZPD_INTERNAL const struct pzpd_disk_group *pzpd_group_at(const struct pzpd_rshard *s, uint64_t local)
 {
     if (s->groups == NULL) { return NULL; }
     uint64_t lo = 0, hi = s->sb.group_count;          // first entry with first_local > local, then one back
@@ -926,7 +870,7 @@ static const struct pzpd_disk_group *pzpd_group_at(const struct pzpd_rshard *s, 
     return (local < (uint64_t) g->first_local + g->frame_count) ? g : NULL;
 }
 
-static int pzpd_match(struct pzpd_archive *a, uint64_t ordinal, uint8_t stream, uint8_t kind, const char *key, size_t len)
+PZPD_INTERNAL int pzpd_match(struct pzpd_archive *a, uint64_t ordinal, uint8_t stream, uint8_t kind, const char *key, size_t len)
 {
     uint64_t local;
     struct pzpd_rshard *s = pzpd_locate(a, ordinal, &local);
@@ -950,7 +894,7 @@ static int pzpd_match(struct pzpd_archive *a, uint64_t ordinal, uint8_t stream, 
 
 /** @brief Single-archive part of pzpd_find(): ordinals, shards and stream ids are local to the archive.
  *  @param only_kind PZPD_KIND_KEY or PZPD_KIND_NAME to search one namespace, -1 for keys then names. */
-static int64_t arch_find(struct pzpd_archive *a, const char *key, size_t len, int *stream_out, int only_kind)
+PZPD_INTERNAL int64_t pzpd_arch_find(struct pzpd_archive *a, const char *key, size_t len, int *stream_out, int only_kind)
 {
     pzpd_clear_error();
     if ( (a == NULL) || (key == NULL) || (len == 0) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return -1; }
@@ -995,7 +939,7 @@ static int64_t arch_find(struct pzpd_archive *a, const char *key, size_t len, in
 }
 
 /** @brief Single-archive part of pzpd_record_key(): ordinals, shards and stream ids are local to the archive. */
-static const char *arch_record_key(struct pzpd_archive *a, uint64_t ordinal, size_t *len)
+PZPD_INTERNAL const char *pzpd_arch_record_key(struct pzpd_archive *a, uint64_t ordinal, size_t *len)
 {
     pzpd_clear_error();
     if (a == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL handle"); return NULL; }
@@ -1009,7 +953,7 @@ static const char *arch_record_key(struct pzpd_archive *a, uint64_t ordinal, siz
 }
 
 /** @brief Single-archive part of pzpd_blob_info_get(): ordinals, shards and stream ids are local to the archive. */
-static int arch_blob_info_get(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, pzpd_blob_info *out)
+PZPD_INTERNAL int pzpd_arch_blob_info_get(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, pzpd_blob_info *out)
 {
     pzpd_clear_error();
     if ( (a == NULL) || (out == NULL) || (stream >= a->S) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
@@ -1044,7 +988,7 @@ static int arch_blob_info_get(struct pzpd_archive *a, uint64_t ordinal, unsigned
 
 /** @brief Find a blob's descriptor in its record header (for checksums), bounds-checked.
  *  @return 1 and the payload XXH32 in *xxh, 0 if the header is damaged (error set). */
-static int pzpd_header_blob_xxh(const struct pzpd_rshard *s, uint64_t local, unsigned stream, uint32_t *xxh)
+PZPD_INTERNAL int pzpd_header_blob_xxh(const struct pzpd_rshard *s, uint64_t local, unsigned stream, uint32_t *xxh)
 {
     const struct pzpd_disk_record *r = &s->rtab[local];
     struct pzpd_disk_record_header rh;
@@ -1082,7 +1026,7 @@ static const struct pzpd_disk_blob *pzpd_resolve(struct pzpd_archive *a, uint64_
 }
 
 /** @brief Single-archive part of pzpd_read_into(): ordinals, shards and stream ids are local to the archive. */
-static ssize_t arch_read_into(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, void *buf, size_t cap)
+PZPD_INTERNAL ssize_t pzpd_arch_read_into(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, void *buf, size_t cap)
 {
     pzpd_clear_error();
     struct pzpd_rshard *s;
@@ -1102,7 +1046,7 @@ static ssize_t arch_read_into(struct pzpd_archive *a, uint64_t ordinal, unsigned
 }
 
 /** @brief Single-archive part of pzpd_read_alloc(): ordinals, shards and stream ids are local to the archive. */
-static void *arch_read_alloc(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, size_t *size)
+PZPD_INTERNAL void *pzpd_arch_read_alloc(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, size_t *size)
 {
     pzpd_clear_error();
     if (size != NULL) { *size = 0; }
@@ -1112,7 +1056,7 @@ static void *arch_read_alloc(struct pzpd_archive *a, uint64_t ordinal, unsigned 
     if ( (b == NULL) || (b->rel_offset == PZPD_MISSING) ) { return NULL; }
     void *buf = malloc(b->size > 0 ? b->size : 1);
     if (buf == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory for a %u byte blob", b->size); return NULL; }
-    ssize_t r = arch_read_into(a, ordinal, stream, buf, b->size);
+    ssize_t r = pzpd_arch_read_into(a, ordinal, stream, buf, b->size);
     if (r < 0) { free(buf); return NULL; }
     if (size != NULL) { *size = (size_t) r; }
     return buf;
@@ -1124,7 +1068,7 @@ void pzpd_free(void *ptr)
 }
 
 /** @brief Single-archive part of pzpd_view(): ordinals, shards and stream ids are local to the archive. */
-static const void *arch_view(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, size_t *size)
+PZPD_INTERNAL const void *pzpd_arch_view(struct pzpd_archive *a, uint64_t ordinal, unsigned stream, size_t *size)
 {
     pzpd_clear_error();
     if (size != NULL) { *size = 0; }
@@ -1145,7 +1089,7 @@ static const void *arch_view(struct pzpd_archive *a, uint64_t ordinal, unsigned 
 
 /** @brief Span [start,end) relative to the record covering the requested present blobs.
  *  @return 1 if at least one requested blob is present, 0 if none; -1 on error. */
-static int pzpd_span(struct pzpd_archive *a, uint64_t ordinal, uint32_t mask, struct pzpd_rshard **so, uint64_t *localOut, uint64_t *start, uint64_t *end)
+PZPD_INTERNAL int pzpd_span(struct pzpd_archive *a, uint64_t ordinal, uint32_t mask, struct pzpd_rshard **so, uint64_t *localOut, uint64_t *start, uint64_t *end)
 {
     if (a == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL handle"); return -1; }
     uint64_t local;
@@ -1170,7 +1114,7 @@ static int pzpd_span(struct pzpd_archive *a, uint64_t ordinal, uint32_t mask, st
 }
 
 /** @brief Single-archive part of pzpd_record_span(): ordinals, shards and stream ids are local to the archive. */
-static size_t arch_record_span(struct pzpd_archive *a, uint64_t ordinal, uint32_t stream_mask)
+PZPD_INTERNAL size_t pzpd_arch_record_span(struct pzpd_archive *a, uint64_t ordinal, uint32_t stream_mask)
 {
     pzpd_clear_error();
     struct pzpd_rshard *s;
@@ -1180,7 +1124,7 @@ static size_t arch_record_span(struct pzpd_archive *a, uint64_t ordinal, uint32_
 }
 
 /** @brief Single-archive part of pzpd_read_record(): ordinals, shards and stream ids are local to the archive. */
-static ssize_t arch_read_record(struct pzpd_archive *a, uint64_t ordinal, uint32_t stream_mask, void *buf, size_t cap, pzpd_blob_ref *refs)
+PZPD_INTERNAL ssize_t pzpd_arch_read_record(struct pzpd_archive *a, uint64_t ordinal, uint32_t stream_mask, void *buf, size_t cap, pzpd_blob_ref *refs)
 {
     pzpd_clear_error();
     struct pzpd_rshard *s;
@@ -1214,7 +1158,7 @@ static ssize_t arch_read_record(struct pzpd_archive *a, uint64_t ordinal, uint32
 }
 
 /** @brief Single-archive part of pzpd_verify_record(): ordinals, shards and stream ids are local to the archive. */
-static int arch_verify_record(struct pzpd_archive *a, uint64_t ordinal, int check_blobs)
+PZPD_INTERNAL int pzpd_arch_verify_record(struct pzpd_archive *a, uint64_t ordinal, int check_blobs)
 {
     pzpd_clear_error();
     if (a == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL handle"); return 0; }
@@ -1260,7 +1204,7 @@ static int arch_verify_record(struct pzpd_archive *a, uint64_t ordinal, int chec
 }
 
 /** @brief Single-archive part of pzpd_verify_shard(): ordinals, shards and stream ids are local to the archive. */
-static int arch_verify_shard(struct pzpd_archive *a, unsigned shard)
+PZPD_INTERNAL int pzpd_arch_verify_shard(struct pzpd_archive *a, unsigned shard)
 {
     pzpd_clear_error();
     if ( (a == NULL) || (shard >= a->shard_count) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
@@ -1321,12 +1265,12 @@ static int arch_verify_shard(struct pzpd_archive *a, unsigned shard)
 
 #if PZPDIR_WITH_PZP
 /** @brief Single-archive part of pzpd_read_pzp(): ordinals, shards and stream ids are local to the archive. */
-static unsigned char *arch_read_pzp(struct pzpd_archive *a, uint64_t ordinal, unsigned stream,
+PZPD_INTERNAL unsigned char *pzpd_arch_read_pzp(struct pzpd_archive *a, uint64_t ordinal, unsigned stream,
                              unsigned int *width, unsigned int *height,
                              unsigned int *bpp, unsigned int *channels)
 {
     size_t size = 0;
-    const void *data = arch_view(a, ordinal, stream, &size);
+    const void *data = pzpd_arch_view(a, ordinal, stream, &size);
     if (data == NULL)
     {
         if (pzpd_errorCode == PZPD_OK) { pzpd_set_error(PZPD_E_NOTFOUND, "record %llu has no blob in stream %u", (unsigned long long) ordinal, stream); }
@@ -1345,7 +1289,7 @@ static unsigned char *arch_read_pzp(struct pzpd_archive *a, uint64_t ordinal, un
 
 /** @brief Rows of a record table for one record of an archive.
  *  @return Row count (0 with no error set when there are none), 0 with error set on failure. */
-static uint32_t arch_table_rows(struct pzpd_archive *a, uint64_t ordinal, unsigned t, const void **rows_out)
+PZPD_INTERNAL uint32_t pzpd_arch_table_rows(struct pzpd_archive *a, uint64_t ordinal, unsigned t, const void **rows_out)
 {
     if (rows_out != NULL) { *rows_out = NULL; }
     if (t >= a->T) { pzpd_set_error(PZPD_E_ARG, "table %u out of range", t); return 0; }
@@ -1364,7 +1308,7 @@ static uint32_t arch_table_rows(struct pzpd_archive *a, uint64_t ordinal, unsign
 
 /** @brief Resolve a `str` field against a table view's heap.
  *  @return The bytes, or NULL if the field points outside the heap (error set). */
-static const char *pzpd_view_str(const struct pzpd_tview *v, const void *field, size_t *len)
+PZPD_INTERNAL const char *pzpd_view_str(const struct pzpd_tview *v, const void *field, size_t *len)
 {
     pzpd_str sv;
     if (field == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL field"); return NULL; }
@@ -1376,7 +1320,7 @@ static const char *pzpd_view_str(const struct pzpd_tview *v, const void *field, 
 
 /** @brief Render a set of rows as CSV into a caller buffer (snprintf-like).
  *  @return Full length, or a negative enum pzpd_error. */
-static ssize_t pzpd_rows_csv(const struct pzpd_tschema *sc, const unsigned char *rows, uint32_t n, const struct pzpd_tview *v, char *out, size_t cap)
+PZPD_INTERNAL ssize_t pzpd_rows_csv(const struct pzpd_tschema *sc, const unsigned char *rows, uint32_t n, const struct pzpd_tview *v, char *out, size_t cap)
 {
     struct pzpd_buf b = {0};
     for (uint32_t r = 0; r < n; r++)

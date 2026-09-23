@@ -9,12 +9,17 @@ Options:
     --rle           Enable delta pre-filter (USE_RLE)
     --palette       Enable per-channel palette indexing (USE_PALETTE)
     --lz4           Use LZ4 instead of ZSTD (faster decompress, larger output)
+    --groups SPEC   Channel groups stored in the header (see PZP.parse_groups),
+                    e.g. "u8:left,u16:gradient"; replaces --rle
     --workers N     Parallel worker processes (default: CPU count)
     --ext EXT       Source extension to scan for (default: png)
 
 Examples:
     # Standard compression
     python3 scripts/encode_directory.py test/segment_val2017 test/segment_val2017PZP
+
+    # Label channel + 16-bit depth packed as (high, low) bytes
+    python3 scripts/encode_directory.py all_val2017 all_val2017PZP --groups u8:left,u16:gradient
 
     # With RLE + palette (best ratio for segmentation maps)
     python3 scripts/encode_directory.py test/segment_val2017 test/segment_val2017PZP --rle --palette
@@ -38,7 +43,7 @@ import PZP
 
 
 def _encode_one(args):
-    src_path, dst_path, flags = args
+    src_path, dst_path, flags, groups = args
     try:
         import cv2
         img = cv2.imread(str(src_path), cv2.IMREAD_UNCHANGED)
@@ -57,6 +62,7 @@ def _encode_one(args):
             str(dst_path),
             img,
             configuration=flags,
+            groups=groups,
         )
         return src_path, True, None
     except Exception as exc:
@@ -74,6 +80,8 @@ def main():
     ap.add_argument("--rle",     action="store_true", help="Enable delta pre-filter")
     ap.add_argument("--palette", action="store_true", help="Enable palette indexing")
     ap.add_argument("--lz4",     action="store_true", help="Use LZ4 instead of ZSTD")
+    ap.add_argument("--groups",  default=None,
+                    help='Channel group spec, e.g. "u8:left,u16:gradient" (replaces --rle)')
     ap.add_argument("--workers", type=int, default=cpu_count(),
                     help=f"Parallel workers (default: {cpu_count()})")
     ap.add_argument("--ext", default="png",
@@ -101,6 +109,7 @@ def main():
     if flags & PZP.USE_RLE:     flag_names.append("RLE")
     if flags & PZP.USE_PALETTE: flag_names.append("PALETTE")
     if flags & PZP.USE_LZ4:     flag_names.append("LZ4")
+    if args.groups:         flag_names.append(f"GROUPS[{args.groups}]")
     flag_str = "+".join(flag_names) if flag_names else "none"
 
     ext = args.ext.lstrip(".")
@@ -120,7 +129,7 @@ def main():
         rel   = src.relative_to(src_dir)
         dst   = (dst_dir / rel).with_suffix(".pzp")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        tasks.append((src, dst, flags))
+        tasks.append((src, dst, flags, args.groups))
 
     t0 = time.perf_counter()
     ok = err = 0
@@ -148,9 +157,9 @@ def main():
 
     # Compression ratio summary
     if ok:
-        total_src = sum(s.stat().st_size for s, _, _ in tasks)
+        total_src = sum(s.stat().st_size for s, _, _, _ in tasks)
         total_dst = sum((dst_dir / s.relative_to(src_dir)).with_suffix(".pzp").stat().st_size
-                        for s, _, _ in tasks
+                        for s, _, _, _ in tasks
                         if (dst_dir / s.relative_to(src_dir)).with_suffix(".pzp").exists())
         if total_dst:
             ratio = total_src / total_dst

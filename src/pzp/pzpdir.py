@@ -31,6 +31,10 @@ Usage:
             w.add_file("rgb", "val2017/000000000009.jpg", path)
             w.rows_csv(persons, "1,10,20,30,40")
 
+    # word index (spec §3.7): words as strings, never token ids
+    with a.words("descriptions.text", canonical=True) as w:  # merged sub-index; source="old" for one source
+        w.records_per_word, w.find("dog"), w.records("dog"), w.of_record(i)
+
 ctypes releases the GIL during every library call, so the library's I/O threads and several
 Python threads reading the same archive run in parallel.
 
@@ -45,6 +49,7 @@ import ctypes
 import ctypes.util
 import os
 import sys
+import weakref
 
 try:
     import numpy as np
@@ -81,6 +86,7 @@ O_VERIFY, O_ALLOW_MISSING, O_HUGEPAGE, O_POPULATE = 1, 4, 8, 16
 TABLE_GLOBAL, TABLE_BULK = 1, 2
 PF_AUTO, PF_MAP, PF_PAGECACHE, PF_BUFFERS = 0, 1, 2, 3
 EDIT_ADD, EDIT_REPLACE, EDIT_DROP = 1, 2, 3
+WORDS_CANONICAL = 1          # Archive.words(canonical=True): apply the `synonyms` table
 EDIT_KEEP_MISSING, EDIT_DROP_MISSING = 1, 2
 STORAGE_BLOCK, STORAGE_RAM = 0, 1
 
@@ -253,6 +259,19 @@ _sig("pzpd_group_find", c_i64, P, c_char_p, c_size)
 _sig("pzpd_group_info", c_int, P, c_u64, ctypes.POINTER(Group))
 _sig("pzpd_range_span", c_size, P, c_u64, c_u32, c_u32)
 _sig("pzpd_read_range", c_ssize, P, c_u64, c_u32, c_u32, c_void_p, c_size, ctypes.POINTER(BlobRef))
+_sig("pzpd_writer_words", c_int, P, c_char_p, c_char_p, c_char_p)
+_sig("pzpd_words_open", c_int, P, c_char_p, c_char_p, c_char_p, c_size, c_uint, ctypes.POINTER(P))
+_sig("pzpd_words_close", None, P)
+_sig("pzpd_words_index", c_int, P, c_uint, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p))
+_sig("pzpd_words_sources", c_size, P, c_char_p, c_char_p, ctypes.POINTER(c_void_p), ctypes.POINTER(c_size), c_size)
+_sig("pzpd_words_find", c_i64, P, c_char_p, c_size)
+_sig("pzpd_words_arrays", c_u32, P, ctypes.POINTER(ctypes.POINTER(c_u64)), ctypes.POINTER(ctypes.POINTER(c_u64)), ctypes.POINTER(c_void_p), ctypes.POINTER(ctypes.POINTER(c_u64)))
+_sig("pzpd_words_records", c_size, P, c_u32, ctypes.POINTER(c_u64), c_size)
+_sig("pzpd_words_of_record", c_size, P, c_u64, ctypes.POINTER(c_u32), c_size)
+_sig("pzpd_words_info", c_int, P, ctypes.POINTER(c_uint), ctypes.POINTER(c_u64))
+_sig("pzpd_edit_words", c_int, c_char_p, c_uint, c_char_p, c_char_p, c_char_p)
+_TOKEN_FN = ctypes.CFUNCTYPE(c_int, c_void_p, c_size, c_void_p)
+_sig("pzpd_tokenize", c_size, c_char_p, c_size, _TOKEN_FN, c_void_p)
 _sig("pzpd_writer_finish", c_int, P)
 _sig("pzpd_writer_abort", None, P)
 try:
@@ -349,11 +368,14 @@ class Archive:
             _raise(str(path))
         self._streams = [_s(_lib.pzpd_stream_name(self._h, u)) for u in range(_lib.pzpd_stream_count(self._h))]
         self._tables = {}
+        self._words = weakref.WeakSet()      # open Words views: closed before the archive
 
     # --- lifetime ---------------------------------------------------------------------------
     def close(self):
         """Close the archive. Views, memoryviews and prefetchers of it must not be used afterwards."""
         if self._h:
+            for w in list(self._words):
+                w.close()
             _lib.pzpd_close(self._h)
             self._h = None
 
@@ -706,11 +728,13 @@ class Archive:
                 o[name] = a[name]
         for name in strs:
             col = a[name]
-            flat = col.reshape(n, -1)
-            vals = [[strings_of(int(v["offset"]), int(v["len"])) for v in row] for row in flat]
+            # offsets / lengths as Python lists in one go: per-element numpy indexing dominates big tables
             if col.ndim == 1:
-                o[name] = [v[0] for v in vals]
+                o[name] = [strings_of(off, ln) for off, ln in zip(col["offset"].tolist(), col["len"].tolist())]
             else:
+                flat = col.reshape(n, -1)
+                vals = [[strings_of(off, ln) for off, ln in zip(offs, lens)]
+                        for offs, lens in zip(flat["offset"].tolist(), flat["len"].tolist())]
                 for r in range(n):
                     for k in range(flat.shape[1]):
                         o[name][r][k] = vals[r][k]
@@ -772,10 +796,10 @@ class Archive:
             if v.row_index:
                 ix = np.ctypeslib.as_array(v.row_index, shape=(v.records + 1,)).astype(np.int64)
                 counts = np.diff(ix)
-                heap_ptr, heap_len = v.strings, v.strings_len
+                heap = ctypes.string_at(v.strings, v.strings_len) if v.strings_len else b""   # one copy per shard
 
-                def strings_of(off, ln, _p=heap_ptr, _n=heap_len):
-                    return _s(ctypes.string_at(_p + off, ln)) if (ln and off + ln <= _n) else ""
+                def strings_of(off, ln, _h=heap):
+                    return _s(_h[off:off + ln]) if (ln and off + ln <= len(_h)) else ""
                 parts.append(self._rows_array(sc, v.rows, int(v.total_rows), strings_of))
             else:
                 counts = np.zeros(v.records, dtype=np.int64)       # a member without this table
@@ -785,6 +809,45 @@ class Archive:
         raw, out, strs = self._dtypes(sc)
         rows = np.concatenate(parts) if parts else np.zeros(0, dtype=out if strs else raw)
         return index, rows
+
+    # --- word index (spec §3.7) ---------------------------------------------------------------
+    def word_indexes(self):
+        """The word indexes: list of (table, column, source_column or None)."""
+        h = self._handle()
+        out, k = [], 0
+        t, c, sc = c_char_p(), c_char_p(), c_char_p()
+        while _lib.pzpd_words_index(h, k, ctypes.byref(t), ctypes.byref(c), ctypes.byref(sc)):
+            out.append((_s(t.value), _s(c.value), _s(sc.value) or None))
+            k += 1
+        return out
+
+    def word_sources(self, spec):
+        """Source values of word index "table.column" (per-source sub-indexes), sorted."""
+        table, column = spec.split(".", 1)
+        h = self._handle()
+        n = _lib.pzpd_words_sources(h, _b(table), _b(column), None, None, 0)
+        if n == 0:
+            if _lib.pzpd_last_error_code() != 0:
+                _raise(spec)
+            return []
+        names, lens = (c_void_p * n)(), (c_size * n)()
+        _lib.pzpd_words_sources(h, _b(table), _b(column), names, lens, n)
+        return [_s(ctypes.string_at(names[i], lens[i])) for i in range(n)]
+
+    def words(self, spec, source=None, canonical=False):
+        """
+        Open word index "table.column": its merged sub-index, or one source's (source="old").
+        canonical=True applies the `synonyms` table (a record with "dog" and "dogs" counts once for "dog").
+        """
+        table, column = spec.split(".", 1)
+        out = P()
+        src = _b(source) if source is not None else None
+        if not _lib.pzpd_words_open(self._handle(), _b(table), _b(column), src, len(src) if src is not None else 0,
+                                    WORDS_CANONICAL if canonical else 0, ctypes.byref(out)):
+            _raise(spec)
+        w = Words(self, out, spec, source, canonical)
+        self._words.add(w)
+        return w
 
     def table_csv(self, ordinal, table):
         """A record's rows as CSV text."""
@@ -961,6 +1024,11 @@ class Writer:
 
     def _t(self, table):
         return table if isinstance(table, int) else self._tables[table]
+
+    def words(self, table, column, source_column=None):
+        """Declare a word index (spec §3.7) after its table, before the first record."""
+        if not _lib.pzpd_writer_words(self._h, _b(table), _b(column), _b(source_column) if source_column else None):
+            _raise("words %s.%s" % (table, column))
 
     def table(self, name, schema, global_=False, bulk=False):
         """Declare a table (before the first record); returns its id. schema: 'name:type[n] ...'."""
@@ -1179,6 +1247,133 @@ def edit_stream(manifest, op, stream, files=None, drop_missing=False):
     if not _lib.pzpd_edit_stream(_b(manifest), _OPS[op], _b(stream), arr, len(items), EDIT_DROP_MISSING if drop_missing else 0, ctypes.byref(um)):
         _raise("%s-stream %s" % (op, stream))
     return um.value
+
+
+def reindex(manifest, spec=None, source_column=None, drop=False):
+    """
+    Add / rebuild (spec "table.column") or drop (drop=True) a word index of an existing archive; with no spec,
+    rebuild every word index it has.
+    """
+    if spec is None:
+        with Archive(manifest) as a:
+            todo = a.word_indexes()
+        for t, c, sc in todo:
+            if not _lib.pzpd_edit_words(_b(manifest), EDIT_REPLACE, _b(t), _b(c), _b(sc) if sc else None):
+                _raise("%s.%s" % (t, c))
+        return
+    table, column = spec.split(".", 1)
+    if not _lib.pzpd_edit_words(_b(manifest), EDIT_DROP if drop else EDIT_REPLACE, _b(table), _b(column),
+                                _b(source_column) if source_column else None):
+        _raise(spec)
+
+
+def tokenize(text):
+    """The words of text under tokenizer v1, the word index's rule (spec §3.7)."""
+    out = []
+
+    def cb(p, n, _u):
+        out.append(ctypes.string_at(p, n).decode("ascii"))
+        return 0
+    b = _b(text)
+    _lib.pzpd_tokenize(b, len(b), _TOKEN_FN(cb), None)
+    return out
+
+
+class Words:
+    """
+    One view (surface or canonical) of one sub-index (merged, or one source) of a word index; Archive.words().
+    Word ids are valid only for this object and are never token ids.
+
+        len(w); w.words (list[str]); w.records_per_word / w.count_per_word (numpy, by word id)
+        w.find("dog") -> id or -1;  w.word(id);  w.records("dog" or id) -> numpy u64 ordinals
+        w.of_record(ordinal) -> numpy u32 word ids;  w.words_of_record(ordinal) -> list[str]
+    """
+
+    def __init__(self, archive, handle, spec, source, canonical):
+        self._archive, self._h = archive, handle      # the archive stays referenced while this is open
+        self.spec, self.source, self.canonical = spec, source, canonical
+        rec, cnt, off = ctypes.POINTER(c_u64)(), ctypes.POINTER(c_u64)(), ctypes.POINTER(c_u64)()
+        heap = c_void_p()
+        n = _lib.pzpd_words_arrays(handle, ctypes.byref(rec), ctypes.byref(cnt), ctypes.byref(heap), ctypes.byref(off))
+        if np is None:
+            raise ImportError("word indexes need numpy")
+        self.records_per_word = np.ctypeslib.as_array(rec, shape=(n,)).copy() if n else np.zeros(0, np.uint64)
+        self.count_per_word = np.ctypeslib.as_array(cnt, shape=(n,)).copy() if n else np.zeros(0, np.uint64)
+        offsets = np.ctypeslib.as_array(off, shape=(n + 1,)).copy()
+        text = ctypes.string_at(heap, int(offsets[-1])).decode("ascii") if n else ""
+        o = offsets.tolist()
+        self.words = [text[o[i]:o[i + 1]] for i in range(n)]
+        tok, cov = c_uint(), c_u64()
+        _lib.pzpd_words_info(handle, ctypes.byref(tok), ctypes.byref(cov))
+        self.tokenizer, self.covered = tok.value, cov.value
+
+    def close(self):
+        if self._h:
+            _lib.pzpd_words_close(self._h)
+            self._h = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _handle(self):
+        if not self._h:
+            raise ValueError("word index is closed")
+        return self._h
+
+    def __len__(self):
+        return len(self.words)
+
+    def word(self, id_):
+        return self.words[id_]
+
+    def find(self, word):
+        """Id of a word, or -1."""
+        b = _b(word)
+        return int(_lib.pzpd_words_find(self._handle(), b, len(b)))
+
+    def _id(self, word_or_id):
+        if isinstance(word_or_id, str):
+            i = self.find(word_or_id)
+            if i < 0:
+                raise KeyError(word_or_id)
+            return i
+        return int(word_or_id)
+
+    def records(self, word_or_id):
+        """Ordinals of the records containing the word (numpy u64, ascending)."""
+        h, i = self._handle(), self._id(word_or_id)
+        n = _lib.pzpd_words_records(h, i, None, 0)
+        if n == 0 and _lib.pzpd_last_error_code() != 0:
+            _raise(str(word_or_id))
+        out = np.zeros(n, dtype=np.uint64)
+        if n:
+            _lib.pzpd_words_records(h, i, out.ctypes.data_as(ctypes.POINTER(c_u64)), n)
+        return out
+
+    def of_record(self, ordinal):
+        """Word ids of one record (numpy u32, ascending)."""
+        h = self._handle()
+        buf = np.zeros(256, dtype=np.uint32)
+        n = _lib.pzpd_words_of_record(h, ordinal, buf.ctypes.data_as(ctypes.POINTER(c_u32)), 256)
+        if n == 0 and _lib.pzpd_last_error_code() != 0:
+            _raise("record %d" % ordinal)
+        if n > 256:
+            buf = np.zeros(n, dtype=np.uint32)
+            _lib.pzpd_words_of_record(h, ordinal, buf.ctypes.data_as(ctypes.POINTER(c_u32)), n)
+        return buf[:n].copy()
+
+    def words_of_record(self, ordinal):
+        """The words of one record (list of str)."""
+        return [self.words[i] for i in self.of_record(ordinal)]
 
 
 def compact(manifest):

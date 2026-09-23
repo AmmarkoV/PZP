@@ -208,6 +208,35 @@ static void exercise(const char *path)
             pzpd_table_csv(a, i, t, csv, sizeof(csv));
         }
     }
+    // Word indexes: enumeration, sources, and every view over every word and record
+    const char *wt, *wc, *ws;
+    for (unsigned k = 0; pzpd_words_index(a, k, &wt, &wc, &ws); k++)
+    {
+        const char *nm[8]; size_t ln[8];
+        size_t ns = pzpd_words_sources(a, wt, wc, nm, ln, 8);
+        for (size_t q = 0; (q < ns) && (q < 8); q++) { if (ln[q]) { volatile char cc = nm[q][ln[q] - 1]; (void) cc; } }
+        for (int view = 0; view < 3; view++)
+        {
+            pzpd_words *w = NULL;
+            const char *src = ((view == 2) && (ns > 0)) ? nm[0] : NULL;
+            if (!pzpd_words_open(a, wt, wc, src, src ? ln[0] : 0, (view == 1) ? PZPD_WORDS_CANONICAL : 0, &w)) { continue; }
+            uint64_t ord[64];
+            uint32_t ids[64];
+            for (uint32_t id = 0; id < pzpd_words_count(w); id++)
+            {
+                size_t l; uint64_t r, c;
+                const char *word = pzpd_words_word(w, id, &l);
+                if (word && l) { volatile char cc = word[l - 1]; (void) cc; pzpd_words_find(w, word, l); }
+                pzpd_words_stats(w, id, &r, &c);
+                size_t got = pzpd_words_records(w, id, ord, 64);
+                for (size_t q = 0; (q < got) && (q < 64); q++) { pzpd_words_of_record(w, ord[q], ids, 64); }
+            }
+            for (uint64_t i = 0; i < n; i++) { pzpd_words_of_record(w, i, ids, 64); }
+            pzpd_words_of_record(w, n + 3, ids, 64);
+            pzpd_words_find(w, "zzz", 3);
+            pzpd_words_close(w);
+        }
+    }
     pzpd_find(a, "no-such-key", 11, NULL);
     pzpd_read_into(a, n + 5, 0, buf, sizeof(buf));
     pzpd_close(a);
@@ -233,8 +262,12 @@ int main(int argc, char **argv)
     pzpd_writer_table(w, "persons", "id:u16 bbox:u16[4] kp:u16[6]", 0);
     pzpd_writer_table(w, "text", "source:str body:str", 0);
     pzpd_writer_table(w, "vec", "v:f32[16]", PZPD_TABLE_BULK);
+    pzpd_writer_table(w, "synonyms", "word:str canonical:str", PZPD_TABLE_GLOBAL);
     const char *jcsv = "head,0\n\"l eye\",0\nr eye,0\n";
     pzpd_writer_global_rows_csv(w, 0, jcsv, strlen(jcsv));
+    const char *scsv = "captions,caption\nsrc1,src0\n";
+    pzpd_writer_global_rows_csv(w, 4, scsv, strlen(scsv));
+    if (!pzpd_writer_words(w, "text", "body", "source")) { fprintf(stderr, "setup failed: %s\n", pzpd_last_error()); return 1; }
     int64_t clip = pzpd_writer_group(w, "clip seven", 10, 0);     // records 100..119: a named group; 200..209 an unnamed one (id 900)
     for (int i = 0; i < 300; i++)
     {

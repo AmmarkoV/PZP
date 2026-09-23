@@ -49,7 +49,7 @@ void pzp_thread_cleanup_export(void) { pzp_thread_cleanup(); }
 /* ── Single-frame compressor ───────────────────────────────────────────────── */
 
 /*
- * pzp_compress_file — compress raw pixel data to a .pzp file.
+ * pzp_compress_file_groups — compress raw pixel data to a .pzp file with a channel group table.
  *
  * pixels      : interleaved pixel bytes.
  *               8-bit  → [ch0, ch1, ch2, …] per pixel, 1 byte per channel.
@@ -59,17 +59,22 @@ void pzp_thread_cleanup_export(void) { pzp_thread_cleanup(); }
  * bpp         : bits per channel (8 or 16).
  * channels    : number of colour channels (e.g. 1 = grey, 3 = RGB).
  * configuration: bitfield — USE_COMPRESSION (1) | USE_RLE (2).
+ * groups      : group_count × 4 bytes { channels, sample_bits, predictor, 0 } over the internal
+ *               channels ( a 16-bit image channel is 2 internal channels ), see PZPChannelGroup in
+ *               pzp.h. NULL / 0 = one 8-bit group, LEFT predictor if USE_RLE is set.
  * output_filename: path of the .pzp file to write.
  *
  * Returns 1 on success, 0 on failure.
  */
-int pzp_compress_file(
+int pzp_compress_file_groups(
         const unsigned char *pixels,
         unsigned int width,
         unsigned int height,
         unsigned int bpp,
         unsigned int channels,
         unsigned int configuration,
+        const unsigned char *groups,
+        unsigned int group_count,
         const char   *output_filename)
 {
     if (!pixels || !output_filename || width == 0 || height == 0
@@ -99,11 +104,27 @@ int pzp_compress_file(
     int ok = pzp_compress_combined(buffers, width, height,
                           bpp, channels,
                           bpp_internal, channels_internal,
-                          configuration, output_filename);
+                          configuration,
+                          (const PZPChannelGroup *)groups, group_count,
+                          output_filename);
 
     for (unsigned int ch = 0; ch < channels_internal; ch++) free(buffers[ch]);
     free(buffers);
     return ok;
+}
+
+/* pzp_compress_file — pzp_compress_file_groups() with the default channel group. */
+int pzp_compress_file(
+        const unsigned char *pixels,
+        unsigned int width,
+        unsigned int height,
+        unsigned int bpp,
+        unsigned int channels,
+        unsigned int configuration,
+        const char   *output_filename)
+{
+    return pzp_compress_file_groups(pixels, width, height, bpp, channels, configuration,
+                                    NULL, 0, output_filename);
 }
 
 /* ── Container API ─────────────────────────────────────────────────────────── */
@@ -302,7 +323,7 @@ int pzp_write_frames(
         ok = pzp_container_write(output_filename, all_buffers,
                             frame_count, widths, heights,
                             bpp_exts, ch_exts, bpp_ints, ch_ints,
-                            configurations, delay_arr, loop_count,
+                            configurations, NULL, 0, delay_arr, loop_count,
                             metadata, metadata_bytes,
                             audio, audio_bytes, audio_format);
 

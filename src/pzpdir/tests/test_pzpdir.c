@@ -1987,6 +1987,135 @@ static void test_groups(void)
     free(sps);
 }
 
+/** @brief Tokenizer callback: append the word and a space. */
+static int words_join(const char *w, size_t n, void *user)
+{
+    char *out = (char *) user;
+    size_t l = strlen(out);
+    if (l + n + 2 < 256) { memcpy(out + l, w, n); out[l + n] = ' '; out[l + n + 1] = 0; }
+    return 0;
+}
+
+/** @brief Write a word-indexed archive: records "p<i>" with the given descriptions rows (CSV, "" = none). */
+static int words_archive(const char *path, const char *synonyms, int n, const char *const *rows, uint64_t shard_bytes)
+{
+    const char *streams[1] = { "txt" };
+    pzpd_writer_opts o = { streams, 1, shard_bytes, 64 };
+    pzpd_writer *w = pzpd_writer_create(path, &o);
+    if (w == NULL) { return 0; }
+    int td = pzpd_writer_table(w, "descriptions", "source:str text:str", 0);
+    int ok = (td >= 0);
+    if (synonyms != NULL)
+    {
+        int ts = pzpd_writer_table(w, "synonyms", "word:str canonical:str", PZPD_TABLE_GLOBAL);
+        ok = ok && (ts >= 0) && pzpd_writer_global_rows_csv(w, (unsigned) ts, synonyms, strlen(synonyms));
+    }
+    ok = ok && pzpd_writer_words(w, "descriptions", "text", "source");
+    for (int i = 0; ok && (i < n); i++)
+    {
+        char k[16];
+        int kl = snprintf(k, sizeof(k), "p%d", i);
+        ok = pzpd_writer_begin(w, k, (size_t) kl, PZPD_NO_GROUP, 0) && pzpd_writer_blob(w, 0, k, (size_t) kl, "x", 1) &&
+             ((rows[i][0] == 0) || pzpd_writer_rows_csv(w, (unsigned) td, rows[i], strlen(rows[i]))) && pzpd_writer_end(w);
+    }
+    if (!ok) { pzpd_writer_abort(w); return 0; }
+    return pzpd_writer_finish(w);
+}
+
+/** @brief Words of one record in a view, joined by spaces. */
+static void words_of(pzpd_words *w, uint64_t ordinal, char *out)
+{
+    uint32_t ids[64];
+    size_t n = pzpd_words_of_record(w, ordinal, ids, 64);
+    out[0] = 0;
+    for (size_t i = 0; (i < n) && (i < 64); i++) { size_t l; const char *s = pzpd_words_word(w, ids[i], &l); strncat(out, s, l); strcat(out, " "); }
+}
+
+static void test_words(void)
+{
+    // Tokenizer v1: lower-case ASCII words; a word with a non-ASCII word character is dropped; the Kelvin
+    // sign lowers to 'k'; U+0130 lowers to "i" + a combining dot, which splits; invalid UTF-8 splits
+    char got[256] = "";
+    const char *t = "Hello, WORLD_2 caf\xc3\xa9 \xe2\x84\xaa x\xc4\xb0y a\xffz \xe2\x80\x94" "end";
+    size_t nw = pzpd_tokenize(t, strlen(t), words_join, got);
+    CHECK( (nw == 8) && !strcmp(got, "hello world_2 k xi y a z end "), "tokenizer v1 (got %zu: \"%s\")", nw, got);
+
+    // Writer misuse
+    char p1[1100], p2[1100], shard[1100];
+    snprintf(p1, sizeof(p1), "%s/words1.pzpd", dir);
+    snprintf(p2, sizeof(p2), "%s/words2.pzpd", dir);
+    const char *streams[1] = { "txt" };
+    pzpd_writer_opts o = { streams, 1, 0, 64 };
+    pzpd_writer *w = pzpd_writer_create(p1, &o);
+    int td = pzpd_writer_table(w, "descriptions", "source:str text:str", 0);
+    int tg = pzpd_writer_table(w, "names", "n:str", PZPD_TABLE_GLOBAL);
+    CHECK( (td == 0) && (tg == 1), "tables");
+    CHECK(!pzpd_writer_words(w, "names", "n", NULL) && (pzpd_last_error_code() == PZPD_E_ARG), "a global table can't be indexed");
+    CHECK(!pzpd_writer_words(w, "descriptions", "text", "text") && (pzpd_last_error_code() == PZPD_E_ARG), "the source column must be another column");
+    CHECK(pzpd_writer_words(w, "descriptions", "text", NULL), "declare");
+    CHECK(!pzpd_writer_words(w, "descriptions", "text", "source") && (pzpd_last_error_code() == PZPD_E_DUPLICATE), "declared twice");
+    CHECK(pzpd_writer_begin(w, "k", 1, PZPD_NO_GROUP, 0) && pzpd_writer_blob(w, 0, "k", 1, "x", 1) && pzpd_writer_end(w), "a record");
+    CHECK(!pzpd_writer_words(w, "descriptions", "source", NULL) && (pzpd_last_error_code() == PZPD_E_STATE), "after the first record");
+    pzpd_writer_abort(w);
+
+    // Records without rows, an empty text, an empty source (merged sub-index only); several shards
+    const char *rowsA[5] = { "vlm,\"Two dogs\"\nold,a DOG\n", "", "vlm,\"\"\n,\"a dog without source\"\n", "old,puppy\n", "vlm,dogs\n" };
+    CHECK(words_archive(p1, "dogs,dog\npuppy,dog\n", 5, rowsA, 1), "write archive 1");
+    pzpd *a = pzpd_open(p1, 0);
+    pzpd_words *m = NULL, *c = NULL, *v = NULL;
+    CHECK( (a != NULL) && pzpd_words_open(a, "descriptions", "text", NULL, 0, 0, &m) && pzpd_words_open(a, "descriptions", "text", NULL, 0, PZPD_WORDS_CANONICAL, &c) &&
+           pzpd_words_open(a, "descriptions", "text", "vlm", 3, 0, &v), "open views");
+    if ( (m != NULL) && (c != NULL) && (v != NULL) )
+    {
+        uint64_t r = 0, cnt = 0, ord[8];
+        int64_t id = pzpd_words_find(c, "dog", 3);
+        CHECK( (id >= 0) && pzpd_words_stats(c, (uint32_t) id, &r, &cnt) && (r == 4) && (cnt == 5), "canonical dog: 4 records, 5 occurrences (%llu, %llu)", (unsigned long long) r, (unsigned long long) cnt);
+        CHECK( (pzpd_words_records(c, (uint32_t) id, ord, 8) == 4) && (ord[0] == 0) && (ord[1] == 2) && (ord[2] == 3) && (ord[3] == 4), "canonical dog: records 0 2 3 4");
+        char s1[256];
+        words_of(m, 1, s1);
+        CHECK(s1[0] == 0, "a record without rows has no words");
+        words_of(m, 2, s1);
+        CHECK(!strcmp(s1, "a dog source without "), "the row with an empty source is in the merged sub-index (\"%s\")", s1);
+        words_of(v, 2, s1);
+        CHECK(s1[0] == 0, "... and in no source's (\"%s\")", s1);
+        uint64_t cov = 0;
+        pzpd_words_info(v, NULL, &cov);
+        CHECK(cov == 5, "covered records");
+        CHECK( (pzpd_words_find(m, "zzz", 3) == -1) && (pzpd_words_word(m, 999, NULL) == NULL) && !pzpd_words_stats(m, 999, NULL, NULL), "lookups out of range");
+        CHECK( (pzpd_words_of_record(m, 99, NULL, 0) == 0) && (pzpd_last_error_code() == PZPD_E_ARG), "ordinal out of range");
+    }
+    pzpd_words_close(m); pzpd_words_close(c); pzpd_words_close(v);
+    const char *wt = NULL, *wc = NULL, *ws = NULL;
+    CHECK(pzpd_words_index(a, 0, &wt, &wc, &ws) && !strcmp(wt, "descriptions") && !strcmp(wc, "text") && !strcmp(ws, "source") && !pzpd_words_index(a, 1, NULL, NULL, NULL), "words_index");
+    pzpd_close(a);
+
+    // A shard opened on its own (no manifest): its own vocabulary
+    snprintf(shard, sizeof(shard), "%s/words1.00000.pzpd", dir);
+    a = pzpd_open(shard, 0);
+    m = NULL;
+    CHECK( (a != NULL) && pzpd_words_open(a, "descriptions", "text", NULL, 0, 0, &m) && (pzpd_words_count(m) == 4) && (pzpd_words_find(m, "two", 3) >= 0) && (pzpd_words_find(m, "puppy", 5) < 0), "standalone shard: record p0 only");
+    pzpd_words_close(m);
+    pzpd_close(a);
+
+    // Two archives as one: vocabularies merged by bytes; conflicting synonyms fail the canonical view only
+    const char *rowsB[2] = { "vlm,\"dogs and a giraffe\"\n", "old,\"puppy\"\n" };
+    CHECK(words_archive(p2, "puppy,hound\n", 2, rowsB, 0), "write archive 2");
+    const char *paths[2] = { p1, p2 };
+    a = pzpd_open_many(paths, NULL, 2, 0);
+    m = c = NULL;
+    CHECK( (a != NULL) && pzpd_words_open(a, "descriptions", "text", NULL, 0, 0, &m), "surface view over two archives");
+    if (m != NULL)
+    {
+        uint64_t ord[8];
+        int64_t id = pzpd_words_find(m, "dogs", 4);
+        CHECK( (id >= 0) && (pzpd_words_records(m, (uint32_t) id, ord, 8) == 3) && (ord[0] == 0) && (ord[1] == 4) && (ord[2] == 5), "dogs: records 0 4 5 (collection ordinals)");
+    }
+    CHECK(!pzpd_words_open(a, "descriptions", "text", NULL, 0, PZPD_WORDS_CANONICAL, &c) && (pzpd_last_error_code() == PZPD_E_FORMAT) && (c == NULL), "conflicting synonyms over members");
+    CHECK(!pzpd_words_open(a, "descriptions", "nope", NULL, 0, 0, &c) && (pzpd_last_error_code() == PZPD_E_NOTFOUND), "no such word index");
+    pzpd_words_close(m);
+    pzpd_close(a);
+}
+
 int main(void)
 {
     const char *d = getenv("PZPDIR_TEST_DIR");
@@ -2003,6 +2132,7 @@ int main(void)
     printf("prefetcher\n");     test_prefetch();
     printf("recovery\n");       test_recovery();
     printf("groups\n");         test_groups();
+    printf("words\n");          test_words();
     printf("open time\n");      test_open_time();
 
     printf("%d checks, %s%d failures\033[0m\n", checks, failures ? "\033[31m" : "\033[32m", failures);

@@ -33,7 +33,7 @@ $(SPZP): $(SRC)
 	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(SPZP)
 
 $(LIBPZP): $(LIB_SRC) pzp.h
-	$(CC) -shared -fPIC $(LIB_SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(LIBPZP)
+	$(CC) -shared -fPIC $(LIB_SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(LIBPZP)
 
 clean:
 	rm -rf $(PZP) $(DPZP) $(SPZP) $(LIBPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt

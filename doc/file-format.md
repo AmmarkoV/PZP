@@ -10,9 +10,55 @@
     [ 40 bytes ] header  (10 × uint32)
                    magic · bpp_ext · channels_ext · width · height
                    bpp_int · channels_int · checksum · config · palette_bytes
+    [ 1 + 4×G bytes ] channel group table ("PZP1" frames only, see below)
     [ P bytes  ] palette data (optional, when USE_PALETTE is set)
-    [ W×H×C bytes ] interleaved pixel / index data
+    [ W×H×C bytes ] pixel / index data, laid out per channel group
 ```
+
+The inner header magic tells the two frame layouts apart:
+
+| Magic | Written by | Pixel data |
+|---|---|---|
+| `PZP1` | v0.03+ | channel group table follows the header |
+| `PZP0` | before v0.03 | one implied 8-bit group over all channels, LEFT predictor if `USE_RLE` is set |
+
+Decoders older than v0.03 reject `PZP1` frames rather than misreading them.
+`scripts/migrate_directory.py` re-encodes existing files in place (verifying
+every pixel before replacing a file); once no `PZP0` frames are left, the
+`PZP0` branch in `pzp_frame_decode_from_memory()` can be removed.
+
+### Channel group table
+
+```
+[ 1 byte ] group_count (1–8)
+[ group_count × 4 bytes ] { channels, sample_bits, predictor, reserved=0 }
+```
+
+Groups take consecutive internal channels in order and together cover all of
+them.  The pixel data holds each group's block one after another:
+
+| sample_bits | channels | predictor | Block layout |
+|---|---|---|---|
+| 8 | any | 0 none / 1 left | the group's channels interleaved pixel by pixel; left = previous pixel of the same channel in raster order |
+| 16 | 2 (high, low byte) | 2 gradient | one big-endian 16-bit sample predicted as left + up − upleft (mod 2^16); zigzag residuals stored as a high-byte plane then a low-byte plane |
+
+`USE_PALETTE` is applied to the channels before prediction and is only allowed
+when every group is 8-bit.  `USE_RLE` is not read for `PZP1` frames: the
+predictors in the table replace it.
+
+Python spec strings (`PZP.write(..., groups=...)`, `encode_directory.py
+--groups`, `migrate_directory.py --groups`): comma-separated `u8[xN]:none|left`
+and `u16:gradient`.  Examples:
+
+| Image | Spec | Why |
+|---|---|---|
+| label + 16-bit depth packed into 3 bytes | `u8:left,u16:gradient` | depth predicted as one 16-bit value, label kept apart |
+| 16-bit depth map | `u16:gradient` | |
+| RGB segmentation map | `u8x3:left` | its channels share edges, so interleaved compresses best |
+
+On COCO val2017 (label + DA3 depth, 200 images) `u8:left,u16:gradient` is 51%
+of the previous LZ4 size and 54% of the previous ZSTD size, and decodes
+1.6–1.7× faster with `INTEL_OPTIMIZATIONS` (AVX2).
 
 16-bit images are stored as two 8-bit internal channels per original channel
 (high-byte plane / low-byte plane), which improves compression ratio.

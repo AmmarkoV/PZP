@@ -349,6 +349,46 @@ def test_pzp_images():
         assert img.shape == arr.shape and (img == arr).all()
 
 
+def test_words():
+    """Word index (spec §3.7): Writer.words, per-source + merged sub-indexes, canonical view, reindex, tokenize."""
+    d = fresh("words")
+    path = os.path.join(d, "w.pzpd")
+    caps = [[("vlm", "A dog and a Dog."), ("old", "two dogs")], [("vlm", "a puppy!")], [("vlm", "Cat; caf\u00e9 dog_1")], []]
+    with pzpdir.Writer(path, ["txt"], shard_size=1) as w:
+        t = w.table("descriptions", "source:str text:str")
+        syn = w.table("synonyms", "word:str canonical:str", global_=True)
+        w.global_rows_csv(syn, "dogs,dog\npuppy,dog\n")
+        w.words("descriptions", "text", "source")
+        for i, rows in enumerate(caps):
+            with w.record("r%d" % i):
+                w.add("txt", "r%d.txt" % i, b"x")
+                for src, text in rows:
+                    w.rows_csv(t, '%s,"%s"' % (src, text))
+    assert pzpdir.tokenize("A Dog, caf\u00e9 \u212a dog_1") == ["a", "dog", "k", "dog_1"]
+    with pzpdir.open(path) as a:
+        assert a.word_indexes() == [("descriptions", "text", "source")]
+        assert a.word_sources("descriptions.text") == ["old", "vlm"]
+        with a.words("descriptions.text") as w:
+            assert w.words == ["a", "and", "cat", "dog", "dog_1", "dogs", "puppy", "two"]
+            assert w.records("dog").tolist() == [0] and int(w.count_per_word[w.find("dog")]) == 2
+            assert w.words_of_record(3) == [] and w.covered == 4 and w.find("nope") == -1
+        with a.words("descriptions.text", canonical=True) as w:
+            i = w.find("dog")
+            assert w.records(i).tolist() == [0, 1] and int(w.records_per_word[i]) == 2 and int(w.count_per_word[i]) == 4
+            assert w.words_of_record(0) == ["a", "and", "dog", "two"]
+        with a.words("descriptions.text", source="old") as w:
+            assert w.words == ["dogs", "two"] and w.records("two").tolist() == [0]
+        w = a.words("descriptions.text")
+    assert not w._h                                            # closed with its archive
+    pzpdir.reindex(path, "descriptions.text", drop=True)
+    with pzpdir.open(path) as a:
+        assert a.word_indexes() == []
+    pzpdir.reindex(path, "descriptions.text")                  # no source column now: merged only
+    with pzpdir.open(path) as a:
+        assert a.word_sources("descriptions.text") == [] and len(a.words("descriptions.text")) == 8
+        assert a.verify()
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

@@ -96,6 +96,19 @@ _lib.pzp_compress_file.argtypes = [
     ctypes.c_char_p,                   # output_filename
 ]
 
+_lib.pzp_compress_file_groups.restype  = ctypes.c_int
+_lib.pzp_compress_file_groups.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),    # pixels
+    ctypes.c_uint,                     # width
+    ctypes.c_uint,                     # height
+    ctypes.c_uint,                     # bpp  (8 or 16)
+    ctypes.c_uint,                     # channels
+    ctypes.c_uint,                     # configuration
+    ctypes.c_char_p,                   # groups (4 bytes per group)
+    ctypes.c_uint,                     # group_count
+    ctypes.c_char_p,                   # output_filename
+]
+
 # Container API signatures
 _lib.pzp_container_frame_count.restype  = ctypes.c_uint
 _lib.pzp_container_frame_count.argtypes = [ctypes.c_char_p]
@@ -191,6 +204,37 @@ USE_RLE          = 2
 USE_PALETTE      = 4
 USE_INTER_DELTA  = 8   # inter-frame delta: frame[N] stores frame[N] - frame[N-1]
 USE_LZ4          = 16  # use LZ4 instead of ZSTD (faster decompress, larger output)
+
+# Channel group predictors (PZPPredictor in pzp.h)
+_PREDICTORS = {"none": 0, "left": 1, "gradient": 2}
+
+
+def parse_groups(spec: str) -> bytes:
+    """
+    Turn a channel group spec into the 4-byte-per-group table of pzp.h (PZPChannelGroup).
+
+    Comma-separated groups over the image channels, in order:
+        u8[xN]:none|left   N (default 1) 8-bit channels stored interleaved
+        u16:gradient       one 16-bit sample; for 8-bit images it takes two
+                           channels (high byte, low byte)
+    e.g. "u8:left,u16:gradient" for a label channel followed by a 16-bit depth
+    packed into two 8-bit channels, or "u16:gradient" for a 16-bit depth map.
+    """
+    table = bytearray()
+    for token in spec.split(","):
+        kind, _, pred = token.strip().partition(":")
+        if pred not in _PREDICTORS:
+            raise ValueError(f"PZP.parse_groups: unknown predictor in '{token}'")
+        if kind == "u16":
+            table += bytes([2, 16, _PREDICTORS[pred], 0])
+        elif kind.startswith("u8"):
+            count = int(kind[3:]) if kind.startswith("u8x") else 1
+            if kind not in ("u8", f"u8x{count}"):
+                raise ValueError(f"PZP.parse_groups: bad group '{token}'")
+            table += bytes([count, 8, _PREDICTORS[pred], 0])
+        else:
+            raise ValueError(f"PZP.parse_groups: bad group '{token}'")
+    return bytes(table)
 
 # Audio format four-char tags (mirror of PZP_AUDIO_* in pzp.h)
 AUDIO_WAVE = 0x57415645  # "WAVE"
@@ -417,6 +461,7 @@ def write(filename: str, data, *,
           use_rle: bool = False,
           use_palette: bool = False,
           use_lz4: bool = False,
+          groups: str = None,
           configuration: int = USE_COMPRESSION) -> None:
     """
     Compress pixel data and write a .pzp file.
@@ -444,6 +489,10 @@ def write(filename: str, data, *,
     use_lz4 : bool
         Use LZ4 instead of ZSTD.  LZ4 decompresses faster but produces
         larger output than ZSTD.  Adds USE_LZ4 to the configuration bitfield.
+    groups : str
+        Channel group spec (see parse_groups), e.g. "u8:left,u16:gradient".
+        Stored in the file header; replaces use_rle for prediction.  None =
+        all channels in one 8-bit group.
     configuration : int
         Full configuration bitfield.  USE_COMPRESSION (1) is always or'd in.
         Prefer the convenience booleans (use_rle, use_palette, use_lz4) for
@@ -506,7 +555,12 @@ def write(filename: str, data, *,
     buf   = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
     fname = filename.encode(sys.getfilesystemencoding())
 
-    rc = _lib.pzp_compress_file(buf, w, h, pixel_bpp, c, cfg, fname)
+    if groups:
+        table = parse_groups(groups)
+        rc = _lib.pzp_compress_file_groups(buf, w, h, pixel_bpp, c, cfg,
+                                           table, len(table) // 4, fname)
+    else:
+        rc = _lib.pzp_compress_file(buf, w, h, pixel_bpp, c, cfg, fname)
     if rc == 0:
         raise RuntimeError(f"PZP.write: compression failed for '{filename}'")
 

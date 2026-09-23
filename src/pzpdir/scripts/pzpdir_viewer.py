@@ -3,19 +3,22 @@
 pzpdir_viewer.py - A small wxPython explorer for .pzpd archives.
 
 Opens an archive (manifest, single shard, or collection) and shows:
-  - every record (ordinal, key, member), filtered by a key substring;
+  - every record (ordinal, key, member), filtered by a key substring, or by a case-insensitive
+    substring of the record's text table columns (e.g. descriptions; indexed on first use);
   - for the selected record: every stream's blob (name, format, WxHxC@bits, size) and every
     table's rows (captions, image size, persons, descriptors as length + norm + first values);
   - a preview of one stream: images decoded (PZP natively, others through PIL), 16-bit and
     single-channel data stretched to 8 bits for display, persons (bbox + keypoints) drawn on top
-    when the record has a `persons` table; text blobs shown as text;
+    when the record has a `persons` table; text blobs shown as text; a 3-channel 8-bit PZP image
+    can also be viewed as its segmentation (channel 0) or its 16-bit depth (channels 1+2), the
+    layout of the combined label + depth files;
   - an archive summary: members, shards (storage, recovery, AUTO prefetch mode), streams, tables.
 The selected blob can be saved to a file.
 
 Usage:
     python3 pzpdir_viewer.py [archive.pzpd]
 
-Needs wxPython, numpy, PIL, and the PZP Python package (pzp.pzpdir); when that isn't installed
+Needs wxPython, numpy (>= 2.0, for the search indexes), PIL, and the PZP Python package (pzp.pzpdir); when that isn't installed
 it is taken from this repository's src/ directory.
 
 Repository : https://github.com/AmmarkoV/PZP
@@ -36,6 +39,37 @@ except ImportError:
 
 IMAGE_FORMATS = {"JPEG", "PNG", "PZP", "PZPC", "PNM", "PFM"}
 TEXT_FORMATS = {"JSON", "TEXT", "CSV", "TSV"}
+
+# One colour per segmentation label; label 0 (background) stays black
+LABEL_COLOURS = np.random.RandomState(7).randint(60, 256, (256, 3)).astype(np.uint8)
+LABEL_COLOURS[0] = 0
+SEGMENTATION_VIEW = "Segmentation (channel 0)"
+DEPTH_VIEW = "Depth (channels 1+2, 16-bit)"
+
+
+def image_views(arr, fmt):
+    """
+    The views of a decoded image the preview offers.
+
+    Parameters
+    ----------
+    arr : numpy.ndarray
+        A decoded image, as read_image returns it.
+    fmt : str
+        The blob's format ("PZP", "PZPC", "JPEG", ...).
+
+    Returns
+    -------
+    dict
+        view name -> image. Always "Image" (arr itself); a 3-channel 8-bit PZP image may be a
+        combined label + depth file (channel 0 = segmentation labels, channels 1 and 2 = high and
+        low byte of a 16-bit depth), so it also gets those two as standalone images.
+    """
+    views = {"Image": arr}
+    if fmt in ("PZP", "PZPC") and arr.ndim == 3 and arr.shape[2] == 3 and arr.dtype == np.uint8:
+        views[SEGMENTATION_VIEW] = arr[:, :, 0]
+        views[DEPTH_VIEW] = (arr[:, :, 1].astype(np.uint16) << 8) | arr[:, :, 2]
+    return views
 
 
 def to_display(arr):
@@ -65,6 +99,48 @@ def to_display(arr):
     if arr.shape[2] == 1:
         arr = np.repeat(arr, 3, axis=2)
     return np.ascontiguousarray(arr)
+
+
+def build_key_index(archive):
+    """
+    Every record key as one numpy string array ( numpy >= 2 StringDType ), so a key search is a
+    vectorised np.strings.find instead of one library call per record.
+    """
+    return np.array([archive.key(o) for o in range(len(archive))], dtype=np.dtypes.StringDType())
+
+
+def build_text_index(archive):
+    """
+    Lower-cased text of every record's string table columns, for case-insensitive search.
+
+    Parameters
+    ----------
+    archive : pzpdir.Archive
+        The opened archive.
+
+    Returns
+    -------
+    list of (numpy.ndarray, numpy.ndarray)
+        One (owners, texts) pair per str column of every record table: texts[r] is row r's value
+        lower-cased ( numpy StringDType ), owners[r] the ordinal of the record the row belongs to.
+    """
+    columns = []
+    for t in archive.tables:
+        sc = archive.schema(t)
+        cols = [name for name, ty, count, _off in sc["columns"] if ty == "str" and count == 1]
+        if sc["global"] or not cols:
+            continue
+        index, rows = archive.table_all(t)   # one bulk read per table
+        owners = np.repeat(np.arange(len(archive)), np.diff(index))
+        for name in cols:
+            columns.append((owners, np.strings.lower(rows[name].astype(np.dtypes.StringDType()))))
+    return columns
+
+
+def search_text_index(columns, needle):
+    """Sorted ordinals of the records with a row whose text contains needle ( already lower-cased )."""
+    hits = [owners[np.strings.find(texts, needle) >= 0] for owners, texts in columns]
+    return np.unique(np.concatenate(hits)) if hits else np.zeros(0, dtype=np.int64)
 
 
 class RecordList(wx.ListCtrl):
@@ -143,6 +219,8 @@ class ViewerFrame(wx.Frame):
     def __init__(self, path=None):
         super().__init__(None, title="pzpdir viewer", size=(1280, 820))
         self.archive, self.path, self.current = None, None, None
+        self.key_index = None    # build_key_index() of the open archive, built on the first key search
+        self.text_index = None   # build_text_index() of the open archive, built on the first text search
 
         menu = wx.Menu()
         self.Bind(wx.EVT_MENU, self.on_open, menu.Append(wx.ID_OPEN, "&Open...\tCtrl+O"))
@@ -158,9 +236,16 @@ class ViewerFrame(wx.Frame):
         left = wx.Panel(split)
         self.search = wx.SearchCtrl(left, style=wx.TE_PROCESS_ENTER)
         self.search.SetDescriptiveText("filter keys")
+        self.scope = wx.Choice(left, choices=["key", "text tables"])
+        self.scope.SetSelection(0)
+        self.scope.SetToolTip("key: substring of the record key\n"
+                              "text tables: case-insensitive substring of the record's text columns (e.g. descriptions)")
         self.records = RecordList(left)
+        ss = wx.BoxSizer(wx.HORIZONTAL)
+        ss.Add(self.search, 1, wx.EXPAND | wx.RIGHT, 4)
+        ss.Add(self.scope, 0, wx.ALIGN_CENTER_VERTICAL)
         ls = wx.BoxSizer(wx.VERTICAL)
-        ls.Add(self.search, 0, wx.EXPAND | wx.ALL, 4)
+        ls.Add(ss, 0, wx.EXPAND | wx.ALL, 4)
         ls.Add(self.records, 1, wx.EXPAND)
         left.SetSizer(ls)
 
@@ -169,6 +254,10 @@ class ViewerFrame(wx.Frame):
         top.Add(wx.StaticText(right, label="Stream:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 4)
         self.stream = wx.Choice(right)
         top.Add(self.stream, 0, wx.ALL, 4)
+        top.Add(wx.StaticText(right, label="View:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 4)
+        self.view = wx.Choice(right, choices=["Image"])
+        self.view.SetSelection(0)
+        top.Add(self.view, 0, wx.ALL, 4)
         self.overlay = wx.CheckBox(right, label="Draw persons")
         self.overlay.SetValue(True)
         top.Add(self.overlay, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 4)
@@ -194,8 +283,10 @@ class ViewerFrame(wx.Frame):
         self.search.Bind(wx.EVT_TEXT_ENTER, self.on_filter)
         self.search.Bind(wx.EVT_SEARCHCTRL_SEARCH_BTN, self.on_filter)
         self.search.Bind(wx.EVT_SEARCHCTRL_CANCEL_BTN, self.on_clear_filter)
+        self.scope.Bind(wx.EVT_CHOICE, self.on_scope)
         self.records.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
         self.stream.Bind(wx.EVT_CHOICE, lambda _e: self.show_preview())
+        self.view.Bind(wx.EVT_CHOICE, lambda _e: self.show_preview())
         self.overlay.Bind(wx.EVT_CHECKBOX, lambda _e: self.show_preview())
         self.Bind(wx.EVT_CLOSE, self.on_close)
         if path:
@@ -211,6 +302,7 @@ class ViewerFrame(wx.Frame):
         if self.archive is not None:
             self.archive.close()
         self.archive, self.path = a, path
+        self.key_index = self.text_index = None
         self.SetTitle("pzpdir viewer - %s" % path)
         self.search.SetValue("")
         self.stream.SetItems(a.streams)
@@ -260,15 +352,30 @@ class ViewerFrame(wx.Frame):
             return
         text = self.search.GetValue()
         a = self.archive
+        in_text = self.scope.GetSelection() == 1
         wx.BeginBusyCursor()
         try:
-            ordinals = [i for i in range(len(a)) if text in a.key(i)] if text else list(range(len(a)))
+            if not text:
+                ordinals = list(range(len(a)))
+            elif in_text:
+                if self.text_index is None:
+                    self.text_index = build_text_index(a)
+                ordinals = search_text_index(self.text_index, text.lower()).tolist()
+            else:
+                if self.key_index is None:
+                    self.key_index = build_key_index(a)
+                ordinals = np.flatnonzero(np.strings.find(self.key_index, text) >= 0).tolist()
         finally:
             wx.EndBusyCursor()
         self.records.set_records(a, ordinals)
-        self.SetStatusText("%d of %d records match %r" % (len(ordinals), len(a), text))
+        self.SetStatusText("%d of %d records match %r%s" % (len(ordinals), len(a), text, " in text tables" if in_text else ""))
         if ordinals:
             self.records.Select(0)
+
+    def on_scope(self, _evt):
+        self.search.SetDescriptiveText("filter keys" if self.scope.GetSelection() == 0 else "filter text (any case)")
+        if self.search.GetValue():
+            self.on_filter(None)
 
     def on_clear_filter(self, _evt):
         self.search.SetValue("")
@@ -323,6 +430,7 @@ class ViewerFrame(wx.Frame):
             return
         st = a.streams[self.stream.GetSelection()]
         inf = a.info(o, st)
+        self.view.Disable()   # enabled again below once an image with several views is decoded
         if inf is None:
             self.preview.show(message="record %d has no %s blob" % (o, st))
             return
@@ -336,10 +444,27 @@ class ViewerFrame(wx.Frame):
             self.preview.show(message="no preview for %s blobs (%d bytes)" % (fmt, inf["size"]))
             return
         try:
-            rgb = to_display(a.read_image(o, st))
+            views = image_views(a.read_image(o, st), fmt)
         except Exception as e:   # a damaged or unsupported blob must not take the viewer down
             self.preview.show(message="cannot decode %s: %s" % (inf["name"], e))
             return
+        names = list(views)
+        if self.view.GetItems() != names:   # keep the chosen view while it is on offer
+            keep = self.view.GetStringSelection()
+            self.view.SetItems(names)
+            self.view.SetSelection(names.index(keep) if keep in names else 0)
+        self.view.Enable(len(names) > 1)
+        view = self.view.GetStringSelection()
+        data = views[view]
+        if view == SEGMENTATION_VIEW:
+            rgb = np.ascontiguousarray(LABEL_COLOURS[data])
+            detail = "  %s: %d labels" % (view, len(np.unique(data)))
+        elif view == DEPTH_VIEW:
+            rgb = to_display(data)
+            detail = "  %s: %d..%d" % (view, int(data.min()), int(data.max()))
+        else:
+            rgb = to_display(data)
+            detail = ""
         persons, size = [], None
         if self.overlay.GetValue() and "persons" in a.tables:
             persons = list(a.table(o, "persons"))
@@ -349,7 +474,7 @@ class ViewerFrame(wx.Frame):
             else:
                 size = (rgb.shape[1], rgb.shape[0])
         self.preview.show(rgb, persons, size)
-        self.SetStatusText("%s  %s  %dx%d x%d @%d bit" % (a.key(o), st, inf["width"], inf["height"], inf["channels"], inf["bits"]))
+        self.SetStatusText("%s  %s  %dx%d x%d @%d bit%s" % (a.key(o), st, inf["width"], inf["height"], inf["channels"], inf["bits"], detail))
 
     # --- menu ---------------------------------------------------------------------------------
     def on_open(self, _evt):

@@ -132,7 +132,7 @@ extern "C"
 #include <sys/types.h>
 
 /** @brief Library version, printed by programs that vendor pzpdir so copies can be told apart. */
-static const char pzpdirVersion[]="0.10"; //0.10: prefetcher lanes (a lock per lane, atomic window / budget), batched I/O-thread takes and wake-ups, stream names checked for the metadata JSON, faster resumed edit-stream; 0.9: review fixes (section-scan recovery after table edits, writer finish cleanup, NPY probe bound, faster edit-stream name check); 0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
+static const char pzpdirVersion[]="0.11"; //0.11: phase 8, word index (per-source + merged sub-indexes, synonyms, reindex); 0.10: prefetcher lanes (a lock per lane, atomic window / budget), batched I/O-thread takes and wake-ups, stream names checked for the metadata JSON, faster resumed edit-stream; 0.9: review fixes (section-scan recovery after table edits, writer finish cleanup, NPY probe bound, faster edit-stream name check); 0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
 
 #ifndef PZPDIR_WITH_PZP
 /** @brief 1 enables pzpd_read_pzp() (includes pzp.h). Build with 0 when the program decodes PZP itself. */
@@ -191,6 +191,21 @@ static const char pzpdirVersion[]="0.10"; //0.10: prefetcher lanes (a lock per l
 
 /** @brief Longest table or column name in bytes. */
 #define PZPD_MAX_TABLE_NAME 23
+
+/** @brief Most word indexes in one archive (spec §3.7). */
+#define PZPD_MAX_WORD_INDEXES 4
+
+/** @brief Most distinct source values (per-source sub-indexes) in one word index. */
+#define PZPD_MAX_WORD_SOURCES 255
+
+/** @brief Word index tokenizer v1: `re.findall(r'\w+', text.lower())` of Python, all-ASCII tokens only (spec §3.7). */
+#define PZPD_TOKENIZER_V1 1
+
+/** @brief pzpd_words_open() flag: apply the `synonyms` global table (canonical view); without it, surface words. */
+#define PZPD_WORDS_CANONICAL 1u
+
+/** @brief Name of the reserved global table with the word index's merge rules (schema `word:str,canonical:str`). */
+#define PZPD_SYNONYMS_TABLE "synonyms"
 
 /** @brief pzpd_writer_table() flag: the table holds rows for the whole archive, not per record (e.g. joints). */
 #define PZPD_TABLE_GLOBAL 1u
@@ -914,6 +929,119 @@ ssize_t pzpd_table_csv(pzpd *a, uint64_t ordinal, unsigned table, char *out, siz
  */
 ssize_t pzpd_global_csv(pzpd *a, unsigned member, unsigned table, char *out, size_t cap);
 
+//-----------------------------------------------------------------------------------------------
+// Word index (spec §3.7, §4.10): per word its records / count / postings, per record its words
+//-----------------------------------------------------------------------------------------------
+
+/** @brief One view (surface or canonical) of one sub-index (merged, or one source) of a word index.
+ *  Word ids are valid only for this handle; they are never token ids. Thread-safe once opened. */
+typedef struct pzpd_words pzpd_words;
+
+/**
+ * @brief Open a word index.
+ *
+ * The handle's vocabulary is the union of the members' vocabularies, merged by word bytes and sorted
+ * by bytes (ids follow that order). With PZPD_WORDS_CANONICAL, words are first mapped through the
+ * members' `synonyms` tables: a canonical word's records are the union of its surface words' records
+ * (computed here from the postings, so every shard holding one of them is opened).
+ * @param a          Open handle.
+ * @param table      Indexed table.
+ * @param column     Indexed column.
+ * @param source     Source value of a per-source sub-index, or NULL for the merged sub-index.
+ * @param source_len Its length.
+ * @param flags      PZPD_WORDS_CANONICAL, or 0.
+ * @param out        Receives the handle (NULL on failure).
+ * @return 1 on success, 0 on failure (PZPD_E_NOTFOUND: no member has this word index).
+ */
+int pzpd_words_open(pzpd *a, const char *table, const char *column, const char *source, size_t source_len,
+                    unsigned flags, pzpd_words **out);
+
+/** @brief Close a word index handle (NULL is ignored). The pzpd handle must outlive it. */
+void pzpd_words_close(pzpd_words *w);
+
+/**
+ * @brief Source values of a word index, over all members, sorted by bytes.
+ * @param a      Open handle.
+ * @param table  Indexed table.
+ * @param column Indexed column.
+ * @param names  Receives up to max pointers (into the archive; valid while it is open), may be NULL.
+ * @param lens   Receives their lengths, may be NULL.
+ * @param max    Capacity of names / lens.
+ * @return The total number of source values (0 without a source column or without the index).
+ */
+size_t pzpd_words_sources(pzpd *a, const char *table, const char *column, const char **names, size_t *lens, size_t max);
+
+/**
+ * @brief The i-th word index of a handle (over all members, in first-seen order).
+ * @param a             Open handle.
+ * @param i             Index, from 0.
+ * @param table         Receives the indexed table (valid while a is open), may be NULL.
+ * @param column        Receives the indexed column, may be NULL.
+ * @param source_column Receives the source column ("" when the index has none), may be NULL.
+ * @return 1 if there is an i-th word index, 0 otherwise.
+ */
+int pzpd_words_index(pzpd *a, unsigned i, const char **table, const char **column, const char **source_column);
+
+/** @brief Words in the handle's vocabulary. */
+uint32_t pzpd_words_count(const pzpd_words *w);
+
+/** @brief Bytes of word id (not NUL-terminated), or NULL if out of range. */
+const char *pzpd_words_word(const pzpd_words *w, uint32_t id, size_t *len);
+
+/** @brief Id of a word (exact bytes), or -1 if it is not in the vocabulary. */
+int64_t pzpd_words_find(const pzpd_words *w, const char *word, size_t len);
+
+/** @brief Records containing word id, and its total occurrences. No shard is opened. @return 1, or 0 if out of range. */
+int pzpd_words_stats(const pzpd_words *w, uint32_t id, uint64_t *records, uint64_t *count);
+
+/**
+ * @brief The whole vocabulary at once, for bulk loaders (zero-copy; valid while the handle is open).
+ * @param w        Handle.
+ * @param records  Receives records[id] (may be NULL).
+ * @param count    Receives count[id] (may be NULL).
+ * @param heap     Receives the words' bytes, concatenated in id order (may be NULL).
+ * @param offsets  Receives count+1 offsets into heap: word id = heap[offsets[id] .. offsets[id+1]) (may be NULL).
+ * @return The number of words.
+ */
+uint32_t pzpd_words_arrays(const pzpd_words *w, const uint64_t **records, const uint64_t **count, const char **heap, const uint64_t **offsets);
+
+/**
+ * @brief Ordinals of the records containing word id, ascending.
+ * @param w        Handle.
+ * @param id       Word id.
+ * @param ordinals Receives up to max ordinals (may be NULL when max is 0).
+ * @param max      Capacity.
+ * @return The total number of such records (as pzpd_find_all()); on error 0 with pzpd_last_error_code() set.
+ */
+size_t pzpd_words_records(pzpd_words *w, uint32_t id, uint64_t *ordinals, size_t max);
+
+/**
+ * @brief Word ids of one record, ascending.
+ * @param w       Handle.
+ * @param ordinal Record ordinal.
+ * @param ids     Receives up to max ids (may be NULL when max is 0).
+ * @param max     Capacity.
+ * @return The total number of the record's words; on error 0 with pzpd_last_error_code() set.
+ */
+size_t pzpd_words_of_record(pzpd_words *w, uint64_t ordinal, uint32_t *ids, size_t max);
+
+/**
+ * @brief Tokenizer version of the index, and how many records are covered (records of the members that
+ *        have this word index; the others have no words).
+ * @return 1.
+ */
+int pzpd_words_info(const pzpd_words *w, unsigned *tokenizer, uint64_t *covered_records);
+
+/**
+ * @brief Split text into words with tokenizer v1 (the rule the word index uses; spec §3.7).
+ * @param text  UTF-8 text (invalid bytes split words like a non-word character).
+ * @param len   Its length.
+ * @param emit  Called once per word with its bytes (lower-case ASCII) and length; a non-zero return stops.
+ * @param user  Passed to emit.
+ * @return The number of words emitted.
+ */
+size_t pzpd_tokenize(const char *text, size_t len, int (*emit)(const char *word, size_t len, void *user), void *user);
+
 #if PZPDIR_WITH_PZP
 /**
  * @brief Read a PZP blob and decode it to pixels (wraps pzp_decompress_combined_from_memory()).
@@ -1168,6 +1296,18 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
  */
 int pzpd_compact(const char *manifest, uint64_t *reclaimed);
 
+/**
+ * @brief Add, rebuild or drop a word index of an existing archive (`pzpdir reindex`; spec §7). Appends a
+ *        new generation to each shard like a table edit (crash-safe), then rewrites the manifest.
+ * @param manifest      The archive's manifest.
+ * @param op            PZPD_EDIT_ADD, PZPD_EDIT_REPLACE (rebuild, or add when missing) or PZPD_EDIT_DROP.
+ * @param table         Indexed record table.
+ * @param column        Indexed `str` column.
+ * @param source_column `str` column naming each row's source (per-source sub-indexes), or NULL.
+ * @return 1 on success, 0 on error.
+ */
+int pzpd_edit_words(const char *manifest, unsigned op, const char *table, const char *column, const char *source_column);
+
 //-----------------------------------------------------------------------------------------------
 // Formats
 //-----------------------------------------------------------------------------------------------
@@ -1357,6 +1497,18 @@ int pzpd_writer_global_rows_csv(pzpd_writer *w, unsigned table, const char *csv,
  * @return The group id, or -1 on error (e.g. PZPD_E_DUPLICATE name).
  */
 int64_t pzpd_writer_group(pzpd_writer *w, const char *name, size_t len, uint64_t bytes_hint);
+
+/**
+ * @brief Declare a word index (spec §3.7), after its table and before the first record. Each shard gets
+ *        the index built from the table's rows when it closes, and the manifest the merged vocabulary.
+ * @param w             Writer.
+ * @param table         A declared record table.
+ * @param column        One of its `str` columns (a single value, not an array).
+ * @param source_column Another `str` column naming each row's source: one sub-index per source value plus
+ *                      the merged one. NULL: the merged sub-index only.
+ * @return 1 on success, 0 on failure.
+ */
+int pzpd_writer_words(pzpd_writer *w, const char *table, const char *column, const char *source_column);
 
 /**
  * @brief Finish the current record and write it.

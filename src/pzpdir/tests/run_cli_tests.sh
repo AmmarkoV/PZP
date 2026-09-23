@@ -346,6 +346,60 @@ F=`printf '%s/g.%05d.pzpd' "$G" "$(grep '^run fast' "$G/groups" | sed 's/.*shard
 "$BIN" salvage "$F" "$G/s" --schemas "$G/g.pzpd" --list "$G/s.tsv" >/dev/null 2>&1
 if grep -q "^@group run fast$" "$G/s.tsv" && "$BIN" pack "$G/s.pzpd" "$G/s.tsv" >/dev/null 2>&1 && [ "`"$BIN" groups "$G/s.pzpd" 2>/dev/null | cut -f1,3`" = "`printf 'run fast\t60'`" ]; then ok "salvage writes @group lines; the re-packed shard has the group back"; else bad "salvage groups: `grep '^@' $G/s.tsv`"; fi
 
+#-----------------------------------------------------------------------------------------
+# 11. Word indexes (spec §3.7): @words, synonyms, the words command, collections, reindex,
+#     and a word index rebuilt by an interrupted replace-table / reindex (PZPDIR_TEST_CRASH)
+#-----------------------------------------------------------------------------------------
+W="$T/words"; rm -rf "$W"; mkdir -p "$W"
+printf 'x' > "$W/blob"
+wlist() { # $1 file, $2 key prefix, $3.. "source|caption" rows per record separated by "^"
+    local f="$1" k="$2"; shift 2
+    { echo "@table descriptions source:str text:str"; echo "@global synonyms word:str canonical:str"
+      echo "@row synonyms dogs,dog"; echo "@row synonyms puppy,dog"; echo "@words descriptions.text source"
+      local i=0
+      for rec in "$@"; do
+          printf '%s%d\tdata\t%s\t%s%d.bin\n' "$k" $i "$W/blob" "$k" $i
+          IFS='^' read -ra rows <<< "$rec"
+          for r in "${rows[@]}"; do [ -n "$r" ] && printf '%s%d\tdescriptions\t%s,"%s"\n' "$k" $i "${r%%|*}" "${r#*|}"; done
+          i=$((i+1))
+      done; } > "$f"
+}
+wlist "$W/a.tsv" a "vlm|A dog and a Dog.^old|two dogs" "vlm|a puppy!^old|no animals here" "vlm|Cat; café dog_1" "old|a cat"
+if "$BIN" pack "$W/a.pzpd" "$W/a.tsv" --shard-size 1K --align 64 >/dev/null 2>"$T/err"; then ok "pack with @words and synonyms"; else bad "pack @words: `cat $T/err`"; fi
+if "$BIN" verify "$W/a.pzpd" --blobs >/dev/null 2>"$T/err"; then ok "verify --blobs checks the word index"; else bad "verify words: `cat $T/err`"; fi
+if [ "`"$BIN" words "$W/a.pzpd" --canonical --word dog 2>&1 | tr '\n' ' '`" = "a0 a1 " ]; then ok "words --canonical --word dog: dog / dogs / puppy, dog_1 is another word"; else bad "words --word: `"$BIN" words "$W/a.pzpd" --canonical --word dog 2>&1`"; fi
+if [ "`"$BIN" words "$W/a.pzpd" --canonical --top 3 2>&1 | tr '\t\n' ',;'`" = "a,3,4;cat,2,2;dog,2,4;" ]; then ok "words --top: by records, ties by word (union semantics for dog: 2 records, 4 occurrences)"; else bad "words --top: `"$BIN" words "$W/a.pzpd" --canonical --top 3 2>&1`"; fi
+if [ "`"$BIN" words "$W/a.pzpd" --source old 2>&1 | cut -f1 | tr '\n' ' '`" = "a animals cat dogs here no two " ]; then ok "words --source old: that source's rows only"; else bad "words --source: `"$BIN" words "$W/a.pzpd" --source old 2>&1`"; fi
+if [ "`"$BIN" words "$W/a.pzpd" --sources 2>&1 | tr '\n' ' '`" = "old vlm " ]; then ok "words --sources"; else bad "words --sources"; fi
+if "$BIN" info "$W/a.pzpd" 2>/dev/null | grep -q "^words descriptions.text  11 words  records covered 4  per source: old vlm"; then ok "info lists the word index"; else bad "info words: `"$BIN" info "$W/a.pzpd" 2>&1 | grep words`"; fi
+wlist "$W/b.tsv" b "vlm|dogs everywhere" "old|a giraffe"
+"$BIN" pack "$W/b.pzpd" "$W/b.tsv" >/dev/null 2>&1 || bad "pack b"
+if [ "`"$BIN" words "$W/a.pzpd" "$W/b.pzpd" --canonical --word dog 2>&1 | tr '\n' ' '`" = "a0 a1 b0 " ] && \
+   "$BIN" words "$W/a.pzpd" "$W/b.pzpd" 2>/dev/null | grep -q "^giraffe	1	1$"; then ok "two archives as one: vocabularies merged by word bytes, collection ordinals"; else bad "words over two archives"; fi
+expect_fail "@words for an unknown table"      "@words nope.text\nk\tdata\t$T/src\n" "e.tsv:1: word index: no table nope"
+expect_fail "@words on a non-str column"       "@table d n:u16\n@words d.n\nk\tdata\t$T/src\n" "e.tsv:2: .*not a str column"
+expect_fail "synonyms chain rejected"          "@global synonyms word:str canonical:str\n@row synonyms dogs,dog\n@row synonyms dog,hound\nk\tdata\t$T/src\n" "row 1: \"dog\" is both"
+expect_fail "synonyms: upper case rejected"    "@global synonyms word:str canonical:str\n@row synonyms Dogs,dog\nk\tdata\t$T/src\n" "not a single lower-case word"
+expect_fail "synonyms: wrong schema rejected"  "@global synonyms from:str to:str\nk\tdata\t$T/src\n" "reserved for the word index"
+
+# Interrupted rebuilds: replace-table (index rebuilt with the table) and reindex, then rerun
+cp "$W"/a.* "$W/ref/" 2>/dev/null || { mkdir -p "$W/ref"; cp "$W"/a.* "$W/ref/"; }
+wlist "$W/a2.tsv" a "vlm|three puppies" "old|dogs" "vlm|" "vlm|dog dog dog"
+grep -v '^@global\|^@row\|^@words\|	data	' "$W/a2.tsv" > "$W/desc2.tsv"
+"$BIN" replace-table "$W/ref/a.pzpd" descriptions "$W/desc2.tsv" >/dev/null 2>&1 || bad "reference replace-table"
+PZPDIR_TEST_CRASH=flip:2 "$BIN" replace-table "$W/a.pzpd" descriptions "$W/desc2.tsv" >/dev/null 2>&1; RC=$?
+"$BIN" replace-table "$W/a.pzpd" descriptions "$W/desc2.tsv" >/dev/null 2>"$T/err" || bad "rerun replace-table: `cat $T/err`"
+if [ $RC = 99 ] && cmp -s <("$BIN" words "$W/a.pzpd" --canonical 2>&1) <("$BIN" words "$W/ref/a.pzpd" --canonical 2>&1) && \
+   "$BIN" verify "$W/a.pzpd" --blobs >/dev/null 2>&1 && [ "`"$BIN" words "$W/a.pzpd" --canonical --word dog | tr '\n' ' '`" = "a1 a3 " ]; then
+    ok "replace-table killed before its flip, rerun: the word index equals an uninterrupted rebuild"; else bad "interrupted replace-table with a word index (rc $RC)"; fi
+"$BIN" reindex "$W/ref/a.pzpd" descriptions.text >/dev/null 2>&1 || bad "reference reindex"
+PZPDIR_TEST_CRASH=flip:2 "$BIN" reindex "$W/a.pzpd" descriptions.text >/dev/null 2>&1; RC=$?
+"$BIN" reindex "$W/a.pzpd" descriptions.text >/dev/null 2>"$T/err" || bad "rerun reindex: `cat $T/err`"
+if [ $RC = 99 ] && cmp -s <("$BIN" words "$W/a.pzpd" 2>&1) <("$BIN" words "$W/ref/a.pzpd" 2>&1) && "$BIN" verify "$W/a.pzpd" --blobs >/dev/null 2>&1 && \
+   [ -z "`"$BIN" words "$W/a.pzpd" --sources 2>&1`" ]; then ok "reindex (no source column now) killed before its flip, rerun: merged sub-index only"; else bad "interrupted reindex (rc $RC)"; fi
+if "$BIN" reindex "$W/a.pzpd" descriptions.text --drop >/dev/null 2>&1 && ! "$BIN" words "$W/a.pzpd" >/dev/null 2>&1 && "$BIN" verify "$W/a.pzpd" --blobs >/dev/null 2>&1 && \
+   "$BIN" reindex "$W/a.pzpd" descriptions.text source >/dev/null 2>&1 && [ "`"$BIN" words "$W/a.pzpd" --sources | tr '\n' ' '`" = "old vlm " ]; then ok "reindex --drop, then reindex with a source column"; else bad "reindex drop / add"; fi
+
 echo
 if [ $FAIL = 0 ]; then echo -e "\033[32mall CLI tests passed\033[0m"; exit 0; fi
 echo -e "\033[31m$FAIL CLI test(s) failed\033[0m"

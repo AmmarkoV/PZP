@@ -286,7 +286,7 @@ static int compress_pnm_to_pzp(const char *input, const char *output, unsigned i
     int ok = pzp_compress_combined(buffers, width, height,
                           bitsperpixel, channels,
                           bitsperpixelInternal, channelsInternal,
-                          configuration, output);
+                          configuration, NULL, 0, output);
 
     for (unsigned int ch = 0; ch < channelsInternal; ch++) free(buffers[ch]);
     free(buffers);
@@ -592,7 +592,7 @@ int main(int argc, char *argv[])
             ok = pzp_container_write(output_path, all_buffers,
                                 frame_count, widths, heights,
                                 bpp_exts, ch_exts, bpp_ints, ch_ints,
-                                cfgs, delays, loop_count,
+                                cfgs, NULL, 0, delays, loop_count,
                                 NULL, 0, NULL, 0, 0);
         }
 

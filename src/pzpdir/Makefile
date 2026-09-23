@@ -17,7 +17,7 @@ SIMD     = -O3 -mavx2 -DINTEL_OPTIMIZATIONS $(BASE)
 LIBS     = -lzstd -llz4 -lm
 
 LIB_SRC  = pzpdir.c
-LIB_DEPS = pzpdir.c pzpdir.h third_party/xxhash.h $(PZP_DIR)/pzp.h
+LIB_DEPS = pzpdir.c pzpdir.h pzpdir_unicode.h third_party/xxhash.h $(PZP_DIR)/pzp.h
 CLI_SRC  = pzpdir_cli.c
 
 .PHONY: all clean test test-py fuzz doc check-client bench

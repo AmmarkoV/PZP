@@ -52,8 +52,11 @@ extern "C"
 #define PZP_VERIFY_CHECKSUM 0
 #endif
 
-static const char pzp_version[]="v0.02";
+static const char pzp_version[]="v0.03";
 static const char pzp_header[4]={"PZP0"};
+/* Inner frame magic of frames that carry a channel group table ( see PZPChannelGroup ). Frames with
+   the "PZP0" inner magic are the pre-0.03 layout and are read as one implied 8-bit group. */
+static const char pzp_frame_header_groups[4]={"PZP1"};
 
 /* Inner frame header: 10 × uint32 = 40 bytes (unchanged) */
 static const int headerSize =  sizeof(unsigned int) * 10;
@@ -109,6 +112,39 @@ typedef enum
     USE_INTER_DELTA  = 1 << 3,  // 1000 — inter-frame delta: store frame[N] - frame[N-1]
     USE_LZ4          = 1 << 4   // 10000 — use LZ4 instead of ZSTD (faster decompress on ramdisk)
 } PZPFlags;
+
+/* ─── Channel groups ─────────────────────────────────────────────────────────
+ * A "PZP1" frame stores, right after its 40-byte header, a table saying how its internal channels
+ * are predicted and laid out:
+ *   [ 1 byte group_count ][ group_count × 4 bytes { channels, sample_bits, predictor, reserved } ]
+ * Groups take consecutive internal channels in order and together cover all of them. The pixel data
+ * holds each group's block one after another:
+ *   sample_bits 8  : `channels` byte channels, interleaved pixel by pixel; predictor NONE or LEFT
+ *                    ( previous pixel of the same channel in raster order, the USE_RLE filter ).
+ *   sample_bits 16 : channels == 2, the ( high, low ) bytes of one big-endian 16-bit sample;
+ *                    predictor GRADIENT ( left + up - upleft, modulo 2^16 ), residuals zigzag coded
+ *                    and stored as a high-byte plane followed by a low-byte plane.
+ * Separating groups lets zstd/lz4 see each kind of data on its own, and a 16-bit group predicts the
+ * real sample instead of its two bytes independently. The palette ( USE_PALETTE ) is applied to the
+ * channels before prediction and is only allowed when every group is 8-bit. USE_RLE is not read for
+ * "PZP1" frames: the table's predictors replace it.
+ * Example - semantic label + 16-bit depth packed as 3 bytes: { {1,8,LEFT,0}, {2,16,GRADIENT,0} }. */
+#define PZP_MAX_CHANNEL_GROUPS 8
+
+typedef enum
+{
+    PZP_PREDICT_NONE     = 0,
+    PZP_PREDICT_LEFT     = 1,
+    PZP_PREDICT_GRADIENT = 2
+} PZPPredictor;
+
+typedef struct
+{
+    unsigned char channels;     /* internal byte channels in the group ( 2 for a 16-bit group ) */
+    unsigned char sample_bits;  /* 8 or 16                                                        */
+    unsigned char predictor;    /* PZPPredictor                                                    */
+    unsigned char reserved;     /* 0                                                               */
+} PZPChannelGroup;
 
 /* Bit 31 of the 4-byte frame-prefix uint32 encodes the codec.
  * Bit 31 = 0: ZSTD (all existing files — backward compatible)
@@ -290,6 +326,123 @@ static void pzp_palette_apply(
             data[i * channels + ch] = palette[ch][data[i * channels + ch]];
 }
 
+// ─── Channel groups ─────────────────────────────────────────────────────────
+
+/* Returns 1 if groups[] is a table this version can encode/decode for a frame of channels internal
+   channels at bpp_int bits ( see PZPChannelGroup ), 0 otherwise. */
+static int pzp_channel_groups_valid(
+        const PZPChannelGroup *groups, unsigned int group_count,
+        unsigned int channels, unsigned int bpp_int, unsigned int configuration)
+{
+    if ((group_count == 0) || (group_count > PZP_MAX_CHANNEL_GROUPS) || (bpp_int != 8)) return 0;
+    unsigned int covered = 0;
+    for (unsigned int g = 0; g < group_count; g++)
+    {
+        const PZPChannelGroup *gr = &groups[g];
+        if ((gr->channels == 0) || (gr->reserved != 0)) return 0;
+        if (gr->sample_bits == 8)
+        {
+            if ((gr->predictor != PZP_PREDICT_NONE) && (gr->predictor != PZP_PREDICT_LEFT)) return 0;
+        }
+        else if (gr->sample_bits == 16)
+        {
+            if ((gr->channels != 2) || (gr->predictor != PZP_PREDICT_GRADIENT) ||
+                (configuration & USE_PALETTE)) return 0;
+        }
+        else return 0;
+        covered += gr->channels;
+    }
+    return covered == channels;
+}
+
+/* 16-bit gradient predictor ( left + up - upleft ) with zigzag residuals. hi/lo are the big-endian
+   byte planes of the samples. Computed as the vertical difference e = d - up followed by
+   r = e - e_left, which is the same prediction and lets the decoder undo it with one running sum
+   per row plus the row above ( rows and columns outside the image count as 0 ). */
+static void pzp_gradient16_encode(
+        const unsigned char *hi, const unsigned char *lo,
+        unsigned char *res_hi, unsigned char *res_lo,
+        unsigned int width, unsigned int height)
+{
+    for (unsigned int y = 0; y < height; y++)
+    {
+        unsigned short e_left = 0;
+        for (unsigned int x = 0; x < width; x++)
+        {
+            unsigned int   i  = y * width + x;
+            unsigned short d  = (unsigned short)((hi[i] << 8) | lo[i]);
+            unsigned short up = y ? (unsigned short)((hi[i - width] << 8) | lo[i - width]) : 0;
+            unsigned short e  = (unsigned short)(d - up);
+            short          r  = (short)(unsigned short)(e - e_left);
+            unsigned short z  = (unsigned short)(((unsigned short)r << 1) ^ (unsigned short)(r >> 15));
+            res_hi[i] = (unsigned char)(z >> 8);
+            res_lo[i] = (unsigned char)(z & 0xFF);
+            e_left = e;
+        }
+    }
+}
+
+/* Inverse of pzp_gradient16_encode: residual planes res_hi/res_lo → sample planes hi/lo. */
+static void pzp_gradient16_decode(
+        const unsigned char *res_hi, const unsigned char *res_lo,
+        unsigned char *hi, unsigned char *lo,
+        unsigned int width, unsigned int height)
+{
+    for (unsigned int y = 0; y < height; y++)
+    {
+        unsigned short e = 0;
+        unsigned int   x = 0;
+        #if INTEL_OPTIMIZATIONS
+        /* 16 samples per step: unzigzag, running sum along the row ( Kogge-Stone within each
+           128-bit lane, then lane 0's last sum into lane 1, then the previous step's last sum ),
+           add the row above, split back into the byte planes. */
+        const __m256i one        = _mm256_set1_epi16(1);
+        const __m256i low_byte   = _mm256_set1_epi16(0xFF);
+        const __m256i last_word  = _mm256_setr_epi8(14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,
+                                                    14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15);
+        __m256i carry = _mm256_setzero_si256();
+        for (; x + 16 <= width; x += 16)
+        {
+            unsigned int i = y * width + x;
+            __m256i z = _mm256_or_si256(
+                    _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(res_lo + i))),
+                    _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(res_hi + i))), 8));
+            __m256i r = _mm256_xor_si256(_mm256_srli_epi16(z, 1),
+                                         _mm256_sub_epi16(_mm256_setzero_si256(), _mm256_and_si256(z, one)));
+            r = _mm256_add_epi16(r, _mm256_slli_si256(r, 2));
+            r = _mm256_add_epi16(r, _mm256_slli_si256(r, 4));
+            r = _mm256_add_epi16(r, _mm256_slli_si256(r, 8));
+            r = _mm256_add_epi16(r, _mm256_shuffle_epi8(_mm256_permute2x128_si256(r, r, 0x08), last_word));
+            __m256i ev = _mm256_add_epi16(r, carry);
+            carry = _mm256_shuffle_epi8(_mm256_permute2x128_si256(ev, ev, 0x11), last_word);
+
+            __m256i up = _mm256_setzero_si256();
+            if (y)
+                up = _mm256_or_si256(
+                        _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(lo + i - width))),
+                        _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(hi + i - width))), 8));
+            __m256i d = _mm256_add_epi16(up, ev);
+            /* packus per lane → [lo0-7 hi0-7 | lo8-15 hi8-15], reorder to [lo0-15 | hi0-15] */
+            __m256i packed = _mm256_permute4x64_epi64(
+                    _mm256_packus_epi16(_mm256_and_si256(d, low_byte), _mm256_srli_epi16(d, 8)), 0xD8);
+            _mm_storeu_si128((__m128i *)(lo + i), _mm256_castsi256_si128(packed));
+            _mm_storeu_si128((__m128i *)(hi + i), _mm256_extracti128_si256(packed, 1));
+        }
+        e = (unsigned short)_mm256_extract_epi16(carry, 0);
+        #endif
+        for (; x < width; x++)
+        {
+            unsigned int   i  = y * width + x;
+            unsigned short z  = (unsigned short)((res_hi[i] << 8) | res_lo[i]);
+            e += (unsigned short)((z >> 1) ^ (unsigned short)-(z & 1));
+            unsigned short up = y ? (unsigned short)((hi[i - width] << 8) | lo[i - width]) : 0;
+            unsigned short d  = (unsigned short)(up + e);
+            hi[i] = (unsigned char)(d >> 8);
+            lo[i] = (unsigned char)(d & 0xFF);
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 
 static void * pzp_read_file_to_memory(const char *filename, size_t *fileSize)
@@ -379,7 +532,10 @@ static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, 
  * *out_size is set to the total byte count.  Caller must free() the result.
  * Returns NULL on failure.
  *
- * NOTE: modifies buffers[] in-place (palette encoding then delta filter).
+ * groups/group_count: the channel group table written into the frame ( see PZPChannelGroup ).
+ * NULL / 0 = one 8-bit group over every channel, predicted with LEFT if USE_RLE is set.
+ *
+ * NOTE: modifies buffers[] in-place (palette encoding then prediction).
  */
 static unsigned char *pzp_compress_frame_to_memory(
         unsigned char **buffers,
@@ -387,8 +543,20 @@ static unsigned char *pzp_compress_frame_to_memory(
         unsigned int bpp_ext,  unsigned int ch_ext,
         unsigned int bpp_int,  unsigned int ch_int,
         unsigned int configuration,
+        const PZPChannelGroup *groups, unsigned int group_count,
         size_t *out_size)
 {
+    /* ── channel groups ── */
+    PZPChannelGroup default_group = { (unsigned char)ch_int, 8,
+                                      (configuration & USE_RLE) ? PZP_PREDICT_LEFT : PZP_PREDICT_NONE, 0 };
+    if (!groups || group_count == 0) { groups = &default_group; group_count = 1; }
+    if ((ch_int > 255) || !pzp_channel_groups_valid(groups, group_count, ch_int, bpp_int, configuration))
+    {
+        fprintf(stderr, "pzp: unsupported channel group table for %u channels @ %u bit (configuration %u)\n",
+                ch_int, bpp_int, configuration);
+        return NULL;
+    }
+
     /* ── palette encoding ── */
     unsigned char palette[8][256];
     unsigned int  palette_counts[8];
@@ -406,47 +574,58 @@ static unsigned char *pzp_compress_frame_to_memory(
         #endif
     }
 
-    /* ── delta filter ── */
-    if (configuration & USE_RLE)
-    {
-        #if PZP_VERBOSE
-        fprintf(stderr, "Using RLE for compression (mode %u)\n", configuration);
-        #endif
-        pzp_RLE_filter(buffers, ch_int, width, height);
-    }
-
     /* ── build uncompressed payload ── */
+    unsigned int groupDataBytes  = 1 + group_count * (unsigned int)sizeof(PZPChannelGroup);
     unsigned int pixel_data_size = width * height * (bpp_int / 8) * ch_int;
-    unsigned int payload_size    = (unsigned int)headerSize + paletteDataBytes + pixel_data_size;
+    unsigned int payload_size    = (unsigned int)headerSize + groupDataBytes + paletteDataBytes + pixel_data_size;
 
     unsigned char *payload = (unsigned char *)malloc(payload_size);
     if (!payload) return NULL;
 
     /* inner frame header (10 × uint32 = 40 bytes) */
     unsigned int *h = (unsigned int *)payload;
-    h[0] = convert_header(pzp_header);
+    h[0] = convert_header(pzp_frame_header_groups);
     h[1] = bpp_ext;
     h[2] = ch_ext;
     h[3] = width;
     h[4] = height;
     h[5] = bpp_int;
     h[6] = ch_int;
-    /* h[7] = checksum, filled after interleave */
+    /* h[7] = checksum, filled after the pixel data */
     h[8] = configuration;
     h[9] = paletteDataBytes;
 
-    /* palette prefix */
+    /* channel group table, then palette prefix */
     unsigned char *write_ptr = payload + headerSize;
+    *write_ptr++ = (unsigned char)group_count;
+    memcpy(write_ptr, groups, group_count * sizeof(PZPChannelGroup));
+    write_ptr += group_count * sizeof(PZPChannelGroup);
     if (paletteDataBytes > 0)
     {
         pzp_palette_write(write_ptr, ch_int, palette, palette_counts);
         write_ptr += paletteDataBytes;
     }
 
-    /* interleave planar channel buffers */
-    for (unsigned int i = 0; i < width * height; i++)
-        for (unsigned int ch = 0; ch < ch_int; ch++)
-            write_ptr[i * ch_int + ch] = buffers[ch][i];
+    /* each group's block in turn: predict, then lay out ( see PZPChannelGroup ) */
+    unsigned int   pixels = width * height;
+    unsigned char *dst    = write_ptr;
+    unsigned char **gbuf  = buffers;
+    for (unsigned int g = 0; g < group_count; g++)
+    {
+        unsigned int c = groups[g].channels;
+        if (groups[g].sample_bits == 16)
+            pzp_gradient16_encode(gbuf[0], gbuf[1], dst, dst + pixels, width, height);
+        else
+        {
+            if (groups[g].predictor == PZP_PREDICT_LEFT)
+                pzp_RLE_filter(gbuf, c, width, height);
+            for (unsigned int i = 0; i < pixels; i++)
+                for (unsigned int ch = 0; ch < c; ch++)
+                    dst[i * c + ch] = gbuf[ch][i];
+        }
+        dst  += (size_t)pixels * c;
+        gbuf += c;
+    }
 
     h[7] = hash_checksum(write_ptr, pixel_data_size);
 
@@ -533,6 +712,8 @@ static unsigned char *pzp_compress_frame_to_memory(
  * bpp_exts/ch_exts: per-frame external bpp and channel count
  * bpp_ints/ch_ints: per-frame internal bpp and channel count
  * configurations  : per-frame PZPFlags bitfield
+ * groups/group_count : channel group table used for every frame ( NULL / 0 = default, see
+ *                   pzp_compress_frame_to_memory )
  * delay_ms_arr    : per-frame display duration in ms (NULL → all 0)
  * loop_count      : 0 = loop forever, N = play N times
  * metadata        : opaque metadata bytes (NULL = absent)
@@ -556,6 +737,7 @@ static int pzp_container_write(
         unsigned int  *bpp_ints,
         unsigned int  *ch_ints,
         unsigned int  *configurations,
+        const PZPChannelGroup *groups, unsigned int group_count,
         unsigned int  *delay_ms_arr,
         unsigned int   loop_count,
         const unsigned char *metadata, unsigned int metadata_bytes,
@@ -676,6 +858,7 @@ static int pzp_container_write(
                 bpp_exts[f], ch_exts[f],
                 bpp_ints[f], ch_ints[f],
                 cfg,
+                groups, group_count,
                 &frame_sizes[f]);
 
         /* Advance the reference window. */
@@ -926,6 +1109,7 @@ static int pzp_compress_combined(unsigned char **buffers,
                               unsigned int bitsperpixelExternal, unsigned int channelsExternal,
                               unsigned int bitsperpixelInternal, unsigned int channelsInternal,
                               unsigned int configuration,
+                              const PZPChannelGroup *groups, unsigned int group_count,
                               const char *output_filename)
 {
     /* Wrap in a single-frame container */
@@ -944,7 +1128,7 @@ static int pzp_compress_combined(unsigned char **buffers,
                         widths, heights,
                         bpp_exts, ch_exts,
                         bpp_ints, ch_ints,
-                        cfgs, delays,
+                        cfgs, groups, group_count, delays,
                         1 /* loop_count */,
                         NULL, 0,    /* no metadata */
                         NULL, 0, 0  /* no audio    */);
@@ -1368,6 +1552,53 @@ static void pzp_extractAndReconstruct(unsigned char *decompressed_bytes, unsigne
    #else
      pzp_extractAndReconstruct_Naive(decompressed_bytes,reconstructed,width,height,channels);
    #endif // INTEL_OPTIMIZATIONS
+}
+
+/* Decode the pixel data of a frame with several channel groups ( see PZPChannelGroup ): undo each
+ * group's predictor into planar scratch buffers, then interleave every channel into out
+ * ( width*height*channels bytes ). out may overlap src: src is fully consumed before out is written.
+ * Returns 0 if the scratch buffers cannot be allocated. */
+static int pzp_channel_groups_decode(
+        const unsigned char *src, unsigned char *out,
+        const PZPChannelGroup *groups, unsigned int group_count,
+        unsigned int width, unsigned int height, unsigned int channels)
+{
+    size_t pixels = (size_t)width * height;
+    unsigned char *planes = (unsigned char *)malloc(pixels * channels);
+    if (!planes) return 0;
+
+    unsigned char *plane = planes;
+    for (unsigned int g = 0; g < group_count; g++)
+    {
+        unsigned int c = groups[g].channels;
+        if (groups[g].sample_bits == 16)
+            pzp_gradient16_decode(src, src + pixels, plane, plane + pixels, width, height);
+        else if ((c == 1) && (groups[g].predictor == PZP_PREDICT_LEFT))
+            pzp_extractAndReconstruct((unsigned char *)src, plane, width, height, 1);
+        else
+        {
+            for (size_t i = 0; i < pixels; i++)
+                for (unsigned int ch = 0; ch < c; ch++)
+                    plane[ch * pixels + i] = src[i * c + ch];
+            if (groups[g].predictor == PZP_PREDICT_LEFT)
+                for (unsigned int ch = 0; ch < c; ch++)
+                    pzp_extractAndReconstruct(plane + ch * pixels, plane + ch * pixels, width, height, 1);
+        }
+        src   += pixels * c;
+        plane += pixels * c;
+    }
+
+    #if INTEL_OPTIMIZATIONS
+    if (channels == 3)
+        pzp_interleave_3ch(planes, planes + pixels, planes + 2 * pixels, out, (unsigned int)pixels);
+    else
+    #endif
+    for (size_t i = 0; i < pixels; i++)
+        for (unsigned int ch = 0; ch < channels; ch++)
+            out[i * channels + ch] = planes[ch * pixels + i];
+
+    free(planes);
+    return 1;
 }
 
 //-----------------------------------------------------------------------------------------------
@@ -1819,8 +2050,10 @@ static unsigned char* pzp_frame_decode_from_memory(
     fprintf(stderr, " | mode %u | CRC:0x%X\n", compressionCfg, *checksumSource);
 #endif
 
-    unsigned int runtimeVersion = convert_header(pzp_header);
-    if (runtimeVersion != *headerSource)
+    // "PZP1" frames carry a channel group table; "PZP0" frames ( written before v0.03 ) are read as
+    // one implied 8-bit group. The PZP0 case can be dropped once no such files are left.
+    int hasGroupTable = (*headerSource == convert_header(pzp_frame_header_groups));
+    if ( (!hasGroupTable) && (*headerSource != convert_header(pzp_header)) )
     {
         free(decompressed_buffer);
         return 0;
@@ -1835,12 +2068,38 @@ static unsigned char* pzp_frame_decode_from_memory(
     *channelsInternalOutput     = channelsIn;
     *configuration              = compressionCfg;
 
+    // After the 40-byte header come the channel group table ( PZP1 only ), optional palette data,
+    // then the pixel/index data.
+    size_t avail = decompressed_size - (size_t)headerSize;
+    unsigned char *after_header = (unsigned char *)decompressed_buffer + headerSize;
+
+    PZPChannelGroup groups[PZP_MAX_CHANNEL_GROUPS];
+    unsigned int    group_count = 1;
+    int             groupsOk    = 1;
+    if (hasGroupTable)
+    {
+        group_count = (avail > 0) ? after_header[0] : 0;
+        size_t tableBytes = 1 + (size_t)group_count * sizeof(PZPChannelGroup);
+        groupsOk = (group_count > 0) && (group_count <= PZP_MAX_CHANNEL_GROUPS) && (tableBytes <= avail);
+        if (groupsOk)
+        {
+            memcpy(groups, after_header + 1, group_count * sizeof(PZPChannelGroup));
+            groupsOk = pzp_channel_groups_valid(groups, group_count, channelsIn, bitsperpixelIn, compressionCfg);
+            after_header += tableBytes;
+            avail        -= tableBytes;
+        }
+    }
+    else
+    {
+        PZPChannelGroup legacy = { 0, 8, (compressionCfg & USE_RLE) ? PZP_PREDICT_LEFT : PZP_PREDICT_NONE, 0 };
+        groups[0] = legacy;
+    }
+
     // The header fields come from the file: check that the palette and the pixel data they
     // describe fit in what was decompressed ( overflow-safe ) before reading any of it.
-    size_t avail      = decompressed_size - (size_t)headerSize;
     size_t pixel_size = (size_t)width * height;
     unsigned int bytesPerSample = bitsperpixelIn / 8;
-    if ( (paletteDataBytes > avail) ||
+    if ( (!groupsOk) || (paletteDataBytes > avail) ||
          (pixel_size == 0) || (channelsIn == 0) || (bytesPerSample == 0) ||
          (pixel_size > (avail - paletteDataBytes) / channelsIn / bytesPerSample) ||
          ((compressionCfg & USE_PALETTE) && (channelsIn > 8)) )
@@ -1852,9 +2111,7 @@ static unsigned char* pzp_frame_decode_from_memory(
     }
     pixel_size *= (size_t)bytesPerSample * channelsIn;
 
-    // After the 40-byte header comes optional palette data, then the pixel/index data.
-    unsigned char *after_header = (unsigned char *)decompressed_buffer + headerSize;
-    unsigned char *index_data   = after_header + paletteDataBytes;
+    unsigned char *index_data = after_header + paletteDataBytes;
 
     // Parse palette (if present) before checksum so we can validate index data.
     unsigned char palette[8][256];
@@ -1881,13 +2138,23 @@ static unsigned char* pzp_frame_decode_from_memory(
     }
 #endif
 
-    // Both paths move the pixels to the start of decompressed_buffer and return it ( no second
-    // image-sized allocation ): a plain move, or the RLE reconstruction done in place.
+    // Every path moves the pixels to the start of decompressed_buffer and returns it. A single
+    // 8-bit group ( every PZP0 frame ) needs no second image-sized allocation: a plain move, or the
+    // left-delta reconstruction done in place.
     unsigned char *reconstructed = (unsigned char *)decompressed_buffer;
-    if (compressionCfg & USE_RLE)
-        pzp_extractAndReconstruct(index_data, reconstructed, width, height, channelsIn);
-    else
-        memmove(reconstructed, index_data, pixel_size);
+    if ( (group_count == 1) && (groups[0].sample_bits == 8) )
+    {
+        if (groups[0].predictor == PZP_PREDICT_LEFT)
+            pzp_extractAndReconstruct(index_data, reconstructed, width, height, channelsIn);
+        else
+            memmove(reconstructed, index_data, pixel_size);
+    }
+    else if (!pzp_channel_groups_decode(index_data, reconstructed, groups, group_count, width, height, channelsIn))
+    {
+        free(decompressed_buffer);
+        fprintf(stderr, "PZP: out of memory decoding channel groups\n");
+        return NULL;
+    }
 
     if (compressionCfg & USE_PALETTE)
         pzp_palette_apply(reconstructed, width * height, channelsIn, palette);

@@ -5,6 +5,7 @@
 #   pzp.c                          -> codecs/pzp.c                  (the pzp CLI makeLibrary.sh builds)
 #   src/pzpdir/pzpdir.h            -> pzpdir/pzpdir.h
 #   src/pzpdir/pzpdir.c            -> pzpdir/pzpdir.c
+#   src/pzpdir/pzpdir_unicode.h    -> pzpdir/pzpdir_unicode.h      (word index tokenizer tables, generated)
 #   src/pzpdir/third_party/xxhash.h -> pzpdir/third_party/xxhash.h
 #
 # A destination with uncommitted changes in the DataLoader repository may hold local edits, so it is
@@ -32,6 +33,7 @@ FILES="pzp.h:codecs/pzp.h
 pzp.c:codecs/pzp.c
 src/pzpdir/pzpdir.h:pzpdir/pzpdir.h
 src/pzpdir/pzpdir.c:pzpdir/pzpdir.c
+src/pzpdir/pzpdir_unicode.h:pzpdir/pzpdir_unicode.h
 src/pzpdir/third_party/xxhash.h:pzpdir/third_party/xxhash.h"
 
 CHANGED=""; LOCAL=""

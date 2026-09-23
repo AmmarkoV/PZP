@@ -88,12 +88,16 @@ static void usage(void)
       "  pzpdir drop-table <archive> TABLE\n"
       "  pzpdir add-stream | replace-stream <archive> STREAM <list|-> [--missing keep|drop]   (shard by shard)\n"
       "  pzpdir drop-stream <archive> STREAM\n"
-      "  pzpdir compact <archive>                  (drop dead table sections left by table edits)\n\n"
+      "  pzpdir compact <archive>                  (drop dead table sections left by table edits)\n"
+      "  pzpdir words   <archive...> [TABLE.COLUMN] [--source S | --sources] [--canonical] [--top N | --word W]\n"
+      "                 (word index: word<TAB>records<TAB>count by records; --word: keys of the records containing W)\n"
+      "  pzpdir reindex <archive> [TABLE.COLUMN [SOURCE_COLUMN]] [--drop]   (no TABLE.COLUMN: rebuild every word index)\n\n"
       "<archive...> = one archive (manifest or shard), a collection file, or several archives opened as one.\n"
       "Record list: one blob per line, key<TAB>stream<TAB>source-path[<TAB>stored-name].\n"
       "Consecutive lines with the same key form one record. '#' comments, '@group NAME' / '@group'.\n"
       "Escapes: \\t \\n \\\\ ; a key starting with # @ or \\ is written with a leading \\.\n"
-      "Tables: '@table NAME col:type[n] ... [bulk]', '@global NAME ...', '@row NAME csv', and lines key<TAB>table<TAB>csv.\n",
+      "Tables: '@table NAME col:type[n] ... [bulk]', '@global NAME ...', '@row NAME csv', and lines key<TAB>table<TAB>csv.\n"
+      "Word indexes: '@words TABLE.COLUMN [SOURCE_COLUMN]' (after the table); merge rules in '@global synonyms word:str canonical:str'.\n",
       pzpdirVersion);
 }
 
@@ -271,6 +275,8 @@ struct record_list
     unsigned grow_count;         ///< Global rows
     char   **gnames;             ///< Name of each list group (`@group NAME`), by list group id
     unsigned gname_count;        ///< Groups
+    struct { char *table, *column, *source; size_t line; } words[PZPD_MAX_WORD_INDEXES]; ///< `@words` declarations
+    unsigned words_count;        ///< Word indexes
 };
 
 /** @brief Index of a declared table, -1 if none. */
@@ -388,6 +394,24 @@ static int parse_list(const char *path, const char *fixed_streams, struct record
                 L->grow_count++;
                 continue;
             }
+            if (strncmp(line, "@words ", 7) == 0)
+            {
+                // @words TABLE.COLUMN [SOURCE_COLUMN]
+                if (L->count > 0) { fprintf(stderr, CLI_RED "%s:%zu: word indexes must be declared before the first record" CLI_NORMAL "\n", path, lineNo); return 0; }
+                if (L->words_count == PZPD_MAX_WORD_INDEXES) { fprintf(stderr, CLI_RED "%s:%zu: more than %d word indexes" CLI_NORMAL "\n", path, lineNo, PZPD_MAX_WORD_INDEXES); return 0; }
+                char *spec = line + 7, *save = NULL;
+                char *tc = strtok_r(spec, " ", &save), *src = strtok_r(NULL, " ", &save);
+                char *dot = (tc != NULL) ? strchr(tc, '.') : NULL;
+                if ( (dot == NULL) || (dot == tc) || (dot[1] == 0) || (strtok_r(NULL, " ", &save) != NULL) )
+                    { fprintf(stderr, CLI_RED "%s:%zu: expected @words TABLE.COLUMN [SOURCE_COLUMN]" CLI_NORMAL "\n", path, lineNo); return 0; }
+                *dot = 0;
+                L->words[L->words_count].table  = tc;
+                L->words[L->words_count].column = dot + 1;
+                L->words[L->words_count].source = src;
+                L->words[L->words_count].line   = lineNo;
+                L->words_count++;
+                continue;
+            }
             fprintf(stderr, CLI_RED "%s:%zu: unknown directive \"%.40s\"" CLI_NORMAL "\n", path, lineNo, line);
             return 0;
         }
@@ -502,6 +526,11 @@ static int pack_list(const char *out, struct record_list *L, uint64_t shard, uin
     {
         if (!pzpd_writer_global_rows_csv(w, L->grows[g].table, L->grows[g].csv, L->grows[g].len))
             { fprintf(stderr, CLI_RED "%s:%zu: %s" CLI_NORMAL "\n", src, L->grows[g].line, pzpd_last_error()); pzpd_writer_abort(w); return 1; }
+    }
+    for (unsigned k = 0; k < L->words_count; k++)
+    {
+        if (!pzpd_writer_words(w, L->words[k].table, L->words[k].column, L->words[k].source))
+            { fprintf(stderr, CLI_RED "%s:%zu: %s" CLI_NORMAL "\n", src, L->words[k].line, pzpd_last_error()); pzpd_writer_abort(w); return 1; }
     }
     uint32_t curGroupId = PZPD_NO_GROUP;
     for (size_t i = 0; i < L->count; i++)
@@ -815,6 +844,24 @@ static int cmd_info(const char *const *paths, int np, const char *only, int dups
         printf("table %s  %s%s  %llu rows  %u B/row  ", sc->name, (sc->flags & PZPD_TABLE_GLOBAL) ? "global" : "record", (sc->flags & PZPD_TABLE_BULK) ? " bulk" : "",
                (unsigned long long) rows, sc->row_stride);
         put_schema(stdout, sc);
+        printf("\n");
+    }
+    const char *wt, *wc, *ws;
+    for (unsigned k = 0; pzpd_words_index(a, k, &wt, &wc, &ws); k++)
+    {
+        pzpd_words *w = NULL;
+        uint64_t cov = 0;
+        if (!pzpd_words_open(a, wt, wc, NULL, 0, 0, &w)) { printf("words %s.%s  DAMAGED: %s\n", wt, wc, pzpd_last_error()); rc = 1; continue; }
+        pzpd_words_info(w, NULL, &cov);
+        printf("words %s.%s  %u words  records covered %llu", wt, wc, pzpd_words_count(w), (unsigned long long) cov);
+        pzpd_words_close(w);
+        if (ws[0] != 0)
+        {
+            const char *nm[PZPD_MAX_WORD_SOURCES]; size_t ln[PZPD_MAX_WORD_SOURCES];
+            size_t n = pzpd_words_sources(a, wt, wc, nm, ln, PZPD_MAX_WORD_SOURCES);
+            printf("  per %s:", ws);
+            for (size_t i = 0; (i < n) && (i < PZPD_MAX_WORD_SOURCES); i++) { printf(" %.*s", (int) ln[i], nm[i]); }
+        }
         printf("\n");
     }
     for (unsigned s = 0; s < S; s++)
@@ -1468,6 +1515,144 @@ static int cmd_collect(const char *out, const char *const *args, int n, int abso
 }
 
 //-----------------------------------------------------------------------------------------------
+// Word index (spec §3.7)
+//-----------------------------------------------------------------------------------------------
+
+/** @brief Resolve TABLE.COLUMN (or, when spec is NULL, the handle's only word index) into buffers.
+ *  @return 1 on success, 0 on failure (message printed). */
+static int words_spec(pzpd *a, const char *spec, char table[64], char column[64], char source[64])
+{
+    const char *t = NULL, *c = NULL, *sc = "";
+    source[0] = 0;
+    if (spec == NULL)
+    {
+        if (!pzpd_words_index(a, 0, &t, &c, &sc)) { fprintf(stderr, CLI_RED "the archive has no word index" CLI_NORMAL "\n"); return 0; }
+        const char *t2, *c2, *s2;
+        if (pzpd_words_index(a, 1, &t2, &c2, &s2)) { fprintf(stderr, CLI_RED "the archive has several word indexes: name one as TABLE.COLUMN" CLI_NORMAL "\n"); return 0; }
+        snprintf(table, 64, "%s", t); snprintf(column, 64, "%s", c); snprintf(source, 64, "%s", sc);
+        return 1;
+    }
+    const char *dot = strchr(spec, '.');
+    if ( (dot == NULL) || (dot == spec) || (dot[1] == 0) || ((size_t)(dot - spec) >= 64) || (strlen(dot + 1) >= 64) ) { fprintf(stderr, CLI_RED "expected TABLE.COLUMN, got \"%s\"" CLI_NORMAL "\n", spec); return 0; }
+    snprintf(table, 64, "%.*s", (int)(dot - spec), spec);
+    snprintf(column, 64, "%s", dot + 1);
+    for (unsigned k = 0; pzpd_words_index(a, k, &t, &c, &sc); k++) { if (!strcmp(t, table) && !strcmp(c, column)) { snprintf(source, 64, "%s", sc); } }
+    return 1;
+}
+
+/** @brief Sort context for cmd_words: records per word, descending, then word id. */
+static const uint64_t *g_wrec;
+
+static int cmp_word_rank(const void *x, const void *y)
+{
+    uint32_t a = *(const uint32_t *) x, b = *(const uint32_t *) y;
+    if (g_wrec[a] != g_wrec[b]) { return (g_wrec[a] > g_wrec[b]) ? -1 : 1; }
+    return (a < b) ? -1 : (a > b);
+}
+
+/** @brief `words`: a word index's vocabulary by records (--top N), the keys of the records containing a word
+ *  (--word W), or its source values (--sources). @return 0 on success, 1 on failure. */
+static int cmd_words(const char *const *paths, int np, const char *spec, const char *source, int sources, int canonical, long top, const char *word)
+{
+    pzpd *a = open_or_die(paths, np);
+    if (a == NULL) { return 1; }
+    char table[64], column[64], srccol[64];
+    if (!words_spec(a, spec, table, column, srccol)) { pzpd_close(a); return 1; }
+    int rc = 0;
+    if (sources)
+    {
+        const char *nm[PZPD_MAX_WORD_SOURCES]; size_t ln[PZPD_MAX_WORD_SOURCES];
+        size_t n = pzpd_words_sources(a, table, column, nm, ln, PZPD_MAX_WORD_SOURCES);
+        if ( (n == 0) && (pzpd_last_error_code() != PZPD_OK) ) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); rc = 1; }
+        for (size_t i = 0; i < n; i++) { printf("%.*s\n", (int) ln[i], nm[i]); }
+        pzpd_close(a);
+        return rc;
+    }
+    pzpd_words *w = NULL;
+    if (!pzpd_words_open(a, table, column, source, (source != NULL) ? strlen(source) : 0, canonical ? PZPD_WORDS_CANONICAL : 0, &w))
+    {
+        fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error());
+        pzpd_close(a);
+        return 1;
+    }
+    if (word != NULL)
+    {
+        int64_t id = pzpd_words_find(w, word, strlen(word));
+        if (id < 0) { fprintf(stderr, CLI_RED "\"%s\" is not in the vocabulary" CLI_NORMAL "\n", word); rc = 1; }
+        else
+        {
+            size_t n = pzpd_words_records(w, (uint32_t) id, NULL, 0);
+            uint64_t *ord = (uint64_t *) malloc((n ? n : 1) * sizeof(uint64_t));
+            if ( (ord == NULL) || ((n > 0) && (pzpd_words_records(w, (uint32_t) id, ord, n) != n)) || (pzpd_last_error_code() != PZPD_OK) )
+                { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", (ord == NULL) ? "out of memory" : pzpd_last_error()); rc = 1; n = 0; }
+            for (size_t i = 0; i < n; i++)
+            {
+                size_t kl = 0;
+                const char *k = pzpd_record_key(a, ord[i], &kl);
+                if (k == NULL) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); rc = 1; break; }
+                put_escaped(stdout, k, kl, 1);
+                fputc('\n', stdout);
+            }
+            free(ord);
+        }
+    }
+    else
+    {
+        const uint64_t *rec = NULL, *cnt = NULL;
+        uint32_t n = pzpd_words_arrays(w, &rec, &cnt, NULL, NULL);
+        uint32_t *ids = (uint32_t *) malloc(((size_t) n + 1) * sizeof(uint32_t));
+        if (ids == NULL) { fprintf(stderr, CLI_RED "out of memory" CLI_NORMAL "\n"); rc = 1; n = 0; }
+        for (uint32_t i = 0; i < n; i++) { ids[i] = i; }
+        g_wrec = rec;
+        qsort(ids, n, sizeof(uint32_t), cmp_word_rank);
+        uint32_t shown = ((top > 0) && ((uint64_t) top < n)) ? (uint32_t) top : n;
+        for (uint32_t i = 0; i < shown; i++)
+        {
+            size_t l;
+            const char *s = pzpd_words_word(w, ids[i], &l);
+            printf("%.*s\t%llu\t%llu\n", (int) l, s, (unsigned long long) rec[ids[i]], (unsigned long long) cnt[ids[i]]);
+        }
+        free(ids);
+    }
+    pzpd_words_close(w);
+    pzpd_close(a);
+    return rc;
+}
+
+/** @brief `reindex`: rebuild every word index (no spec), add / rebuild one, or drop one. @return 0 on success, 1 on failure. */
+static int cmd_reindex(const char *archive, const char *spec, const char *source_column, int drop)
+{
+    if (spec == NULL)
+    {
+        if (drop) { fprintf(stderr, CLI_RED "--drop needs TABLE.COLUMN" CLI_NORMAL "\n"); return 1; }
+        pzpd *a = pzpd_open(archive, 0);
+        if (a == NULL) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
+        char tabs[PZPD_MAX_WORD_INDEXES][3][64];
+        unsigned n = 0;
+        const char *t, *c, *sc;
+        for (unsigned k = 0; (n < PZPD_MAX_WORD_INDEXES) && pzpd_words_index(a, k, &t, &c, &sc); k++)
+        {
+            snprintf(tabs[n][0], 64, "%s", t); snprintf(tabs[n][1], 64, "%s", c); snprintf(tabs[n][2], 64, "%s", sc); n++;
+        }
+        pzpd_close(a);
+        if (n == 0) { fprintf(stderr, CLI_RED "%s has no word index to rebuild (name one: reindex <archive> TABLE.COLUMN [SOURCE_COLUMN])" CLI_NORMAL "\n", archive); return 1; }
+        for (unsigned k = 0; k < n; k++)
+        {
+            if (!pzpd_edit_words(archive, PZPD_EDIT_REPLACE, tabs[k][0], tabs[k][1], tabs[k][2][0] ? tabs[k][2] : NULL)) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
+            fprintf(stderr, CLI_GREEN "rebuilt word index %s.%s in %s" CLI_NORMAL "\n", tabs[k][0], tabs[k][1], archive);
+        }
+        return 0;
+    }
+    const char *dot = strchr(spec, '.');
+    if ( (dot == NULL) || (dot == spec) || (dot[1] == 0) || ((size_t)(dot - spec) >= 64) ) { fprintf(stderr, CLI_RED "expected TABLE.COLUMN, got \"%s\"" CLI_NORMAL "\n", spec); return 1; }
+    char table[64];
+    snprintf(table, sizeof(table), "%.*s", (int)(dot - spec), spec);
+    if (!pzpd_edit_words(archive, drop ? PZPD_EDIT_DROP : PZPD_EDIT_REPLACE, table, dot + 1, source_column)) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
+    fprintf(stderr, CLI_GREEN "%s word index %s in %s" CLI_NORMAL "\n", drop ? "dropped" : "built", spec, archive);
+    return 0;
+}
+
+//-----------------------------------------------------------------------------------------------
 
 /** @brief Entry point: dispatch the subcommand.
  *  @param argc Argument count.
@@ -1482,7 +1667,9 @@ int main(int argc, char **argv)
     const char *streams = NULL, *stream = NULL, *table = NULL, *schemas = NULL, *listOut = NULL, *out = NULL, *missing = NULL;
     uint64_t shard = 0;
     uint32_t align = 0;
-    int lng = 0, names = 0, blobs = 0, absolute = 0, refresh = 0, dups = 0;
+    int lng = 0, names = 0, blobs = 0, absolute = 0, refresh = 0, dups = 0, sources = 0, canonical = 0, drop = 0;
+    const char *source = NULL, *word = NULL;
+    long top = 0;
     const char *pos[256] = {0};
     int npos = 0;
     for (int i = 2; i < argc; i++)
@@ -1502,6 +1689,12 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--absolute") == 0) { absolute = 1; }
         else if (strcmp(argv[i], "--refresh") == 0)  { refresh = 1; }
         else if (strcmp(argv[i], "--dups") == 0)     { dups = 1; }
+        else if ( (strcmp(argv[i], "--source") == 0) && (i + 1 < argc) ) { source = argv[++i]; }
+        else if ( (strcmp(argv[i], "--word") == 0) && (i + 1 < argc) )   { word = argv[++i]; }
+        else if ( (strcmp(argv[i], "--top") == 0) && (i + 1 < argc) )    { top = atol(argv[++i]); }
+        else if (strcmp(argv[i], "--sources") == 0)   { sources = 1; }
+        else if (strcmp(argv[i], "--canonical") == 0) { canonical = 1; }
+        else if (strcmp(argv[i], "--drop") == 0)      { drop = 1; }
         else if ( (argv[i][0] == '-') && (argv[i][1] == '-') ) { fprintf(stderr, "unknown option %s\n", argv[i]); usage(); return 1; }
         else if (npos < 256) { pos[npos++] = argv[i]; }
         else { fprintf(stderr, "too many arguments\n"); return 1; }
@@ -1528,6 +1721,14 @@ int main(int argc, char **argv)
     if ( (strcmp(cmd, "unpack") == 0) && (npos >= 2) )  { return cmd_unpack(pos, npos - 1, pos[npos - 1]); }
     if ( (strcmp(cmd, "salvage") == 0) && (npos == 2) ) { return cmd_salvage(pos[0], pos[1], schemas, listOut); }
     if ( (strcmp(cmd, "rebuild-manifest") == 0) && (npos >= 1) ) { return cmd_rebuild_manifest(pos, npos, out); }
+    if ( (strcmp(cmd, "words") == 0) && (npos >= 1) )
+    {
+        // A last argument that isn't a file is the TABLE.COLUMN of the index
+        struct stat st;
+        int hasSpec = (npos >= 2) && (stat(pos[npos - 1], &st) != 0) && (strchr(pos[npos - 1], '.') != NULL);
+        return cmd_words(pos, hasSpec ? npos - 1 : npos, hasSpec ? pos[npos - 1] : NULL, source, sources, canonical, top, word);
+    }
+    if ( (strcmp(cmd, "reindex") == 0) && (npos >= 1) && (npos <= 3) ) { return cmd_reindex(pos[0], (npos >= 2) ? pos[1] : NULL, (npos == 3) ? pos[2] : NULL, drop); }
     unsigned op = !strncmp(cmd, "add-", 4) ? PZPD_EDIT_ADD : !strncmp(cmd, "replace-", 8) ? PZPD_EDIT_REPLACE : !strncmp(cmd, "drop-", 5) ? PZPD_EDIT_DROP : 0;
     const char *what = (op == PZPD_EDIT_ADD) ? cmd + 4 : (op == PZPD_EDIT_REPLACE) ? cmd + 8 : (op == PZPD_EDIT_DROP) ? cmd + 5 : "";
     if ( (op != 0) && (!strcmp(what, "table") || !strcmp(what, "stream")) && (npos == ((op == PZPD_EDIT_DROP) ? 2 : 3)) )

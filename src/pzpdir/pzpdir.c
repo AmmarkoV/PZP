@@ -62,6 +62,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *  clash with a system libxxhash or another vendored copy in the same program. */
 #define XXH_INLINE_ALL
 #include "third_party/xxhash.h"
+#include "pzpdir_unicode.h"
 
 #if PZPDIR_WITH_PZP
  #pragma GCC diagnostic push
@@ -115,7 +116,9 @@ enum pzpd_section_kind
     PZPD_SECT_CHEAP    = 10,///< Collection: member paths and aliases
     PZPD_SECT_CREMAP   = 11,///< Collection: per member, PZPD_MAX_STREAMS bytes mapping merged stream -> member stream (0xFF = none)
     PZPD_SECT_TABLE    = 12,///< One table: pzpd_disk_table_head, columns, row index, rows, string heap
-    PZPD_SECT_GROUPS   = 13 ///< Video groups of the shard (pzpd_disk_group entries, by first record)
+    PZPD_SECT_GROUPS   = 13,///< Video groups of the shard (pzpd_disk_group entries, by first record)
+    PZPD_SECT_WORDS    = 14,///< One word index of a shard (spec §4.10): pzpd_disk_words_head, sub-indexes
+    PZPD_SECT_MWORDS   = 15 ///< Manifest: merged vocabularies of one word index (pzpd_disk_words_head, pzpd_disk_msubindex)
 };
 
 /** @brief Hash entry kind: the entry indexes a record key. */
@@ -151,6 +154,15 @@ struct pzpd_disk_table
     uint64_t section_bytes;  ///< Bytes of the table section
     uint32_t row_stride;     ///< Bytes per row
     uint32_t pad;            ///< Reserved, 0
+};
+
+/** @brief One slot of the word index directory (64 bytes; spec revision 12). Unused slots are all zero. */
+struct pzpd_disk_words
+{
+    char     table[24];       ///< Indexed table, NUL-terminated
+    char     column[24];      ///< Indexed `str` column, NUL-terminated
+    uint64_t section_offset;  ///< Section data (PZPD_SECT_WORDS in shards, PZPD_SECT_MWORDS in manifests)
+    uint64_t section_bytes;   ///< Section bytes
 };
 
 /** @brief Shard superblock: a 4 KiB slot at offset 0, copied to the last 4 KiB of the file.
@@ -190,6 +202,11 @@ struct pzpd_disk_superblock
     uint64_t file_bytes;        ///< Size of the complete shard file (the backup superblock ends here)
     uint64_t index_checksum;    ///< XXH64 of the record, blob, hash, heap, meta and table section data
     uint64_t sb_checksum;       ///< XXH64 of every byte of this structure before this field
+    // Revision 12 extension, after sb_checksum: superblocks written before it (zeros here) stay valid, and
+    // older readers ignore it. It is sealed on its own (pzpd_seal_superblock()).
+    struct pzpd_disk_words words[PZPD_MAX_WORD_INDEXES]; ///< Word index directory (256 B)
+    uint64_t words_checksum;    ///< XXH64 of the word index section data, in directory order
+    uint64_t ext_checksum;      ///< XXH64 of the extension bytes before this field; 0 when the extension is all zero
 };
 
 /** @brief Header in front of every index section (32 bytes). */
@@ -301,6 +318,10 @@ struct pzpd_disk_manifest
     uint64_t file_bytes;        ///< Manifest file size
     uint64_t index_checksum;    ///< XXH64 of the shard table, names, hash and table section data
     uint64_t sb_checksum;       ///< XXH64 of every byte of this structure before this field
+    // Revision 12 extension, as in the shard superblock
+    struct pzpd_disk_words words[PZPD_MAX_WORD_INDEXES]; ///< Merged vocabulary sections (PZPD_SECT_MWORDS)
+    uint64_t words_checksum;    ///< XXH64 of those sections' data, in directory order
+    uint64_t ext_checksum;      ///< XXH64 of the extension bytes before this field; 0 when the extension is all zero
 };
 
 /** @brief Manifest shard table entry (48 bytes). */
@@ -366,6 +387,71 @@ struct pzpd_disk_group
     uint32_t pad;          ///< 0
 };
 
+/** @brief Head of a word index section (64 bytes), shard (kind 14) or manifest (kind 15). Offsets are
+ *  relative to the section data; each part is 8-byte aligned. Sub-index 0 is the merged one, 1..k one per
+ *  source value, sorted by its bytes. */
+struct pzpd_disk_words_head
+{
+    uint32_t tokenizer;         ///< PZPD_TOKENIZER_V1
+    uint32_t flags;             ///< 0
+    uint32_t subindex_count;    ///< Sub-index heads that follow
+    uint32_t pad;               ///< 0
+    char     source_column[24]; ///< Column naming each row's source, "" for none
+    uint64_t names_offset;      ///< Source values (bytes, no NUL)
+    uint64_t names_bytes;       ///< Their size
+    uint64_t reserved;          ///< 0
+};
+
+/** @brief One sub-index of a shard word index section (96 bytes). */
+struct pzpd_disk_subindex
+{
+    uint32_t source_offset;     ///< Source value in the names (source_len 0: the merged sub-index)
+    uint32_t source_len;        ///< Its length
+    uint64_t records;           ///< Records of the shard (forward index covers them all)
+    uint64_t words;             ///< Vocabulary size
+    uint64_t postings;          ///< Record-word pairs (= forward entries)
+    uint64_t vocab_offset;      ///< words × pzpd_disk_word, sorted by word bytes
+    uint64_t post_index_offset; ///< (words + 1) × u32
+    uint64_t post_offset;       ///< postings × u32 shard-local ordinals, ascending per word
+    uint64_t fwd_index_offset;  ///< (records + 1) × u32
+    uint64_t fwd_offset;        ///< postings × u32 word ids, ascending per record
+    uint64_t heap_offset;       ///< Word bytes
+    uint64_t heap_bytes;        ///< Their size
+    uint64_t reserved;          ///< 0
+};
+
+/** @brief One word of a shard vocabulary (16 bytes). */
+struct pzpd_disk_word
+{
+    uint32_t heap_offset;       ///< Word bytes in the sub-index heap
+    uint16_t len;               ///< Word length
+    uint16_t pad;               ///< 0
+    uint32_t records;           ///< Records of the shard containing it
+    uint32_t count;             ///< Occurrences in the shard
+};
+
+/** @brief One sub-index of a manifest word section (48 bytes): the merged vocabulary of every shard. */
+struct pzpd_disk_msubindex
+{
+    uint32_t source_offset;     ///< Source value in the names (source_len 0: the merged sub-index)
+    uint32_t source_len;        ///< Its length
+    uint64_t words;             ///< Vocabulary size
+    uint64_t vocab_offset;      ///< words × pzpd_disk_mword, sorted by word bytes
+    uint64_t heap_offset;       ///< Word bytes
+    uint64_t heap_bytes;        ///< Their size
+    uint64_t reserved;          ///< 0
+};
+
+/** @brief One word of a manifest vocabulary (24 bytes): totals over the archive. */
+struct pzpd_disk_mword
+{
+    uint32_t heap_offset;       ///< Word bytes in the sub-index heap
+    uint16_t len;               ///< Word length
+    uint16_t pad;               ///< 0
+    uint64_t records;           ///< Records containing it
+    uint64_t count;             ///< Occurrences
+};
+
 /** @brief Manifest global hash entry (24 bytes), sorted by (hash, kind, ordinal, stream). */
 struct pzpd_disk_global_hash
 {
@@ -394,6 +480,13 @@ _Static_assert(sizeof(struct pzpd_disk_table_head)      == 96,  "table section h
 _Static_assert(sizeof(struct pzpd_disk_column)          == 32,  "table column");
 _Static_assert(sizeof(struct pzpd_disk_row_copy)        == 16,  "record-header row copy");
 _Static_assert(sizeof(struct pzpd_disk_group)           == 24,  "group entry");
+_Static_assert(sizeof(struct pzpd_disk_words)           == 64,  "word index slot");
+_Static_assert(sizeof(struct pzpd_disk_words_head)      == 64,  "word section head");
+_Static_assert(sizeof(struct pzpd_disk_subindex)        == 96,  "word sub-index head");
+_Static_assert(sizeof(struct pzpd_disk_word)            == 16,  "shard vocabulary entry");
+_Static_assert(sizeof(struct pzpd_disk_msubindex)       == 48,  "manifest sub-index head");
+_Static_assert(sizeof(struct pzpd_disk_mword)           == 24,  "manifest vocabulary entry");
+_Static_assert(offsetof(struct pzpd_disk_superblock, sb_checksum) == 1728, "the revision-12 extension must not move sb_checksum");
 
 //-----------------------------------------------------------------------------------------------
 // Errors (thread-local)
@@ -865,9 +958,11 @@ static int pzpd_pzp_inner_header(const unsigned char *frame, size_t n, uint32_t 
         if (ob.pos < 40) { return 0; }
     }
     memcpy(hdr, out, 40);
-    // PZP writes convert_header("PZP0") natively: 'P'<<24 | 'Z'<<16 | 'P'<<8 | '0'
-    const uint32_t magic = ((uint32_t)'P' << 24) | ((uint32_t)'Z' << 16) | ((uint32_t)'P' << 8) | (uint32_t)'0';
-    return hdr[0] == magic;
+    // PZP writes convert_header("PZP0") natively: 'P'<<24 | 'Z'<<16 | 'P'<<8 | '0'; frames with a
+    // channel group table ( PZP v0.03 ) use "PZP1", with the same 40-byte header
+    const uint32_t magic  = ((uint32_t)'P' << 24) | ((uint32_t)'Z' << 16) | ((uint32_t)'P' << 8) | (uint32_t)'0';
+    const uint32_t magic1 = ((uint32_t)'P' << 24) | ((uint32_t)'Z' << 16) | ((uint32_t)'P' << 8) | (uint32_t)'1';
+    return (hdr[0] == magic) || (hdr[0] == magic1);
 }
 
 /** @brief Fill metadata from an inner PZP frame header (bpp_ext is bits per channel). */
@@ -1502,6 +1597,767 @@ static int pzpd_table_parse(const unsigned char *d, uint64_t bytes, struct pzpd_
 }
 
 //-----------------------------------------------------------------------------------------------
+// Word index (spec §3.7, §4.10): tokenizer v1, shard section builder, section views
+//-----------------------------------------------------------------------------------------------
+
+/** @brief 1 for the ASCII bytes that are word characters for Python's `re` (\w: letters, digits, '_'). */
+static const unsigned char pzpd_ascii_word[128] =
+{
+    ['0']=1,['1']=1,['2']=1,['3']=1,['4']=1,['5']=1,['6']=1,['7']=1,['8']=1,['9']=1,['_']=1,
+    ['a']=1,['b']=1,['c']=1,['d']=1,['e']=1,['f']=1,['g']=1,['h']=1,['i']=1,['j']=1,['k']=1,['l']=1,['m']=1,
+    ['n']=1,['o']=1,['p']=1,['q']=1,['r']=1,['s']=1,['t']=1,['u']=1,['v']=1,['w']=1,['x']=1,['y']=1,['z']=1,
+    ['A']=1,['B']=1,['C']=1,['D']=1,['E']=1,['F']=1,['G']=1,['H']=1,['I']=1,['J']=1,['K']=1,['L']=1,['M']=1,
+    ['N']=1,['O']=1,['P']=1,['Q']=1,['R']=1,['S']=1,['T']=1,['U']=1,['V']=1,['W']=1,['X']=1,['Y']=1,['Z']=1
+};
+
+/** @brief 1 if a non-ASCII code point is a word character for Python's `re` (str.isalnum() or '_'). */
+static int pzpd_word_cp(uint32_t c)
+{
+    size_t lo = 0, hi = sizeof(pzpd_unicode_word) / sizeof(pzpd_unicode_word[0]);
+    while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (pzpd_unicode_word[mid][1] < c) { lo = mid + 1; } else { hi = mid; } }
+    return (lo < sizeof(pzpd_unicode_word) / sizeof(pzpd_unicode_word[0])) && (pzpd_unicode_word[lo][0] <= c);
+}
+
+/** @brief Python's str.lower() of one non-ASCII code point: 1 or 2 code points in out. @return Their number. */
+static int pzpd_lower_cp(uint32_t c, uint32_t out[2])
+{
+    size_t lo = 0, hi = sizeof(pzpd_unicode_lower) / sizeof(pzpd_unicode_lower[0]);
+    while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (pzpd_unicode_lower[mid][0] < c) { lo = mid + 1; } else { hi = mid; } }
+    if ( (lo < sizeof(pzpd_unicode_lower) / sizeof(pzpd_unicode_lower[0])) && (pzpd_unicode_lower[lo][0] == c) )
+    {
+        out[0] = pzpd_unicode_lower[lo][1];
+        out[1] = pzpd_unicode_lower[lo][2];
+        return (out[1] != 0) ? 2 : 1;
+    }
+    out[0] = c;
+    return 1;
+}
+
+/** @brief Decode one UTF-8 code point at p (n bytes left). Invalid or truncated sequences give U+FFFD over one byte.
+ *  @return Bytes consumed (≥ 1). */
+static size_t pzpd_utf8_next(const unsigned char *p, size_t n, uint32_t *cp)
+{
+    unsigned char b = p[0];
+    size_t need = (b >= 0xF0 && b <= 0xF4) ? 4 : (b >= 0xE0) && (b <= 0xEF) ? 3 : (b >= 0xC2) && (b <= 0xDF) ? 2 : 0;
+    if ( (need == 0) || (need > n) ) { *cp = 0xFFFD; return 1; }
+    uint32_t c = (need == 2) ? (b & 0x1Fu) : (need == 3) ? (b & 0x0Fu) : (b & 0x07u);
+    for (size_t k = 1; k < need; k++)
+    {
+        if ((p[k] & 0xC0) != 0x80) { *cp = 0xFFFD; return 1; }
+        c = (c << 6) | (p[k] & 0x3Fu);
+    }
+    // No overlong forms, surrogates or values past U+10FFFF (strict UTF-8, as Python's decoder)
+    if ( ((need == 3) && ((c < 0x800) || ((c >= 0xD800) && (c <= 0xDFFF)))) || ((need == 4) && ((c < 0x10000) || (c > 0x10FFFF))) ) { *cp = 0xFFFD; return 1; }
+    *cp = c;
+    return need;
+}
+
+/** @brief Tokenizer v1 state: the word being assembled. */
+struct pzpd_tok
+{
+    struct pzpd_buf word;   ///< Its bytes (ASCII, lower-case)
+    int  foreign;           ///< 1 once a non-ASCII word character joined it: the word is dropped (spec §3.7)
+    int  (*emit)(const char *, size_t, void *);
+    void *user;
+    size_t emitted;         ///< Words emitted
+    int  stop;              ///< 1 after emit asked to stop
+};
+
+/** @brief End the current word: emit it if it is all ASCII. */
+static void pzpd_tok_flush(struct pzpd_tok *t)
+{
+    if ( (t->word.len > 0) && !t->foreign && !t->stop )
+    {
+        t->emitted++;
+        if (t->emit((const char *) t->word.data, t->word.len, t->user) != 0) { t->stop = 1; }
+    }
+    t->word.len = 0;
+    t->foreign  = 0;
+}
+
+/** @brief Feed one (already lower-cased) code point. @return 0 on out of memory. */
+static int pzpd_tok_cp(struct pzpd_tok *t, uint32_t c)
+{
+    if (c < 128)
+    {
+        if (!pzpd_ascii_word[c]) { pzpd_tok_flush(t); return 1; }
+        unsigned char b = (unsigned char) c;
+        return pzpd_buf_append(&t->word, &b, 1);
+    }
+    if (pzpd_word_cp(c)) { t->foreign = 1; } else { pzpd_tok_flush(t); }
+    return 1;
+}
+
+/** @brief Tokenizer v1 over text, with the caller's word buffer (reused across calls). @return Words emitted, or -1 on out of memory. */
+static int64_t pzpd_tokenize_buf(const char *text, size_t len, struct pzpd_buf *scratch, int (*emit)(const char *, size_t, void *), void *user)
+{
+    struct pzpd_tok t;
+    memset(&t, 0, sizeof(t));
+    t.word = *scratch;
+    t.word.len = 0;
+    t.emit = emit;
+    t.user = user;
+    const unsigned char *p = (const unsigned char *) text;
+    int ok = 1;
+    for (size_t i = 0; ok && !t.stop && (i < len); )
+    {
+        unsigned char b = p[i];
+        if (b < 128)
+        {
+            // str.lower() of ASCII only changes A-Z
+            ok = pzpd_tok_cp(&t, ((b >= 'A') && (b <= 'Z')) ? (uint32_t)(b + 32) : b);
+            i++;
+            continue;
+        }
+        uint32_t c, low[2];
+        i += pzpd_utf8_next(p + i, len - i, &c);
+        int nl = pzpd_lower_cp(c, low);
+        for (int k = 0; ok && (k < nl); k++) { ok = pzpd_tok_cp(&t, low[k]); }
+    }
+    if (ok) { pzpd_tok_flush(&t); }
+    *scratch = t.word;
+    if (!ok) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return -1; }
+    return (int64_t) t.emitted;
+}
+
+size_t pzpd_tokenize(const char *text, size_t len, int (*emit)(const char *word, size_t len, void *user), void *user)
+{
+    pzpd_clear_error();
+    if ( (emit == NULL) || ((text == NULL) && (len > 0)) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    struct pzpd_buf scratch = {0};
+    int64_t n = pzpd_tokenize_buf(text, len, &scratch, emit, user);
+    pzpd_buf_free(&scratch);
+    return (n < 0) ? 0 : (size_t) n;
+}
+
+/** @brief Order of words everywhere in the word index: bytes (memcmp), a prefix first. */
+static int pzpd_word_cmp(const char *a, size_t al, const char *b, size_t bl)
+{
+    int c = memcmp(a, b, (al < bl) ? al : bl);
+    if (c != 0) { return c; }
+    return (al < bl) ? -1 : (al > bl);
+}
+
+/** @brief Distinct byte strings with dense ids (open addressing), for the word index builder. */
+struct pzpd_sdict
+{
+    uint32_t *slot;          ///< id + 1, 0 = empty
+    uint64_t  cap;           ///< Slots (power of two)
+    uint64_t *off;           ///< Bytes of id in `bytes`
+    uint32_t *len;           ///< Their length
+    uint64_t *hash;          ///< Their XXH64
+    uint32_t  n, ecap;       ///< Ids, capacity of off / len / hash
+    struct pzpd_buf bytes;   ///< Every string
+};
+
+static void pzpd_sdict_free(struct pzpd_sdict *d)
+{
+    free(d->slot); free(d->off); free(d->len); free(d->hash);
+    pzpd_buf_free(&d->bytes);
+    memset(d, 0, sizeof(*d));
+}
+
+/** @brief Id of a string without inserting it. @return The id, or -1 if absent. */
+static int64_t pzpd_sdict_find(const struct pzpd_sdict *d, const char *s, size_t n)
+{
+    if (d->cap == 0) { return -1; }
+    uint64_t h = XXH64(s, n, 0), k = h & (d->cap - 1);
+    while (d->slot[k] != 0)
+    {
+        uint32_t id = d->slot[k] - 1;
+        if ( (d->hash[id] == h) && (d->len[id] == n) && (memcmp(d->bytes.data + d->off[id], s, n) == 0) ) { return id; }
+        k = (k + 1) & (d->cap - 1);
+    }
+    return -1;
+}
+
+/** @brief Id of a string, inserting it if new. @return The id, or -1 on out of memory. */
+static int64_t pzpd_sdict_id(struct pzpd_sdict *d, const char *s, size_t n)
+{
+    if ( (d->cap == 0) || ((uint64_t)(d->n + 1) * 2 > d->cap) )
+    {
+        uint64_t cap = d->cap ? d->cap * 2 : 1024;
+        uint32_t *ns = (uint32_t *) calloc(cap, sizeof(uint32_t));
+        if (ns == NULL) { return -1; }
+        for (uint32_t id = 0; id < d->n; id++)
+        {
+            uint64_t k = d->hash[id] & (cap - 1);
+            while (ns[k] != 0) { k = (k + 1) & (cap - 1); }
+            ns[k] = id + 1;
+        }
+        free(d->slot);
+        d->slot = ns;
+        d->cap  = cap;
+    }
+    uint64_t h = XXH64(s, n, 0), k = h & (d->cap - 1);
+    while (d->slot[k] != 0)
+    {
+        uint32_t id = d->slot[k] - 1;
+        if ( (d->hash[id] == h) && (d->len[id] == n) && (memcmp(d->bytes.data + d->off[id], s, n) == 0) ) { return id; }
+        k = (k + 1) & (d->cap - 1);
+    }
+    if (d->n == 0xFFFFFFFFu) { return -1; }
+    if (d->n == d->ecap)
+    {
+        uint32_t ec = d->ecap ? d->ecap * 2 : 1024;
+        uint64_t *no = (uint64_t *) realloc(d->off, ec * sizeof(uint64_t));   if (no == NULL) { return -1; } d->off = no;
+        uint32_t *nl = (uint32_t *) realloc(d->len, ec * sizeof(uint32_t));   if (nl == NULL) { return -1; } d->len = nl;
+        uint64_t *nh = (uint64_t *) realloc(d->hash, ec * sizeof(uint64_t));  if (nh == NULL) { return -1; } d->hash = nh;
+        d->ecap = ec;
+    }
+    uint32_t id = d->n;
+    d->off[id]  = d->bytes.len;
+    d->len[id]  = (uint32_t) n;
+    d->hash[id] = h;
+    if ( (n > 0) && !pzpd_buf_append(&d->bytes, s, n) ) { return -1; }
+    d->slot[k] = id + 1;
+    d->n++;
+    return id;
+}
+
+/** @brief A record table's rows in one shard, as the word index builder reads them. */
+struct pzpd_wsrc
+{
+    uint64_t             records;     ///< Records of the shard
+    const uint32_t      *index;       ///< records + 1 row starts (CSR)
+    const unsigned char *rows;        ///< Rows
+    uint64_t             nrows;       ///< Rows
+    uint32_t             stride;      ///< Bytes per row
+    const char          *heap;        ///< Strings
+    uint64_t             heap_bytes;  ///< Strings size
+    uint32_t             text_off;    ///< Offset of the indexed `str` field in a row
+    int64_t              source_off;  ///< Offset of the source `str` field, -1 for none
+};
+
+/** @brief One word occurrence in a record: (word id, source id; 0 = no source). */
+struct pzpd_wocc { uint32_t tid; uint32_t sid; };
+
+/** @brief One (word, record, occurrences) pair of a sub-index, in record order. */
+struct pzpd_wpair { uint32_t tid; uint32_t rec; uint32_t cnt; };
+
+static int pzpd_cmp_wocc(const void *a, const void *b)
+{
+    const struct pzpd_wocc *x = (const struct pzpd_wocc *) a, *y = (const struct pzpd_wocc *) b;
+    if (x->tid != y->tid) { return (x->tid < y->tid) ? -1 : 1; }
+    return (x->sid < y->sid) ? -1 : (x->sid > y->sid);
+}
+
+/** @brief Context of the id comparators below (qsort has none): the dictionary whose strings are sorted. */
+static __thread const struct pzpd_sdict *pzpd_sort_dict;
+
+static int pzpd_cmp_dict_ids(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
+    const struct pzpd_sdict *d = pzpd_sort_dict;
+    return pzpd_word_cmp((const char *) d->bytes.data + d->off[x], d->len[x], (const char *) d->bytes.data + d->off[y], d->len[y]);
+}
+
+static int pzpd_cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
+    return (x < y) ? -1 : (x > y);
+}
+
+/** @brief Tokenizer callback of the builder: append (word id, current source) to the record's occurrences. */
+struct pzpd_wbuild
+{
+    struct pzpd_sdict *words;   ///< Word dictionary
+    struct pzpd_buf   *occ;     ///< The record's occurrences (pzpd_wocc)
+    uint32_t           sid;     ///< Source of the row being tokenized
+    int                failed;  ///< 1 after an error (set)
+};
+
+static int pzpd_wbuild_emit(const char *word, size_t len, void *user)
+{
+    struct pzpd_wbuild *b = (struct pzpd_wbuild *) user;
+    if (len > 0xFFFF) { pzpd_set_error(PZPD_E_ARG, "a word of %zu bytes is longer than the word index allows (65535)", len); b->failed = 1; return 1; }
+    int64_t id = pzpd_sdict_id(b->words, word, len);
+    struct pzpd_wocc o = { (uint32_t) id, b->sid };
+    if ( (id < 0) || !pzpd_buf_append(b->occ, &o, sizeof(o)) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); b->failed = 1; return 1; }
+    return 0;
+}
+
+/** @brief Append zero bytes up to the next multiple of 8. */
+static int pzpd_buf_pad8(struct pzpd_buf *b)
+{
+    static const unsigned char zeros[8] = {0};
+    return pzpd_buf_append(b, zeros, (size_t)(pzpd_align_up(b->len, 8) - b->len));
+}
+
+/** @brief One sub-index serialized: pzpd_disk_subindex offsets relative to the start of `parts`. */
+struct pzpd_wsub_out
+{
+    struct pzpd_disk_subindex head;
+    struct pzpd_buf parts;
+};
+
+/** @brief Build one sub-index from its pairs (record order, word ids ascending within a record). */
+static int pzpd_words_build_sub(const struct pzpd_sdict *words, const struct pzpd_wpair *pairs, uint64_t np, uint64_t records,
+                                uint32_t *df, uint32_t *cnt, uint32_t *fid, struct pzpd_wsub_out *o)
+{
+    if (np > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "word index: more than 4 G record-word pairs in one shard"); return 0; }
+    // Vocabulary: the words present, sorted by bytes
+    uint32_t *present = (uint32_t *) malloc(sizeof(uint32_t) * (words->n ? words->n : 1));
+    if (present == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    uint32_t W = 0;
+    for (uint64_t i = 0; i < np; i++)
+    {
+        uint32_t t = pairs[i].tid;
+        if (df[t]++ == 0) { present[W++] = t; }
+        cnt[t] += pairs[i].cnt;
+    }
+    pzpd_sort_dict = words;
+    qsort(present, W, sizeof(uint32_t), pzpd_cmp_dict_ids);
+    for (uint32_t w = 0; w < W; w++) { fid[present[w]] = w; }
+
+    struct pzpd_buf vocab = {0}, heap = {0}, pidx = {0}, post = {0}, fidx = {0}, fwd = {0};
+    uint32_t *cursor = (uint32_t *) calloc((size_t) W + 1, sizeof(uint32_t));
+    int ok = (cursor != NULL);
+    uint32_t acc = 0;
+    for (uint32_t w = 0; ok && (w < W); w++)
+    {
+        uint32_t t = present[w];
+        struct pzpd_disk_word dw = { (uint32_t) heap.len, (uint16_t) words->len[t], 0, df[t], cnt[t] };
+        if (heap.len + words->len[t] > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "word index: more than 4 GiB of words in one shard"); ok = 0; break; }
+        ok = pzpd_buf_append(&vocab, &dw, sizeof(dw)) && pzpd_buf_append(&heap, words->bytes.data + words->off[t], words->len[t]) &&
+             pzpd_buf_append(&pidx, &acc, 4);
+        cursor[w] = acc;
+        acc += df[t];
+    }
+    ok = ok && pzpd_buf_append(&pidx, &acc, 4);
+    // Postings: pairs are in record order, so every word's list comes out ascending
+    if (ok)
+    {
+        post.data = (unsigned char *) realloc(post.data, (size_t)(np ? np : 1) * 4);
+        ok = (post.data != NULL);
+        if (ok) { post.cap = (size_t)(np ? np : 1) * 4; post.len = (size_t) np * 4; }
+    }
+    for (uint64_t i = 0; ok && (i < np); i++) { ((uint32_t *) post.data)[cursor[fid[pairs[i].tid]]++] = pairs[i].rec; }
+    // Forward lists: per record, the sub-index word ids, ascending
+    uint64_t i = 0;
+    for (uint64_t r = 0; ok && (r < records); r++)
+    {
+        uint32_t start = (uint32_t)(fwd.len / 4);
+        ok = pzpd_buf_append(&fidx, &start, 4);
+        uint64_t j = i;
+        while ( ok && (j < np) && (pairs[j].rec == r) ) { uint32_t f = fid[pairs[j].tid]; ok = pzpd_buf_append(&fwd, &f, 4); j++; }
+        if (ok && (j - i > 1)) { qsort(fwd.data + (size_t) start * 4, (size_t)(j - i), 4, pzpd_cmp_u32); }
+        i = j;
+    }
+    uint32_t endf = (uint32_t)(fwd.len / 4);
+    ok = ok && pzpd_buf_append(&fidx, &endf, 4);
+    for (uint32_t w = 0; w < W; w++) { df[present[w]] = 0; cnt[present[w]] = 0; }   // reset for the next sub-index
+
+    // Serialize the parts, each 8-aligned
+    memset(&o->head, 0, sizeof(o->head));
+    o->head.records  = records;
+    o->head.words    = W;
+    o->head.postings = np;
+    struct pzpd_buf *pp = &o->parts;
+    pp->len = 0;
+    o->head.vocab_offset      = pp->len; ok = ok && pzpd_buf_append(pp, vocab.data, vocab.len) && pzpd_buf_pad8(pp);
+    o->head.post_index_offset = pp->len; ok = ok && pzpd_buf_append(pp, pidx.data,  pidx.len)  && pzpd_buf_pad8(pp);
+    o->head.post_offset       = pp->len; ok = ok && pzpd_buf_append(pp, post.data,  post.len)  && pzpd_buf_pad8(pp);
+    o->head.fwd_index_offset  = pp->len; ok = ok && pzpd_buf_append(pp, fidx.data,  fidx.len)  && pzpd_buf_pad8(pp);
+    o->head.fwd_offset        = pp->len; ok = ok && pzpd_buf_append(pp, fwd.data,   fwd.len)   && pzpd_buf_pad8(pp);
+    o->head.heap_offset       = pp->len; ok = ok && pzpd_buf_append(pp, heap.data,  heap.len)  && pzpd_buf_pad8(pp);
+    o->head.heap_bytes        = heap.len;
+    if (!ok && (pzpd_errorCode == PZPD_OK)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+    pzpd_buf_free(&vocab); pzpd_buf_free(&heap); pzpd_buf_free(&pidx); pzpd_buf_free(&post); pzpd_buf_free(&fidx); pzpd_buf_free(&fwd);
+    free(cursor);
+    free(present);
+    return ok;
+}
+
+/** @brief Build a shard's word index section (kind 14) from a record table's rows.
+ *  @return 1 on success (section data in out), 0 on failure (error set). */
+static int pzpd_words_build(struct pzpd_buf *out, const struct pzpd_wsrc *in, const char *source_column)
+{
+    out->len = 0;
+    if (in->records > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "word index: more than 4 G records in one shard"); return 0; }
+    struct pzpd_sdict words, sources;
+    memset(&words, 0, sizeof(words));
+    memset(&sources, 0, sizeof(sources));
+    struct pzpd_buf occ = {0}, scratch = {0};
+    struct pzpd_buf pairs[PZPD_MAX_WORD_SOURCES + 1];
+    memset(pairs, 0, sizeof(pairs));
+    struct pzpd_wbuild wb = { &words, &occ, 0, 0 };
+    int ok = 1;
+    for (uint64_t r = 0; ok && (r < in->records); r++)
+    {
+        occ.len = 0;
+        uint32_t a = in->index[r], b = in->index[r + 1];
+        if ( (a > b) || (b > in->nrows) ) { pzpd_set_error(PZPD_E_FORMAT, "word index: the table's row index is damaged"); ok = 0; break; }
+        for (uint32_t row = a; ok && (row < b); row++)
+        {
+            const unsigned char *rp = in->rows + (uint64_t) row * in->stride;
+            pzpd_str tf;
+            memcpy(&tf, rp + in->text_off, sizeof(tf));
+            wb.sid = 0;
+            if (in->source_off >= 0)
+            {
+                pzpd_str sf;
+                memcpy(&sf, rp + in->source_off, sizeof(sf));
+                if (!pzpd_in_file(sf.offset, sf.len, in->heap_bytes)) { pzpd_set_error(PZPD_E_FORMAT, "word index: a source string lies outside the table's strings"); ok = 0; break; }
+                if (sf.len > 0)   // rows with an empty source count in the merged sub-index only
+                {
+                    int64_t sid = pzpd_sdict_id(&sources, in->heap + sf.offset, sf.len);
+                    if (sid < 0) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; break; }
+                    if (sid >= PZPD_MAX_WORD_SOURCES) { pzpd_set_error(PZPD_E_ARG, "word index: more than %d distinct source values", PZPD_MAX_WORD_SOURCES); ok = 0; break; }
+                    wb.sid = (uint32_t) sid + 1;
+                }
+            }
+            if (!pzpd_in_file(tf.offset, tf.len, in->heap_bytes)) { pzpd_set_error(PZPD_E_FORMAT, "word index: a text string lies outside the table's strings"); ok = 0; break; }
+            if ( (pzpd_tokenize_buf(in->heap + tf.offset, tf.len, &scratch, pzpd_wbuild_emit, &wb) < 0) || wb.failed ) { ok = 0; break; }
+        }
+        if (!ok || (occ.len == 0)) { continue; }
+        // Sort by (word, source): runs of a word give the merged pair, sub-runs of a source the per-source pairs
+        struct pzpd_wocc *o = (struct pzpd_wocc *) occ.data;
+        size_t no = occ.len / sizeof(*o);
+        qsort(o, no, sizeof(*o), pzpd_cmp_wocc);
+        for (size_t i = 0; ok && (i < no); )
+        {
+            size_t j = i;
+            while ( (j < no) && (o[j].tid == o[i].tid) ) { j++; }
+            struct pzpd_wpair mp = { o[i].tid, (uint32_t) r, (uint32_t)(j - i) };
+            ok = pzpd_buf_append(&pairs[0], &mp, sizeof(mp));
+            for (size_t k = i; ok && (k < j); )
+            {
+                size_t l = k;
+                while ( (l < j) && (o[l].sid == o[k].sid) ) { l++; }
+                if (o[k].sid != 0)
+                {
+                    struct pzpd_wpair sp = { o[k].tid, (uint32_t) r, (uint32_t)(l - k) };
+                    ok = pzpd_buf_append(&pairs[o[k].sid], &sp, sizeof(sp));
+                }
+                k = l;
+            }
+            i = j;
+        }
+        if (!ok && (pzpd_errorCode == PZPD_OK)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+    }
+
+    // Sub-index order: the merged one, then the sources by bytes
+    unsigned K = sources.n;
+    uint32_t order[PZPD_MAX_WORD_SOURCES];
+    for (unsigned k = 0; k < K; k++) { order[k] = k; }
+    pzpd_sort_dict = &sources;
+    qsort(order, K, sizeof(uint32_t), pzpd_cmp_dict_ids);
+
+    uint32_t *df = NULL, *cnt = NULL, *fid = NULL;
+    if (ok)
+    {
+        size_t n = words.n ? words.n : 1;
+        df  = (uint32_t *) calloc(n, sizeof(uint32_t));
+        cnt = (uint32_t *) calloc(n, sizeof(uint32_t));
+        fid = (uint32_t *) calloc(n, sizeof(uint32_t));
+        if ( (df == NULL) || (cnt == NULL) || (fid == NULL) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+    }
+    struct pzpd_wsub_out *subs = ok ? (struct pzpd_wsub_out *) calloc(K + 1, sizeof(struct pzpd_wsub_out)) : NULL;
+    if (ok && (subs == NULL)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+    for (unsigned k = 0; ok && (k <= K); k++)
+    {
+        const struct pzpd_buf *pb = &pairs[(k == 0) ? 0 : order[k - 1] + 1];
+        ok = pzpd_words_build_sub(&words, (const struct pzpd_wpair *) pb->data, pb->len / sizeof(struct pzpd_wpair), in->records, df, cnt, fid, &subs[k]);
+    }
+
+    // Serialize: head, sub-index heads, source names, then each sub-index's parts
+    if (ok)
+    {
+        struct pzpd_disk_words_head h;
+        memset(&h, 0, sizeof(h));
+        h.tokenizer      = PZPD_TOKENIZER_V1;
+        h.subindex_count = K + 1;
+        if (source_column != NULL) { snprintf(h.source_column, sizeof(h.source_column), "%s", source_column); }
+        struct pzpd_buf names = {0};
+        for (unsigned k = 1; ok && (k <= K); k++)
+        {
+            uint32_t s = order[k - 1];
+            subs[k].head.source_offset = (uint32_t) names.len;
+            subs[k].head.source_len    = sources.len[s];
+            ok = pzpd_buf_append(&names, sources.bytes.data + sources.off[s], sources.len[s]);
+        }
+        uint64_t off = sizeof(h) + (uint64_t)(K + 1) * sizeof(struct pzpd_disk_subindex);
+        h.names_offset = off;
+        h.names_bytes  = names.len;
+        off = pzpd_align_up(off + names.len, 8);
+        for (unsigned k = 0; k <= K; k++)
+        {
+            struct pzpd_disk_subindex *sh = &subs[k].head;
+            sh->vocab_offset += off; sh->post_index_offset += off; sh->post_offset += off;
+            sh->fwd_index_offset += off; sh->fwd_offset += off; sh->heap_offset += off;
+            off += subs[k].parts.len;
+        }
+        ok = ok && pzpd_buf_append(out, &h, sizeof(h));
+        for (unsigned k = 0; ok && (k <= K); k++) { ok = pzpd_buf_append(out, &subs[k].head, sizeof(subs[k].head)); }
+        ok = ok && pzpd_buf_append(out, names.data, names.len) && pzpd_buf_pad8(out);
+        for (unsigned k = 0; ok && (k <= K); k++) { ok = pzpd_buf_append(out, subs[k].parts.data, subs[k].parts.len); }
+        if (!ok && (pzpd_errorCode == PZPD_OK)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+        pzpd_buf_free(&names);
+    }
+    for (unsigned k = 0; (subs != NULL) && (k <= K); k++) { pzpd_buf_free(&subs[k].parts); }
+    free(subs);
+    free(df); free(cnt); free(fid);
+    for (unsigned k = 0; k <= PZPD_MAX_WORD_SOURCES; k++) { pzpd_buf_free(&pairs[k]); }
+    pzpd_buf_free(&occ);
+    pzpd_buf_free(&scratch);
+    pzpd_sdict_free(&words);
+    pzpd_sdict_free(&sources);
+    return ok;
+}
+
+/** @brief Tokenizer callback that counts the words and keeps the first. */
+struct pzpd_one_word { const char *w; size_t len; unsigned n; };
+
+static int pzpd_one_word_emit(const char *w, size_t len, void *user)
+{
+    struct pzpd_one_word *o = (struct pzpd_one_word *) user;
+    if (o->n++ == 0) { o->w = w; o->len = len; }
+    return 0;
+}
+
+/** @brief 1 if s is exactly one word under tokenizer v1 (so it is already lower-case ASCII). */
+static int pzpd_is_one_word(const char *s, size_t len)
+{
+    struct pzpd_one_word o = { NULL, 0, 0 };
+    struct pzpd_buf scratch = {0};
+    int ok = (pzpd_tokenize_buf(s, len, &scratch, pzpd_one_word_emit, &o) == 1) && (o.len == len) && (memcmp(o.w, s, len) == 0);
+    pzpd_buf_free(&scratch);
+    return ok;
+}
+
+/** @brief Check a `synonyms` table (spec §3.7): schema `word:str,canonical:str` (global), each value a single
+ *  word under tokenizer v1, a word at most once, one step (no canonical is also a word), no word mapped to itself.
+ *  @param rows / n / heap  Its rows, or NULL / 0 to check the schema only.
+ *  @return 1 if valid, 0 otherwise (error set, naming the row). */
+static int pzpd_synonyms_check(const struct pzpd_tschema *sc, const unsigned char *rows, uint64_t n, const char *heap, uint64_t heap_bytes)
+{
+    if ( !(sc->flags & PZPD_TABLE_GLOBAL) || (sc->ncols != 2) || strcmp(sc->colname[0], "word") || strcmp(sc->colname[1], "canonical") ||
+         (sc->type[0] != PZPD_TYPE_STR) || (sc->type[1] != PZPD_TYPE_STR) || (sc->count[0] != 1) || (sc->count[1] != 1) )
+        { pzpd_set_error(PZPD_E_ARG, "table %s is reserved for the word index: it must be a global table \"word:str,canonical:str\"", PZPD_SYNONYMS_TABLE); return 0; }
+    struct pzpd_sdict words;
+    memset(&words, 0, sizeof(words));
+    int ok = 1;
+    for (uint64_t r = 0; ok && (r < n); r++)
+    {
+        pzpd_str f[2];
+        memcpy(f, rows + r * sc->stride + sc->offset[0], 8);
+        memcpy(&f[1], rows + r * sc->stride + sc->offset[1], 8);
+        for (int c = 0; ok && (c < 2); c++)
+        {
+            if (!pzpd_in_file(f[c].offset, f[c].len, heap_bytes) || !pzpd_is_one_word(heap + f[c].offset, f[c].len))
+                { pzpd_set_error(PZPD_E_ARG, "%s row %llu: \"%.*s\" is not a single lower-case word", PZPD_SYNONYMS_TABLE, (unsigned long long)(r + 1), (int)(f[c].len > 100 ? 100 : f[c].len), heap + f[c].offset); ok = 0; }
+        }
+        if (ok && (f[0].len == f[1].len) && !memcmp(heap + f[0].offset, heap + f[1].offset, f[0].len))
+            { pzpd_set_error(PZPD_E_ARG, "%s row %llu: \"%.*s\" maps to itself", PZPD_SYNONYMS_TABLE, (unsigned long long)(r + 1), (int) f[0].len, heap + f[0].offset); ok = 0; }
+        if (ok)
+        {
+            uint32_t before = words.n;
+            int64_t id = pzpd_sdict_id(&words, heap + f[0].offset, f[0].len);
+            if (id < 0) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+            else if (words.n == before) { pzpd_set_error(PZPD_E_ARG, "%s row %llu: \"%.*s\" is listed twice", PZPD_SYNONYMS_TABLE, (unsigned long long)(r + 1), (int) f[0].len, heap + f[0].offset); ok = 0; }
+        }
+    }
+    // One step: a canonical word may not itself be mapped
+    for (uint64_t r = 0; ok && (r < n); r++)
+    {
+        pzpd_str c;
+        memcpy(&c, rows + r * sc->stride + sc->offset[1], 8);
+        if (pzpd_sdict_find(&words, heap + c.offset, c.len) >= 0)
+            { pzpd_set_error(PZPD_E_ARG, "%s row %llu: \"%.*s\" is both a canonical word and mapped (rules are one step)", PZPD_SYNONYMS_TABLE, (unsigned long long)(r + 1), (int) c.len, heap + c.offset); ok = 0; }
+    }
+    pzpd_sdict_free(&words);
+    return ok;
+}
+
+/** @brief A validated view of one word index section (shard kind 14 or manifest kind 15). */
+struct pzpd_wsec
+{
+    const unsigned char *d;          ///< Section data
+    uint64_t             bytes;      ///< Its size
+    uint32_t             tokenizer;  ///< Tokenizer version
+    unsigned             nsub;       ///< Sub-indexes
+    char                 source_column[24]; ///< Source column ("" for none)
+    const char          *names;      ///< Source values
+    uint64_t             names_bytes;///< Their size
+    int                  manifest;   ///< 1 for kind 15
+};
+
+/** @brief One sub-index of a section: shard (postings, forward lists) or manifest (vocabulary with totals). */
+struct pzpd_wsub
+{
+    const char *source;              ///< Source value (NULL / 0 for the merged sub-index)
+    uint32_t    source_len;          ///< Its length
+    uint64_t    records;             ///< Shard: records covered by the forward index
+    uint64_t    words;               ///< Vocabulary size
+    uint64_t    postings;            ///< Shard: record-word pairs
+    const struct pzpd_disk_word  *vocab;   ///< Shard vocabulary
+    const struct pzpd_disk_mword *mvocab;  ///< Manifest vocabulary
+    const uint32_t *post_index, *post, *fwd_index, *fwd;  ///< Shard CSR parts
+    const char *heap;                ///< Word bytes
+    uint64_t    heap_bytes;          ///< Their size
+};
+
+/** @brief Validate a word index section's head (O(1) plus the sub-index heads).
+ *  @return 1 if valid, 0 otherwise (error set). */
+static int pzpd_wsec_parse(const unsigned char *d, uint64_t bytes, int manifest, struct pzpd_wsec *v)
+{
+    struct pzpd_disk_words_head h;
+    if (bytes < sizeof(h)) { pzpd_set_error(PZPD_E_FORMAT, "word index section too small"); return 0; }
+    memcpy(&h, d, sizeof(h));
+    size_t subSize = manifest ? sizeof(struct pzpd_disk_msubindex) : sizeof(struct pzpd_disk_subindex);
+    if ( (h.subindex_count == 0) || (h.subindex_count > PZPD_MAX_WORD_SOURCES + 1) || (memchr(h.source_column, 0, sizeof(h.source_column)) == NULL) ||
+         (sizeof(h) + (uint64_t) h.subindex_count * subSize > bytes) || !pzpd_in_file(h.names_offset, h.names_bytes, bytes) )
+        { pzpd_set_error(PZPD_E_FORMAT, "word index section header is damaged"); return 0; }
+    if (h.tokenizer != PZPD_TOKENIZER_V1) { pzpd_set_error(PZPD_E_VERSION, "word index tokenizer %u is unknown to this library (%d)", h.tokenizer, PZPD_TOKENIZER_V1); return 0; }
+    memset(v, 0, sizeof(*v));
+    v->d = d; v->bytes = bytes; v->tokenizer = h.tokenizer; v->nsub = h.subindex_count; v->manifest = manifest;
+    memcpy(v->source_column, h.source_column, sizeof(v->source_column));
+    v->names = (const char *) (d + h.names_offset);
+    v->names_bytes = h.names_bytes;
+    return 1;
+}
+
+/** @brief Check that a u32 array of n entries at off lies in the section, 4-aligned. */
+static int pzpd_wsec_u32s(const struct pzpd_wsec *v, uint64_t off, uint64_t n)
+{
+    return ((off & 3) == 0) && (n <= v->bytes / 4) && pzpd_in_file(off, n * 4, v->bytes);
+}
+
+/** @brief View of sub-index k (lazy validation: bounds and CSR ends; spec §4.10).
+ *  @param expectRecords For shard sections: the shard's record count; -1 for manifests.
+ *  @return 1 if valid, 0 otherwise (error set). */
+static int pzpd_wsec_sub(const struct pzpd_wsec *v, unsigned k, int64_t expectRecords, struct pzpd_wsub *s)
+{
+    memset(s, 0, sizeof(*s));
+    if (k >= v->nsub) { pzpd_set_error(PZPD_E_ARG, "sub-index %u out of range", k); return 0; }
+    if (v->manifest)
+    {
+        struct pzpd_disk_msubindex m;
+        memcpy(&m, v->d + sizeof(struct pzpd_disk_words_head) + k * sizeof(m), sizeof(m));
+        if ( ((k == 0) != (m.source_len == 0)) || !pzpd_in_file(m.source_offset, m.source_len, v->names_bytes) || ((m.vocab_offset & 7) != 0) ||
+             (m.words > v->bytes / sizeof(struct pzpd_disk_mword)) || !pzpd_in_file(m.vocab_offset, m.words * sizeof(struct pzpd_disk_mword), v->bytes) ||
+             !pzpd_in_file(m.heap_offset, m.heap_bytes, v->bytes) || (m.words > 0xFFFFFFFFull) )
+            { pzpd_set_error(PZPD_E_FORMAT, "word index: manifest sub-index %u is damaged", k); return 0; }
+        s->source = m.source_len ? v->names + m.source_offset : NULL;
+        s->source_len = m.source_len;
+        s->words  = m.words;
+        s->mvocab = (const struct pzpd_disk_mword *) (v->d + m.vocab_offset);
+        s->heap   = (const char *) (v->d + m.heap_offset);
+        s->heap_bytes = m.heap_bytes;
+        return 1;
+    }
+    struct pzpd_disk_subindex h;
+    memcpy(&h, v->d + sizeof(struct pzpd_disk_words_head) + k * sizeof(h), sizeof(h));
+    if ( ((k == 0) != (h.source_len == 0)) || !pzpd_in_file(h.source_offset, h.source_len, v->names_bytes) ||
+         ((expectRecords >= 0) && (h.records != (uint64_t) expectRecords)) || (h.words > 0xFFFFFFFFull) || (h.postings > 0xFFFFFFFFull) ||
+         ((h.vocab_offset & 3) != 0) || (h.words > v->bytes / sizeof(struct pzpd_disk_word)) ||
+         !pzpd_in_file(h.vocab_offset, h.words * sizeof(struct pzpd_disk_word), v->bytes) ||
+         !pzpd_wsec_u32s(v, h.post_index_offset, h.words + 1) || !pzpd_wsec_u32s(v, h.post_offset, h.postings) ||
+         !pzpd_wsec_u32s(v, h.fwd_index_offset, h.records + 1) || !pzpd_wsec_u32s(v, h.fwd_offset, h.postings) ||
+         !pzpd_in_file(h.heap_offset, h.heap_bytes, v->bytes) )
+        { pzpd_set_error(PZPD_E_FORMAT, "word index: sub-index %u is damaged", k); return 0; }
+    s->source     = h.source_len ? v->names + h.source_offset : NULL;
+    s->source_len = h.source_len;
+    s->records    = h.records;
+    s->words      = h.words;
+    s->postings   = h.postings;
+    s->vocab      = (const struct pzpd_disk_word *) (v->d + h.vocab_offset);
+    s->post_index = (const uint32_t *) (v->d + h.post_index_offset);
+    s->post       = (const uint32_t *) (v->d + h.post_offset);
+    s->fwd_index  = (const uint32_t *) (v->d + h.fwd_index_offset);
+    s->fwd        = (const uint32_t *) (v->d + h.fwd_offset);
+    s->heap       = (const char *) (v->d + h.heap_offset);
+    s->heap_bytes = h.heap_bytes;
+    if ( (s->post_index[0] != 0) || (s->post_index[s->words] != s->postings) || (s->fwd_index[0] != 0) || (s->fwd_index[s->records] != s->postings) )
+        { pzpd_set_error(PZPD_E_FORMAT, "word index: sub-index %u is damaged", k); return 0; }
+    return 1;
+}
+
+/** @brief Sub-index of a section for a source value (NULL = merged). @return Its index, or -1 if the section lacks it. */
+static int pzpd_wsec_find(const struct pzpd_wsec *v, const char *source, size_t len, int64_t expectRecords)
+{
+    if (source == NULL) { return 0; }
+    for (unsigned k = 1; k < v->nsub; k++)
+    {
+        struct pzpd_wsub s;
+        if (!pzpd_wsec_sub(v, k, expectRecords, &s)) { return -2; }
+        if ( (s.source_len == len) && (memcmp(s.source, source, len) == 0) ) { return (int) k; }
+    }
+    return -1;
+}
+
+/** @brief Word k of a sub-index (bounds-checked). @return 1, or 0 if damaged (error set). */
+static int pzpd_wsub_word(const struct pzpd_wsub *s, uint64_t k, const char **w, size_t *len)
+{
+    uint32_t off = s->vocab ? s->vocab[k].heap_offset : s->mvocab[k].heap_offset;
+    uint16_t l   = s->vocab ? s->vocab[k].len         : s->mvocab[k].len;
+    if (!pzpd_in_file(off, l, s->heap_bytes)) { pzpd_set_error(PZPD_E_FORMAT, "word index: word %llu is damaged", (unsigned long long) k); return 0; }
+    *w = s->heap + off;
+    *len = l;
+    return 1;
+}
+
+/** @brief Binary search of a word in a sub-index vocabulary. @return Its id, -1 if absent, -2 if damaged (error set). */
+static int64_t pzpd_wsub_find(const struct pzpd_wsub *s, const char *word, size_t len)
+{
+    uint64_t lo = 0, hi = s->words;
+    while (lo < hi)
+    {
+        uint64_t mid = lo + (hi - lo) / 2;
+        const char *w; size_t l;
+        if (!pzpd_wsub_word(s, mid, &w, &l)) { return -2; }
+        int c = pzpd_word_cmp(w, l, word, len);
+        if (c == 0) { return (int64_t) mid; }
+        if (c < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    return -1;
+}
+
+/** @brief Full check of a shard sub-index (verify): sorted vocabulary, ascending postings and forward lists,
+ *  per-word counts, and forward lists = transpose of the postings. @return 1 if valid, 0 otherwise (error set). */
+static int pzpd_wsub_check_full(const struct pzpd_wsub *s)
+{
+    const char *pw = NULL; size_t pl = 0;
+    for (uint64_t w = 0; w < s->words; w++)
+    {
+        const char *cw; size_t cl;
+        if (!pzpd_wsub_word(s, w, &cw, &cl)) { return 0; }
+        if ( (cl == 0) || ((w > 0) && (pzpd_word_cmp(pw, pl, cw, cl) >= 0)) ) { pzpd_set_error(PZPD_E_FORMAT, "word index: vocabulary not sorted at word %llu", (unsigned long long) w); return 0; }
+        pw = cw; pl = cl;
+        uint32_t a = s->post_index[w], b = s->post_index[w + 1];
+        if ( (a > b) || (b > s->postings) || (b - a != s->vocab[w].records) || (s->vocab[w].count < s->vocab[w].records) )
+            { pzpd_set_error(PZPD_E_FORMAT, "word index: postings of word %llu are damaged", (unsigned long long) w); return 0; }
+        for (uint32_t p = a; p < b; p++)
+        {
+            if ( (s->post[p] >= s->records) || ((p > a) && (s->post[p] <= s->post[p - 1])) ) { pzpd_set_error(PZPD_E_FORMAT, "word index: postings of word %llu are damaged", (unsigned long long) w); return 0; }
+        }
+    }
+    uint32_t *cur = (uint32_t *) calloc(s->records ? s->records : 1, sizeof(uint32_t));
+    if (cur == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    int ok = 1;
+    for (uint64_t r = 0; ok && (r < s->records); r++)
+    {
+        uint32_t a = s->fwd_index[r], b = s->fwd_index[r + 1];
+        if ( (a > b) || (b > s->postings) ) { ok = 0; break; }
+        for (uint32_t p = a; ok && (p < b); p++) { if ( (s->fwd[p] >= s->words) || ((p > a) && (s->fwd[p] <= s->fwd[p - 1])) ) { ok = 0; } }
+    }
+    // Transpose: walking the words in order, each posting must be the next entry of its record's forward list
+    for (uint64_t w = 0; ok && (w < s->words); w++)
+    {
+        for (uint32_t p = s->post_index[w]; ok && (p < s->post_index[w + 1]); p++)
+        {
+            uint32_t r = s->post[p], at = s->fwd_index[r] + cur[r]++;
+            if ( (at >= s->fwd_index[r + 1]) || (s->fwd[at] != w) ) { ok = 0; }
+        }
+    }
+    for (uint64_t r = 0; ok && (r < s->records); r++) { if (s->fwd_index[r] + cur[r] != s->fwd_index[r + 1]) { ok = 0; } }
+    free(cur);
+    if (!ok) { pzpd_set_error(PZPD_E_FORMAT, "word index: forward lists disagree with the postings"); }
+    return ok;
+}
+
+//-----------------------------------------------------------------------------------------------
 // Writer
 //-----------------------------------------------------------------------------------------------
 
@@ -1562,6 +2418,17 @@ struct pzpd_wtable
     uint64_t        g_n;        ///< Global table: rows
 };
 
+/** @brief A word index declared on a writer (pzpd_writer_words()). */
+struct pzpd_wwords
+{
+    char     table[24];    ///< Indexed table
+    char     column[24];   ///< Indexed column
+    char     source[24];   ///< Source column, "" for none
+    unsigned t;            ///< Table id
+    uint32_t text_off;     ///< Offset of the indexed field in a row
+    int64_t  source_off;   ///< Offset of the source field, -1 for none
+};
+
 /** @brief Writer state. Records are appended to the open shard; index sections are kept in
  *  memory until the shard closes. */
 struct pzpd_writer
@@ -1617,6 +2484,8 @@ struct pzpd_writer
     uint32_t last_group;                 ///< Group of the previous record (archive-wide), PZPD_NO_GROUP if none
     uint32_t last_frame;                 ///< Its frame
     int      shard_oversize;             ///< 1 once a group larger than the shard limit started in the open shard
+    unsigned W;                          ///< Word indexes declared
+    struct pzpd_wwords words[PZPD_MAX_WORD_INDEXES]; ///< Their declarations
 };
 
 /** @brief Drop the blobs of the record being assembled. */
@@ -1770,10 +2639,23 @@ static void pzpd_fill_streams(struct pzpd_disk_stream *slots, unsigned S, char n
     for (unsigned s = 0; s < S; s++) { pzpd_put_slot_name(slots[s].name, names[s]); }
 }
 
-/** @brief Seal a superblock: compute sb_checksum over the bytes before it. */
+/** @brief Checksum of a revision-12 header extension (the `len` bytes before ext_checksum): 0 when they are
+ *  all zero, so a header without word indexes is byte-identical to one written before revision 12. */
+static uint64_t pzpd_ext_checksum(const void *ext, size_t len)
+{
+    const unsigned char *p = (const unsigned char *) ext;
+    size_t i = 0;
+    while ( (i < len) && (p[i] == 0) ) { i++; }
+    if (i == len) { return 0; }
+    uint64_t h = XXH64(ext, len, 0);
+    return (h == 0) ? 1 : h;
+}
+
+/** @brief Seal a superblock: sb_checksum over the bytes before it, then the extension's ext_checksum. */
 static void pzpd_seal_superblock(struct pzpd_disk_superblock *sb)
 {
-    sb->sb_checksum = XXH64(sb, offsetof(struct pzpd_disk_superblock, sb_checksum), 0);
+    sb->sb_checksum  = XXH64(sb, offsetof(struct pzpd_disk_superblock, sb_checksum), 0);
+    sb->ext_checksum = pzpd_ext_checksum(sb->words, offsetof(struct pzpd_disk_superblock, ext_checksum) - offsetof(struct pzpd_disk_superblock, words));
 }
 
 /** @brief Write the index sections, the superblocks, fsync and rename the open shard.
@@ -1847,6 +2729,25 @@ static int pzpd_writer_close_shard(pzpd_writer *w)
     }
     pzpd_buf_free(&sec);
     sb.index_checksum = XXH64_digest(idx);
+    // Word indexes: built from the tables' rows of this shard, after the tables, with their own checksum
+    XXH64_reset(idx, 0);
+    struct pzpd_buf wsec = {0};
+    for (unsigned k = 0; ok && (k < w->W); k++)
+    {
+        const struct pzpd_wwords *d = &w->words[k];
+        const struct pzpd_wtable *wt = &w->tables[d->t];
+        struct pzpd_wsrc src = { w->shard_records, (const uint32_t *) wt->index.data, wt->rows.data, wt->nrows, wt->sc.stride,
+                                 (const char *) wt->heap.data, wt->heap.len, d->text_off, d->source_off };
+        uint64_t dataOff = 0;
+        ok = pzpd_words_build(&wsec, &src, d->source[0] ? d->source : NULL) &&
+             pzpd_write_section(w->fd, &off, PZPD_SECT_WORDS, wsec.data, wsec.len, &dataOff, idx);
+        snprintf(sb.words[k].table, sizeof(sb.words[k].table), "%s", d->table);
+        snprintf(sb.words[k].column, sizeof(sb.words[k].column), "%s", d->column);
+        sb.words[k].section_offset = dataOff;
+        sb.words[k].section_bytes  = wsec.len;
+    }
+    pzpd_buf_free(&wsec);
+    sb.words_checksum = (w->W > 0) ? XXH64_digest(idx) : 0;
     XXH64_freeState(idx);
     if (!ok) { return 0; }
 
@@ -2107,8 +3008,45 @@ int pzpd_writer_table(pzpd_writer *w, const char *name, const char *schema, unsi
     if (!pzpd_schema_parse(name, schema, flags, &wt->sc)) { return -1; }
     for (unsigned t = 0; t < w->T; t++) { if (!strcmp(w->tables[t].sc.name, name)) { pzpd_set_error(PZPD_E_ARG, "table \"%s\" declared twice", name); return -1; } }
     for (unsigned st = 0; st < w->S; st++) { if (!strcmp(w->streams[st], name)) { pzpd_set_error(PZPD_E_ARG, "\"%s\" is already a stream name", name); return -1; } }
+    if ( !strcmp(name, PZPD_SYNONYMS_TABLE) && !pzpd_synonyms_check(&wt->sc, NULL, 0, NULL, 0) ) { return -1; }
     pzpd_schema_publish(&wt->sc);
     return (int)(w->T++);
+}
+
+int pzpd_writer_words(pzpd_writer *w, const char *table, const char *column, const char *source_column)
+{
+    pzpd_clear_error();
+    if ( (w == NULL) || (table == NULL) || (column == NULL) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    if ( w->in_record || (w->total_records > 0) || (w->shard_index > 0) ) { pzpd_set_error(PZPD_E_STATE, "word indexes must be declared before the first record"); return 0; }
+    if (w->W >= PZPD_MAX_WORD_INDEXES) { pzpd_set_error(PZPD_E_ARG, "more than %d word indexes", PZPD_MAX_WORD_INDEXES); return 0; }
+    int t = -1;
+    for (unsigned k = 0; k < w->T; k++) { if (!strcmp(w->tables[k].sc.name, table)) { t = (int) k; } }
+    if (t < 0) { pzpd_set_error(PZPD_E_NOTFOUND, "word index: no table %s (declare it first)", table); return 0; }
+    const struct pzpd_tschema *sc = &w->tables[t].sc;
+    if (sc->flags & PZPD_TABLE_GLOBAL) { pzpd_set_error(PZPD_E_ARG, "word index: %s is a global table", table); return 0; }
+    int ct = -1, cs = -1;
+    for (unsigned c = 0; c < sc->ncols; c++)
+    {
+        if (!strcmp(sc->colname[c], column)) { ct = (int) c; }
+        if ( (source_column != NULL) && !strcmp(sc->colname[c], source_column) ) { cs = (int) c; }
+    }
+    if ( (ct < 0) || (sc->type[ct] != PZPD_TYPE_STR) || (sc->count[ct] != 1) ) { pzpd_set_error(PZPD_E_ARG, "word index: %s.%s is not a str column", table, column); return 0; }
+    if ( (source_column != NULL) && ((cs < 0) || (sc->type[cs] != PZPD_TYPE_STR) || (sc->count[cs] != 1) || (cs == ct)) )
+        { pzpd_set_error(PZPD_E_ARG, "word index: source column %s.%s is not another str column", table, source_column); return 0; }
+    for (unsigned k = 0; k < w->W; k++)
+    {
+        if ( !strcmp(w->words[k].table, table) && !strcmp(w->words[k].column, column) ) { pzpd_set_error(PZPD_E_DUPLICATE, "word index %s.%s declared twice", table, column); return 0; }
+    }
+    struct pzpd_wwords *d = &w->words[w->W];
+    memset(d, 0, sizeof(*d));
+    snprintf(d->table, sizeof(d->table), "%s", table);
+    snprintf(d->column, sizeof(d->column), "%s", column);
+    if (source_column != NULL) { snprintf(d->source, sizeof(d->source), "%s", source_column); }
+    d->t          = (unsigned) t;
+    d->text_off   = sc->offset[ct];
+    d->source_off = (cs >= 0) ? (int64_t) sc->offset[cs] : -1;
+    w->W++;
+    return 1;
 }
 
 /** @brief Validate and stage binary rows (str offsets relative to `strings`) into rows / heap.
@@ -2188,7 +3126,9 @@ int pzpd_writer_global_rows(pzpd_writer *w, unsigned table, const void *rows, ui
     if (wt == NULL) { return 0; }
     size_t r0 = wt->g_rows.len, h0 = wt->g_heap.len;
     if (wt->g_n + nrows > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows", wt->sc.name); return 0; }   // the reader's limit
-    if (!pzpd_stage_rows(&wt->sc, rows, nrows, strings, strings_len, &wt->g_rows, &wt->g_heap)) { wt->g_rows.len = r0; wt->g_heap.len = h0; return 0; }
+    if ( !pzpd_stage_rows(&wt->sc, rows, nrows, strings, strings_len, &wt->g_rows, &wt->g_heap) ||
+         ( !strcmp(wt->sc.name, PZPD_SYNONYMS_TABLE) && !pzpd_synonyms_check(&wt->sc, wt->g_rows.data, wt->g_n + nrows, (const char *) wt->g_heap.data, wt->g_heap.len) ) )
+        { wt->g_rows.len = r0; wt->g_heap.len = h0; return 0; }
     wt->g_n += nrows;
     return 1;
 }
@@ -2201,6 +3141,7 @@ int pzpd_writer_global_rows_csv(pzpd_writer *w, unsigned table, const char *csv,
     size_t r0 = wt->g_rows.len, h0 = wt->g_heap.len;
     int64_t n = pzpd_csv_parse(&wt->sc, csv, len, &wt->g_rows, &wt->g_heap);
     if ( (n >= 0) && (wt->g_n + (uint64_t) n > 0xFFFFFFFFull) ) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows", wt->sc.name); n = -1; }   // the reader's limit
+    if ( (n >= 0) && !strcmp(wt->sc.name, PZPD_SYNONYMS_TABLE) && !pzpd_synonyms_check(&wt->sc, wt->g_rows.data, wt->g_n + (uint64_t) n, (const char *) wt->g_heap.data, wt->g_heap.len) ) { n = -1; }
     if (n < 0) { wt->g_rows.len = r0; wt->g_heap.len = h0; return 0; }
     wt->g_n += (uint64_t) n;
     return 1;
@@ -2578,12 +3519,20 @@ struct pzpd_mtable
     uint64_t    heap_len;           ///< Strings size
 };
 
+struct pzpd_archive;
+static struct pzpd_archive *arch_open(const char *path, unsigned int flags);
+static void arch_close(struct pzpd_archive *a);
+static int pzpd_mwords_sections(struct pzpd_archive *const *shards, unsigned n, struct pzpd_buf secs[PZPD_MAX_WORD_INDEXES],
+                                struct pzpd_disk_words dir[PZPD_MAX_WORD_INDEXES], unsigned *W);
+
 /** @brief Write a manifest atomically (temp file, fsync, rename, fsync of the directory): header,
- *  shard table, shard names, global hash (sorted here) and table sections. Used by the writer and by
+ *  shard table, shard names, global hash (sorted here), table sections and, when `wshards` (the shards,
+ *  opened standalone, in order) is given, the word indexes' merged vocabularies. Used by the writer and by
  *  pzpd_manifest_rebuild(), so a rebuilt manifest is byte-identical to the original.
  *  @return 1 on success, 0 on failure (error set). */
 static int pzpd_write_manifest(const char *path, const uint8_t *uuid, uint64_t total, unsigned S, char streams[][24], unsigned shard_count,
-                               const struct pzpd_buf *shardTab, const struct pzpd_buf *names, struct pzpd_buf *ghash, unsigned T, const struct pzpd_mtable *tabs)
+                               const struct pzpd_buf *shardTab, const struct pzpd_buf *names, struct pzpd_buf *ghash, unsigned T, const struct pzpd_mtable *tabs,
+                               struct pzpd_archive *const *wshards)
 {
     qsort(ghash->data, ghash->len / sizeof(struct pzpd_disk_global_hash), sizeof(struct pzpd_disk_global_hash), pzpd_cmp_ghash);
     int ok = 1, fd = -1;
@@ -2628,11 +3577,30 @@ static int pzpd_write_manifest(const char *path, const uint8_t *uuid, uint64_t t
             }
             pzpd_buf_free(&sec);
             mh.index_checksum = XXH64_digest(idx);
+            // Word indexes: the merged vocabularies, with their own checksum
+            if (ok && (wshards != NULL))
+            {
+                struct pzpd_buf ws[PZPD_MAX_WORD_INDEXES];
+                memset(ws, 0, sizeof(ws));
+                unsigned W = 0;
+                ok = pzpd_mwords_sections(wshards, shard_count, ws, mh.words, &W);
+                XXH64_reset(idx, 0);
+                for (unsigned j = 0; ok && (j < W); j++)
+                {
+                    uint64_t dataOff = 0;
+                    ok = pzpd_write_section(fd, &off, PZPD_SECT_MWORDS, ws[j].data, ws[j].len, &dataOff, idx);
+                    mh.words[j].section_offset = dataOff;
+                    mh.words[j].section_bytes  = ws[j].len;
+                }
+                mh.words_checksum = (W > 0) ? XXH64_digest(idx) : 0;
+                for (unsigned j = 0; j < PZPD_MAX_WORD_INDEXES; j++) { pzpd_buf_free(&ws[j]); }
+            }
             XXH64_freeState(idx);
             mh.names_bytes = names->len;
             mh.hash_count  = ghash->len / sizeof(struct pzpd_disk_global_hash);
             mh.file_bytes  = off;
             mh.sb_checksum = XXH64(&mh, offsetof(struct pzpd_disk_manifest, sb_checksum), 0);
+            mh.ext_checksum = pzpd_ext_checksum(mh.words, offsetof(struct pzpd_disk_manifest, ext_checksum) - offsetof(struct pzpd_disk_manifest, words));
             unsigned char block[PZPD_BLOCK];
             memset(block, 0, sizeof(block));
             memcpy(block, &mh, sizeof(mh));
@@ -2688,7 +3656,17 @@ int pzpd_writer_finish(pzpd_writer *w)
         tabs[t].heap     = global ? wt->g_heap.data : NULL;
         tabs[t].heap_len = global ? wt->g_heap.len : 0;
     }
-    ok = ok && pzpd_write_manifest(w->manifest_path, w->uuid, w->total_records, w->S, w->streams, w->shard_count, &shardTab, &names, &w->ghash, w->T, tabs);
+    // Word indexes: the manifest merges the finished shards' vocabularies
+    struct pzpd_archive **wsh = NULL;
+    if (ok && (w->W > 0))
+    {
+        wsh = (struct pzpd_archive **) calloc(w->shard_count ? w->shard_count : 1, sizeof(*wsh));
+        if (wsh == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        for (unsigned i = 0; ok && (i < w->shard_count); i++) { wsh[i] = arch_open(w->shards[i].path, 0); ok = (wsh[i] != NULL); }
+    }
+    ok = ok && pzpd_write_manifest(w->manifest_path, w->uuid, w->total_records, w->S, w->streams, w->shard_count, &shardTab, &names, &w->ghash, w->T, tabs, wsh);
+    for (unsigned i = 0; (wsh != NULL) && (i < w->shard_count); i++) { if (wsh[i] != NULL) { arch_close(wsh[i]); } }
+    free(wsh);
     pzpd_buf_free(&shardTab);
     pzpd_buf_free(&names);
 
@@ -2732,6 +3710,7 @@ struct pzpd_rshard
     int      storage;          ///< enum pzpd_storage of the shard's file system
     int      recovery;         ///< 0 primary superblock, 1 backup superblock, 2 superblock rebuilt from the index sections
     const struct pzpd_disk_group  *groups; ///< Group table (in map), NULL when the shard has no groups
+    int      words_bad;        ///< 1 if the word index directory (revision-12 extension) failed its checksum
 };
 
 /** @brief One open archive (manifest + shards) or a single shard opened standalone: the unit a
@@ -2755,7 +3734,13 @@ struct pzpd_archive
     unsigned T;                         ///< Tables
     struct pzpd_tschema *tables;        ///< Table schemas (PZPD_MAX_TABLES entries, fixed address)
     struct pzpd_tview gview[PZPD_MAX_TABLES]; ///< Global tables' rows (manifest copy, or the standalone shard's)
+    struct pzpd_disk_words mwords[PZPD_MAX_WORD_INDEXES]; ///< Manifest word directory (merged vocabularies), zero when none
+    int      mwords_bad;                ///< 1 if the manifest's word directory failed its checksum
 };
+
+/** @brief Bytes of a header's revision-12 extension covered by ext_checksum. */
+#define PZPD_SB_EXT_BYTES (offsetof(struct pzpd_disk_superblock, ext_checksum) - offsetof(struct pzpd_disk_superblock, words))
+#define PZPD_MH_EXT_BYTES (offsetof(struct pzpd_disk_manifest, ext_checksum) - offsetof(struct pzpd_disk_manifest, words))
 
 static int pzpd_check_section(const unsigned char *map, uint64_t file, uint64_t data_off, uint32_t kind, uint64_t bytes);
 
@@ -3125,6 +4110,8 @@ static int pzpd_shard_load(struct pzpd_archive *a, struct pzpd_rshard *s)
         if ( (sb.first_ordinal != s->first_ordinal) || (sb.record_count != s->record_count) || (sb.stream_count != a->S) )
             { pzpd_set_error(PZPD_E_STALE_MANIFEST, "%s disagrees with the manifest", s->path); return 0; }
     }
+    // Word index directory: damage there only makes the word indexes unusable (they are re-derivable)
+    s->words_bad = (sb.ext_checksum != pzpd_ext_checksum(sb.words, PZPD_SB_EXT_BYTES));
     s->sb   = sb;
     s->rtab = (const struct pzpd_disk_record *) (s->map + sb.rtab_offset);
     s->btab = (const struct pzpd_disk_blob *)   (s->map + sb.btab_offset);
@@ -3296,6 +4283,8 @@ static struct pzpd_archive *arch_open(const char *path, unsigned int flags)
     a->S = mh.stream_count;
     for (unsigned i = 0; i < a->S; i++) { pzpd_get_slot_name(a->streams[i], mh.streams[i].name); }
     memcpy(a->uuid, mh.archive_uuid, 16);
+    a->mwords_bad = (mh.ext_checksum != pzpd_ext_checksum(mh.words, PZPD_MH_EXT_BYTES));
+    if (!a->mwords_bad) { memcpy(a->mwords, mh.words, sizeof(a->mwords)); }
     a->total       = mh.total_records;
     a->shard_count = mh.shard_count;
     a->mshards     = (const struct pzpd_disk_manifest_shard *) (a->mmap_manifest + mh.shards_offset);
@@ -3355,6 +4344,203 @@ static void arch_close(struct pzpd_archive *a)
     pthread_mutex_destroy(&a->lock);
     free(a->tables);
     free(a);
+}
+
+/** @brief A shard's word index section for directory slot j, parsed. @return 1 on success, 0 on failure (error set). */
+static int pzpd_shard_wsec(const struct pzpd_rshard *s, unsigned j, struct pzpd_wsec *v)
+{
+    if (s->words_bad) { pzpd_set_error(PZPD_E_CHECKSUM, "%s: the word index directory is damaged (rebuild it with reindex)", s->path); return 0; }
+    const struct pzpd_disk_words *d = &s->sb.words[j];
+    if ( !pzpd_check_section(s->map, s->map_len, d->section_offset, PZPD_SECT_WORDS, d->section_bytes) ||
+         !pzpd_wsec_parse(s->map + d->section_offset, d->section_bytes, 0, v) )
+    {
+        if (pzpd_errorText[0] == 0) { pzpd_set_error(PZPD_E_FORMAT, "section is damaged"); }
+        pzpd_error_wrap(PZPD_E_FORMAT, "%s: word index %s.%s", s->path, d->table, d->column);
+        return 0;
+    }
+    return 1;
+}
+
+/** @brief Word directory slot of (table, column) in a directory, or -1. */
+static int pzpd_words_slot(const struct pzpd_disk_words *dir, const char *table, const char *column)
+{
+    for (unsigned j = 0; (j < PZPD_MAX_WORD_INDEXES) && (dir[j].table[0] != 0); j++)
+    {
+        if ( !strncmp(dir[j].table, table, sizeof(dir[j].table)) && !strncmp(dir[j].column, column, sizeof(dir[j].column)) ) { return (int) j; }
+    }
+    return -1;
+}
+
+/** @brief Word directory entries in use. */
+static unsigned pzpd_words_used(const struct pzpd_disk_words *dir)
+{
+    unsigned n = 0;
+    while ( (n < PZPD_MAX_WORD_INDEXES) && (dir[n].table[0] != 0) ) { n++; }
+    return n;
+}
+
+/** @brief One (word, stats) entry gathered from several vocabularies before they are merged. */
+struct pzpd_went
+{
+    const char *w;       ///< Word bytes
+    uint32_t    len;     ///< Length
+    uint64_t    records; ///< Records containing it
+    uint64_t    count;   ///< Occurrences
+};
+
+static int pzpd_cmp_went(const void *a, const void *b)
+{
+    const struct pzpd_went *x = (const struct pzpd_went *) a, *y = (const struct pzpd_went *) b;
+    return pzpd_word_cmp(x->w, x->len, y->w, y->len);
+}
+
+/** @brief A byte string pointer + length (source values). */
+struct pzpd_bstr { const char *s; uint32_t len; };
+
+static int pzpd_cmp_bstr(const void *a, const void *b)
+{
+    const struct pzpd_bstr *x = (const struct pzpd_bstr *) a, *y = (const struct pzpd_bstr *) b;
+    return pzpd_word_cmp(x->s, x->len, y->s, y->len);
+}
+
+/** @brief Sort and fold entries with equal words (summing their stats). @return The number left. */
+static size_t pzpd_went_fold(struct pzpd_went *e, size_t n)
+{
+    if (n == 0) { return 0; }
+    qsort(e, n, sizeof(*e), pzpd_cmp_went);
+    size_t o = 0;
+    for (size_t i = 1; i < n; i++)
+    {
+        if (pzpd_word_cmp(e[o].w, e[o].len, e[i].w, e[i].len) == 0) { e[o].records += e[i].records; e[o].count += e[i].count; }
+        else { e[++o] = e[i]; }
+    }
+    return o + 1;
+}
+
+/** @brief Build the manifest's word sections (kind 15) from the shards of an archive, each opened standalone
+ *  (spec §4.10): per word index and per sub-index (merged, then the union of the shards' source values sorted),
+ *  the vocabulary with totals over every shard. Every shard must declare the same word indexes.
+ *  @return 1 on success (W sections in secs, directory in dir), 0 on failure (error set). */
+static int pzpd_mwords_sections(struct pzpd_archive *const *shards, unsigned n, struct pzpd_buf secs[PZPD_MAX_WORD_INDEXES],
+                                struct pzpd_disk_words dir[PZPD_MAX_WORD_INDEXES], unsigned *W)
+{
+    memset(dir, 0, sizeof(struct pzpd_disk_words) * PZPD_MAX_WORD_INDEXES);
+    *W = 0;
+    if (n == 0) { return 1; }
+    const struct pzpd_rshard *s0 = &shards[0]->shards[0];
+    unsigned nw = pzpd_words_used(s0->sb.words);
+    struct pzpd_wsec *views = (struct pzpd_wsec *) calloc(n ? n : 1, sizeof(struct pzpd_wsec));
+    if (views == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    int ok = 1;
+    for (unsigned k = 1; ok && (k < n); k++)
+    {
+        if (pzpd_words_used(shards[k]->shards[0].sb.words) != nw) { pzpd_set_error(PZPD_E_FORMAT, "%s has other word indexes than shard 0", shards[k]->shards[0].path); ok = 0; }
+    }
+    for (unsigned j = 0; ok && (j < nw); j++)
+    {
+        // Every shard: the same index, parsed
+        for (unsigned k = 0; ok && (k < n); k++)
+        {
+            const struct pzpd_rshard *s = &shards[k]->shards[0];
+            if ( (pzpd_words_used(s->sb.words) != nw) || (pzpd_words_slot(s->sb.words, s0->sb.words[j].table, s0->sb.words[j].column) != (int) j) )
+                { pzpd_set_error(PZPD_E_FORMAT, "%s has other word indexes than shard 0", s->path); ok = 0; break; }
+            ok = pzpd_shard_wsec(s, j, &views[k]);
+            if (ok && strncmp(views[k].source_column, views[0].source_column, sizeof(views[0].source_column)))
+                { pzpd_set_error(PZPD_E_FORMAT, "%s: word index %s.%s has another source column than shard 0", s->path, s0->sb.words[j].table, s0->sb.words[j].column); ok = 0; }
+        }
+        // Source values over all shards
+        struct pzpd_bstr *src = NULL;
+        size_t ns = 0, cap = 0;
+        for (unsigned k = 0; ok && (k < n); k++)
+        {
+            for (unsigned q = 1; ok && (q < views[k].nsub); q++)
+            {
+                struct pzpd_wsub sub;
+                ok = pzpd_wsec_sub(&views[k], q, (int64_t) shards[k]->shards[0].sb.record_count, &sub);
+                if (!ok) { break; }
+                if (ns == cap) { cap = cap ? cap * 2 : 16; struct pzpd_bstr *nsrc = (struct pzpd_bstr *) realloc(src, cap * sizeof(*src)); if (nsrc == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; break; } src = nsrc; }
+                src[ns].s = sub.source; src[ns].len = sub.source_len; ns++;
+            }
+        }
+        if (ok && (ns > 0))
+        {
+            qsort(src, ns, sizeof(*src), pzpd_cmp_bstr);
+            size_t o = 0;
+            for (size_t i = 1; i < ns; i++) { if (pzpd_cmp_bstr(&src[o], &src[i]) != 0) { src[++o] = src[i]; } }
+            ns = o + 1;
+        }
+        if (ok && (ns > PZPD_MAX_WORD_SOURCES)) { pzpd_set_error(PZPD_E_FORMAT, "word index: more than %d source values over the shards", PZPD_MAX_WORD_SOURCES); ok = 0; }
+
+        // Each sub-index: gather every shard's vocabulary, fold equal words
+        struct pzpd_buf names = {0}, heads = {0}, parts = {0};
+        struct pzpd_buf ents = {0};
+        for (size_t q = 0; ok && (q <= ns); q++)
+        {
+            ents.len = 0;
+            for (unsigned k = 0; ok && (k < n); k++)
+            {
+                int si = pzpd_wsec_find(&views[k], (q == 0) ? NULL : src[q - 1].s, (q == 0) ? 0 : src[q - 1].len, (int64_t) shards[k]->shards[0].sb.record_count);
+                if (si == -2) { ok = 0; break; }
+                if (si < 0) { continue; }                          // this shard has no rows of that source
+                struct pzpd_wsub sub;
+                ok = pzpd_wsec_sub(&views[k], (unsigned) si, (int64_t) shards[k]->shards[0].sb.record_count, &sub);
+                for (uint64_t w = 0; ok && (w < sub.words); w++)
+                {
+                    struct pzpd_went e;
+                    size_t l = 0;
+                    ok = pzpd_wsub_word(&sub, w, &e.w, &l);
+                    e.len = (uint32_t) l; e.records = sub.vocab[w].records; e.count = sub.vocab[w].count;
+                    ok = ok && pzpd_buf_append(&ents, &e, sizeof(e));
+                }
+            }
+            if (!ok) { break; }
+            size_t ne = pzpd_went_fold((struct pzpd_went *) ents.data, ents.len / sizeof(struct pzpd_went));
+            const struct pzpd_went *e = (const struct pzpd_went *) ents.data;
+            struct pzpd_disk_msubindex mh;
+            memset(&mh, 0, sizeof(mh));
+            if (q > 0) { mh.source_offset = (uint32_t) names.len; mh.source_len = src[q - 1].len; ok = pzpd_buf_append(&names, src[q - 1].s, src[q - 1].len); }
+            mh.words = ne;
+            // vocabulary then heap, relative to `parts` for now
+            struct pzpd_buf heap = {0};
+            mh.vocab_offset = parts.len;
+            for (size_t i = 0; ok && (i < ne); i++)
+            {
+                struct pzpd_disk_mword mw = { (uint32_t) heap.len, (uint16_t) e[i].len, 0, e[i].records, e[i].count };
+                if (heap.len + e[i].len > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "word index: more than 4 GiB of words"); ok = 0; break; }
+                ok = pzpd_buf_append(&parts, &mw, sizeof(mw)) && pzpd_buf_append(&heap, e[i].w, e[i].len);
+            }
+            ok = ok && pzpd_buf_pad8(&parts);
+            mh.heap_offset = parts.len;
+            mh.heap_bytes  = heap.len;
+            ok = ok && pzpd_buf_append(&parts, heap.data, heap.len) && pzpd_buf_pad8(&parts) && pzpd_buf_append(&heads, &mh, sizeof(mh));
+            pzpd_buf_free(&heap);
+        }
+        // Section: head, sub-index heads, names, parts (offsets shifted to the section start)
+        if (ok)
+        {
+            struct pzpd_disk_words_head h;
+            memset(&h, 0, sizeof(h));
+            h.tokenizer      = PZPD_TOKENIZER_V1;
+            h.subindex_count = (uint32_t)(ns + 1);
+            memcpy(h.source_column, views[0].source_column, sizeof(h.source_column));
+            h.names_offset = sizeof(h) + heads.len;
+            h.names_bytes  = names.len;
+            uint64_t base = pzpd_align_up(h.names_offset + names.len, 8);
+            struct pzpd_disk_msubindex *mh = (struct pzpd_disk_msubindex *) heads.data;
+            for (size_t q = 0; q <= ns; q++) { mh[q].vocab_offset += base; mh[q].heap_offset += base; }
+            secs[j].len = 0;
+            ok = pzpd_buf_append(&secs[j], &h, sizeof(h)) && pzpd_buf_append(&secs[j], heads.data, heads.len) &&
+                 pzpd_buf_append(&secs[j], names.data, names.len) && pzpd_buf_pad8(&secs[j]) && pzpd_buf_append(&secs[j], parts.data, parts.len);
+            memcpy(dir[j].table, s0->sb.words[j].table, sizeof(dir[j].table));
+            memcpy(dir[j].column, s0->sb.words[j].column, sizeof(dir[j].column));
+        }
+        if (!ok && (pzpd_errorCode == PZPD_OK)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+        pzpd_buf_free(&names); pzpd_buf_free(&heads); pzpd_buf_free(&parts); pzpd_buf_free(&ents);
+        free(src);
+    }
+    free(views);
+    if (ok) { *W = nw; }
+    return ok;
 }
 
 
@@ -3782,13 +4968,38 @@ static int arch_verify_shard(struct pzpd_archive *a, unsigned shard)
         XXH64_update(idx, s->map + offs[i], (size_t) sh.bytes);
     }
     uint64_t digest = XXH64_digest(idx);
-    XXH64_freeState(idx);
     if (!ok || (digest != s->sb.index_checksum))
     {
+        XXH64_freeState(idx);
         pzpd_set_error(PZPD_E_CHECKSUM, "%s: index checksum mismatch", s->path);
         return 0;
     }
-    return 1;
+    // Word indexes: directory, section checksums, words_checksum, then the full structure of every sub-index
+    if (s->words_bad) { XXH64_freeState(idx); pzpd_set_error(PZPD_E_CHECKSUM, "%s: word index directory checksum mismatch", s->path); return 0; }
+    unsigned nw = pzpd_words_used(s->sb.words);
+    XXH64_reset(idx, 0);
+    for (unsigned j = 0; ok && (j < nw); j++)
+    {
+        const struct pzpd_disk_words *d = &s->sb.words[j];
+        struct pzpd_disk_section sh;
+        struct pzpd_wsec v;
+        ok = pzpd_shard_wsec(s, j, &v);
+        if (ok) { memcpy(&sh, s->map + d->section_offset - sizeof(sh), sizeof(sh)); }
+        if (ok && (XXH64(s->map + d->section_offset, (size_t) d->section_bytes, 0) != sh.checksum))
+            { pzpd_set_error(PZPD_E_CHECKSUM, "%s: word index %s.%s: section checksum mismatch", s->path, d->table, d->column); ok = 0; }
+        if (ok) { XXH64_update(idx, s->map + d->section_offset, (size_t) d->section_bytes); }
+        for (unsigned k = 0; ok && (k < v.nsub); k++)
+        {
+            struct pzpd_wsub sub;
+            ok = pzpd_wsec_sub(&v, k, (int64_t) s->sb.record_count, &sub) && pzpd_wsub_check_full(&sub);
+            if (!ok) { pzpd_error_wrap(PZPD_E_FORMAT, "%s: word index %s.%s", s->path, d->table, d->column); }
+        }
+    }
+    digest = XXH64_digest(idx);
+    XXH64_freeState(idx);
+    if (ok && (((nw > 0) && (digest != s->sb.words_checksum)) || ((nw == 0) && (s->sb.words_checksum != 0))))
+        { pzpd_set_error(PZPD_E_CHECKSUM, "%s: word index checksum mismatch", s->path); ok = 0; }
+    return ok;
 }
 
 #if PZPDIR_WITH_PZP
@@ -4715,6 +5926,608 @@ ssize_t pzpd_global_csv(pzpd *a, unsigned member, unsigned table, char *out, siz
     if (mt < 0) { return 0; }
     const struct pzpd_tview *v = &ar->gview[mt];
     return pzpd_rows_csv(&ar->tables[mt], v->rowdata, (uint32_t) v->rows, v, out, cap);
+}
+
+//-----------------------------------------------------------------------------------------------
+// Word index handle (spec §3.7, §4.10)
+//-----------------------------------------------------------------------------------------------
+
+/** @brief Word index state of one shard inside a handle, loaded on first use (under pzpd_words::lock). */
+struct pzpd_wstate
+{
+    int       state;        ///< 0 not loaded, 1 loaded, -1 failed (read with acquire / written with release)
+    int       has;          ///< 1 if the shard has the handle's sub-index
+    struct pzpd_wsub sub;   ///< That sub-index
+    uint32_t *map;          ///< Shard word id -> handle word id
+    uint64_t  first;        ///< Handle ordinal of the shard's first record
+    char      error[512];   ///< Why loading failed
+    int       error_code;   ///< Its enum pzpd_error
+};
+
+/** @brief One view of one sub-index of a word index over a pzpd handle (public: pzpd_words). */
+struct pzpd_words
+{
+    pzpd     *a;                ///< The handle
+    unsigned  flags;            ///< PZPD_WORDS_CANONICAL
+    char      table[24];        ///< Indexed table
+    char      column[24];       ///< Indexed column
+    char     *source;           ///< Source value, NULL for the merged sub-index
+    size_t    source_len;       ///< Its length
+    uint64_t  covered;          ///< Records of the members that have this word index
+    uint32_t  n;                ///< Vocabulary size
+    char     *heap;             ///< Words, concatenated in id order
+    uint64_t *offsets;          ///< n + 1 offsets into heap
+    uint64_t *records;          ///< Records per word
+    uint64_t *count;            ///< Occurrences per word
+    uint32_t  ns;               ///< Surface words (the words the shards store)
+    char     *sheap;            ///< Surface words, sorted
+    uint64_t *soff;             ///< ns + 1 offsets into sheap
+    uint32_t *sstart;           ///< n + 1: the surface words of word h are sidx[sstart[h] .. sstart[h+1])
+    uint32_t *sidx;             ///< Surface word ids
+    struct pzpd_wstate *st;     ///< One per shard of the handle (pzpd::shard_total)
+    pthread_mutex_t lock;       ///< Taken once per shard, for its lazy load
+};
+
+/** @brief Surface word id of a word (binary search), or -1. */
+static int64_t pzpd_words_sfind(const pzpd_words *w, const char *word, size_t len)
+{
+    uint64_t lo = 0, hi = w->ns;
+    while (lo < hi)
+    {
+        uint64_t mid = lo + (hi - lo) / 2;
+        int c = pzpd_word_cmp(w->sheap + w->soff[mid], (size_t)(w->soff[mid + 1] - w->soff[mid]), word, len);
+        if (c == 0) { return (int64_t) mid; }
+        if (c < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    return -1;
+}
+
+int64_t pzpd_words_find(const pzpd_words *w, const char *word, size_t len)
+{
+    if ( (w == NULL) || ((word == NULL) && (len > 0)) ) { return -1; }
+    uint64_t lo = 0, hi = w->n;
+    while (lo < hi)
+    {
+        uint64_t mid = lo + (hi - lo) / 2;
+        int c = pzpd_word_cmp(w->heap + w->offsets[mid], (size_t)(w->offsets[mid + 1] - w->offsets[mid]), word, len);
+        if (c == 0) { return (int64_t) mid; }
+        if (c < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    return -1;
+}
+
+/** @brief The vocabulary a member contributes: its manifest's merged sub-index, or a standalone shard's own.
+ *  @param has_index Receives 1 if the member has the word index at all (whatever the source).
+ *  @return 1 with *sub filled, 0 if the member has no such (sub-)index, -1 on error (error set). */
+static int pzpd_words_member_vocab(pzpd *a, unsigned mi, const char *table, const char *column, const char *source, size_t source_len,
+                                   struct pzpd_wsec *v, struct pzpd_wsub *sub, int *has_index)
+{
+    *has_index = 0;
+    struct pzpd_member *mb = &a->m[mi];
+    if (mb->arch == NULL) { return 0; }                    // a missing member has no words
+    struct pzpd_archive *ar = mb->arch;
+    int64_t expect = -1;
+    if (!ar->standalone)
+    {
+        if (ar->mwords_bad) { pzpd_set_error(PZPD_E_CHECKSUM, "member \"%s\": the manifest's word index directory is damaged (rebuild-manifest)", mb->alias); return -1; }
+        int j = pzpd_words_slot(ar->mwords, table, column);
+        if (j < 0) { return 0; }
+        const struct pzpd_disk_words *d = &ar->mwords[j];
+        if ( !pzpd_check_section(ar->mmap_manifest, ar->manifest_len, d->section_offset, PZPD_SECT_MWORDS, d->section_bytes) ||
+             !pzpd_wsec_parse(ar->mmap_manifest + d->section_offset, d->section_bytes, 1, v) )
+        {
+            if (pzpd_errorText[0] == 0) { pzpd_set_error(PZPD_E_FORMAT, "section is damaged"); }
+            pzpd_error_wrap(PZPD_E_FORMAT, "member \"%s\": manifest word index %s.%s", mb->alias, table, column);
+            return -1;
+        }
+    }
+    else
+    {
+        struct pzpd_rshard *s = pzpd_shard(ar, 0);
+        if (s == NULL) { return -1; }
+        int j = pzpd_words_slot(s->sb.words, table, column);
+        if (j < 0) { return 0; }
+        if (!pzpd_shard_wsec(s, (unsigned) j, v)) { return -1; }
+        expect = (int64_t) s->sb.record_count;
+    }
+    *has_index = 1;
+    int k = pzpd_wsec_find(v, source, source_len, expect);
+    if (k == -2) { return -1; }
+    if (k < 0) { return 0; }
+    return pzpd_wsec_sub(v, (unsigned) k, expect, sub) ? 1 : -1;
+}
+
+/** @brief Load the word index state of handle shard g (once). @return The state, or NULL on error (error set). */
+static struct pzpd_wstate *pzpd_words_state(pzpd_words *w, unsigned g)
+{
+    struct pzpd_wstate *st = &w->st[g];
+    int state = __atomic_load_n(&st->state, __ATOMIC_ACQUIRE);
+    if (state == 0)
+    {
+        pthread_mutex_lock(&w->lock);
+        if (st->state == 0)
+        {
+            int ok = 1;
+            pzpd *a = w->a;
+            unsigned mi = 0;
+            while ( (mi + 1 < a->member_count) && (g >= a->m[mi + 1].shard_base) ) { mi++; }
+            struct pzpd_member *mb = &a->m[mi];
+            struct pzpd_rshard *s = (mb->arch != NULL) ? pzpd_shard(mb->arch, g - mb->shard_base) : NULL;
+            if (s == NULL) { ok = 0; if (pzpd_errorCode == PZPD_OK) { pzpd_set_error(PZPD_E_MEMBER_MISSING, "member \"%s\" is unavailable", mb->alias); } }
+            int j = ok ? pzpd_words_slot(s->sb.words, w->table, w->column) : -1;
+            if (ok && (j >= 0))
+            {
+                struct pzpd_wsec v;
+                int k = -1;
+                ok = pzpd_shard_wsec(s, (unsigned) j, &v);
+                if (ok) { k = pzpd_wsec_find(&v, w->source, w->source_len, (int64_t) s->sb.record_count); ok = (k != -2); }
+                if (ok && (k >= 0)) { ok = pzpd_wsec_sub(&v, (unsigned) k, (int64_t) s->sb.record_count, &st->sub); st->has = ok; }
+            }
+            if (ok) { st->first = mb->first + s->first_ordinal; }
+            // Shard word id -> handle word id (surface word, then its canonical form)
+            if (ok && st->has)
+            {
+                st->map = (uint32_t *) malloc(sizeof(uint32_t) * (st->sub.words ? st->sub.words : 1));
+                if (st->map == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+                for (uint64_t k = 0; ok && (k < st->sub.words); k++)
+                {
+                    const char *word; size_t len;
+                    ok = pzpd_wsub_word(&st->sub, k, &word, &len);
+                    int64_t sid = ok ? pzpd_words_sfind(w, word, len) : -1;
+                    uint32_t h = 0xFFFFFFFFu;
+                    // Surface view: handle id = surface id; canonical view: sidx[ns + sid] (see pzpd_words_open())
+                    if (sid >= 0) { h = (w->flags & PZPD_WORDS_CANONICAL) ? w->sidx[w->ns + sid] : (uint32_t) sid; }
+                    if ( ok && (h == 0xFFFFFFFFu) ) { pzpd_set_error(PZPD_E_STALE_MANIFEST, "%s: word \"%.*s\" is missing from the manifest's vocabulary (rebuild-manifest)", s->path, (int)(len > 100 ? 100 : len), word); ok = 0; }
+                    if (ok) { st->map[k] = h; }
+                }
+            }
+            if (!ok)
+            {
+                snprintf(st->error, sizeof(st->error), "%s", pzpd_errorText);
+                st->error_code = pzpd_errorCode;
+                free(st->map);
+                st->map = NULL;
+                st->has = 0;
+            }
+            __atomic_store_n(&st->state, ok ? 1 : -1, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&w->lock);
+        state = __atomic_load_n(&st->state, __ATOMIC_ACQUIRE);
+    }
+    if (state < 0) { pzpd_set_error(st->error_code ? st->error_code : PZPD_E_FORMAT, "%s", st->error); return NULL; }
+    return st;
+}
+
+/** @brief Append the handle ordinals of the records containing a surface word (every shard, in order).
+ *  @return 1 on success, 0 on failure (error set). */
+static int pzpd_words_surface_records(pzpd_words *w, const char *word, size_t len, struct pzpd_buf *out)
+{
+    for (unsigned g = 0; g < w->a->shard_total; g++)
+    {
+        struct pzpd_member *mb = NULL;
+        for (unsigned mi = 0; mi < w->a->member_count; mi++) { if ( (g >= w->a->m[mi].shard_base) && (g < w->a->m[mi].shard_base + w->a->m[mi].shards) ) { mb = &w->a->m[mi]; } }
+        if (mb == NULL) { continue; }
+        struct pzpd_wstate *st = pzpd_words_state(w, g);
+        if (st == NULL) { return 0; }
+        if (!st->has) { continue; }
+        int64_t k = pzpd_wsub_find(&st->sub, word, len);
+        if (k == -2) { return 0; }
+        if (k < 0) { continue; }
+        uint32_t a = st->sub.post_index[k], b = st->sub.post_index[k + 1];
+        if ( (a > b) || (b > st->sub.postings) ) { pzpd_set_error(PZPD_E_FORMAT, "word index: postings are damaged"); return 0; }
+        for (uint32_t p = a; p < b; p++)
+        {
+            if (st->sub.post[p] >= st->sub.records) { pzpd_set_error(PZPD_E_FORMAT, "word index: a posting points past the shard"); return 0; }
+            uint64_t o = st->first + st->sub.post[p];
+            if (!pzpd_buf_append(out, &o, sizeof(o))) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+        }
+    }
+    return 1;
+}
+
+static int pzpd_cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *) a, y = *(const uint64_t *) b;
+    return (x < y) ? -1 : (x > y);
+}
+
+/** @brief Sort and deduplicate u64 values. @return The number left. */
+static size_t pzpd_u64_unique(uint64_t *v, size_t n)
+{
+    if (n < 2) { return n; }
+    qsort(v, n, sizeof(uint64_t), pzpd_cmp_u64);
+    size_t o = 0;
+    for (size_t i = 1; i < n; i++) { if (v[i] != v[o]) { v[++o] = v[i]; } }
+    return o + 1;
+}
+
+/** @brief Records of handle word h (ascending, unique) into out (u64). @return 1, or 0 on error (error set). */
+static int pzpd_words_records_buf(pzpd_words *w, uint32_t h, struct pzpd_buf *out)
+{
+    out->len = 0;
+    for (uint32_t i = w->sstart[h]; i < w->sstart[h + 1]; i++)
+    {
+        uint32_t s = w->sidx[i];
+        if (!pzpd_words_surface_records(w, w->sheap + w->soff[s], (size_t)(w->soff[s + 1] - w->soff[s]), out)) { return 0; }
+    }
+    if (w->sstart[h + 1] - w->sstart[h] > 1) { out->len = pzpd_u64_unique((uint64_t *) out->data, out->len / 8) * 8; }
+    return 1;
+}
+
+void pzpd_words_close(pzpd_words *w)
+{
+    if (w == NULL) { return; }
+    for (unsigned g = 0; (w->st != NULL) && (g < w->a->shard_total); g++) { free(w->st[g].map); }
+    free(w->st);
+    free(w->source);
+    free(w->heap); free(w->offsets); free(w->records); free(w->count);
+    free(w->sheap); free(w->soff); free(w->sstart); free(w->sidx);
+    pthread_mutex_destroy(&w->lock);
+    free(w);
+}
+
+/** @brief The union of the members' `synonyms` rules: surface word -> canonical word.
+ *  @return 1 on success (from / to filled; to[id] = canonical bytes in `toheap`), 0 on failure (error set). */
+static int pzpd_words_synonyms(pzpd *a, struct pzpd_sdict *from, struct pzpd_buf *toheap, struct pzpd_buf *tooff)
+{
+    int t = pzpd_table_id(a, PZPD_SYNONYMS_TABLE);
+    if (t < 0) { return 1; }
+    const struct pzpd_tschema *sc = a->tables[t];
+    if (!pzpd_synonyms_check(sc, NULL, 0, NULL, 0)) { return 0; }
+    for (unsigned mi = 0; mi < a->member_count; mi++)
+    {
+        const void *rows = NULL;
+        uint32_t n = pzpd_global_rows(a, mi, (unsigned) t, &rows);
+        if ( (n == 0) && (pzpd_errorCode != PZPD_OK) && (pzpd_errorCode != PZPD_E_MEMBER_MISSING) ) { return 0; }
+        for (uint32_t r = 0; r < n; r++)
+        {
+            const unsigned char *row = (const unsigned char *) rows + (size_t) r * sc->stride;
+            size_t wl = 0, cl = 0;
+            const char *word = pzpd_global_str(a, mi, (unsigned) t, row + sc->offset[0], &wl);
+            const char *canon = pzpd_global_str(a, mi, (unsigned) t, row + sc->offset[1], &cl);
+            if ( (word == NULL) || (canon == NULL) ) { return 0; }
+            uint32_t before = from->n;
+            int64_t id = pzpd_sdict_id(from, word, wl);
+            if (id < 0) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+            if ((uint32_t) id < before)
+            {
+                uint64_t o = ((const uint64_t *) tooff->data)[2 * id], l = ((const uint64_t *) tooff->data)[2 * id + 1];
+                if ( (l != cl) || memcmp(toheap->data + o, canon, cl) )
+                    { pzpd_set_error(PZPD_E_FORMAT, "synonyms: \"%.*s\" maps to \"%.*s\" in one member and to \"%.*s\" in member \"%s\"", (int) wl, word, (int) l, (const char *) toheap->data + o, (int) cl, canon, a->m[mi].alias); return 0; }
+                continue;
+            }
+            uint64_t ol[2] = { toheap->len, cl };
+            if ( !pzpd_buf_append(toheap, canon, cl) || !pzpd_buf_append(tooff, ol, sizeof(ol)) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+        }
+    }
+    // One step over the union too: no canonical word may itself be mapped
+    for (uint32_t id = 0; id < from->n; id++)
+    {
+        uint64_t o = ((const uint64_t *) tooff->data)[2 * id], l = ((const uint64_t *) tooff->data)[2 * id + 1];
+        if (pzpd_sdict_find(from, (const char *) toheap->data + o, l) >= 0)
+            { pzpd_set_error(PZPD_E_FORMAT, "synonyms: \"%.*s\" is both a canonical word and mapped (over the members' rules)", (int) l, (const char *) toheap->data + o); return 0; }
+    }
+    return 1;
+}
+
+/** @brief A surface word with its canonical form, for grouping (pzpd_words_open()). */
+struct pzpd_wcanon { const char *c; uint32_t clen; uint32_t sid; };
+
+static int pzpd_cmp_wcanon(const void *a, const void *b)
+{
+    const struct pzpd_wcanon *x = (const struct pzpd_wcanon *) a, *y = (const struct pzpd_wcanon *) b;
+    int c = pzpd_word_cmp(x->c, x->clen, y->c, y->clen);
+    if (c != 0) { return c; }
+    return (x->sid < y->sid) ? -1 : (x->sid > y->sid);
+}
+
+int pzpd_words_open(pzpd *a, const char *table, const char *column, const char *source, size_t source_len, unsigned flags, pzpd_words **out)
+{
+    pzpd_clear_error();
+    if (out != NULL) { *out = NULL; }
+    if ( (a == NULL) || (table == NULL) || (column == NULL) || (out == NULL) || (flags & ~PZPD_WORDS_CANONICAL) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    pzpd_words *w = (pzpd_words *) calloc(1, sizeof(pzpd_words));
+    if (w == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    pthread_mutex_init(&w->lock, NULL);
+    w->a = a;
+    w->flags = flags;
+    snprintf(w->table, sizeof(w->table), "%s", table);
+    snprintf(w->column, sizeof(w->column), "%s", column);
+    int ok = 1;
+    if (source != NULL)
+    {
+        w->source = (char *) malloc(source_len ? source_len : 1);
+        if (w->source == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        else { memcpy(w->source, source, source_len); w->source_len = source_len; }
+    }
+    w->st = (struct pzpd_wstate *) calloc(a->shard_total ? a->shard_total : 1, sizeof(struct pzpd_wstate));
+    if (w->st == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+
+    // Surface vocabulary: the members' vocabularies, merged by word bytes (their records are disjoint: stats add up)
+    struct pzpd_buf ents = {0};
+    int any = 0;
+    for (unsigned mi = 0; ok && (mi < a->member_count); mi++)
+    {
+        struct pzpd_wsec v;
+        struct pzpd_wsub sub;
+        int has = 0;
+        int r = pzpd_words_member_vocab(a, mi, table, column, w->source, w->source_len, &v, &sub, &has);
+        if (r < 0) { ok = 0; break; }
+        if (has) { any = 1; w->covered += a->m[mi].count; }
+        for (uint64_t k = 0; ok && (r == 1) && (k < sub.words); k++)
+        {
+            struct pzpd_went e;
+            size_t l = 0;
+            ok = pzpd_wsub_word(&sub, k, &e.w, &l);
+            e.len = (uint32_t) l;
+            e.records = sub.vocab ? sub.vocab[k].records : sub.mvocab[k].records;
+            e.count   = sub.vocab ? sub.vocab[k].count   : sub.mvocab[k].count;
+            if (ok && !pzpd_buf_append(&ents, &e, sizeof(e))) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        }
+    }
+    if (ok && !any) { pzpd_set_error(PZPD_E_NOTFOUND, "no word index %s.%s", table, column); ok = 0; }
+    size_t ns = ok ? pzpd_went_fold((struct pzpd_went *) ents.data, ents.len / sizeof(struct pzpd_went)) : 0;
+    const struct pzpd_went *e = (const struct pzpd_went *) ents.data;
+    if (ok && (ns > 0xFFFFFFFEull)) { pzpd_set_error(PZPD_E_ARG, "word index: more than 4 G words"); ok = 0; }
+    if (ok)
+    {
+        w->ns = (uint32_t) ns;
+        uint64_t hb = 0;
+        for (size_t i = 0; i < ns; i++) { hb += e[i].len; }
+        w->sheap = (char *) malloc(hb ? hb : 1);
+        w->soff  = (uint64_t *) malloc(sizeof(uint64_t) * (ns + 1));
+        if ( (w->sheap == NULL) || (w->soff == NULL) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        uint64_t o = 0;
+        for (size_t i = 0; ok && (i < ns); i++) { w->soff[i] = o; memcpy(w->sheap + o, e[i].w, e[i].len); o += e[i].len; }
+        if (ok) { w->soff[ns] = o; }
+    }
+
+    // Handle vocabulary: the surface words, or their canonical forms grouped
+    struct pzpd_sdict from;
+    memset(&from, 0, sizeof(from));
+    struct pzpd_buf toheap = {0}, tooff = {0}, canon = {0}, recs = {0};
+    if (ok && (flags & PZPD_WORDS_CANONICAL)) { ok = pzpd_words_synonyms(a, &from, &toheap, &tooff); }
+    if (ok)
+    {
+        for (uint32_t i = 0; ok && (i < w->ns); i++)
+        {
+            struct pzpd_wcanon c = { w->sheap + w->soff[i], (uint32_t)(w->soff[i + 1] - w->soff[i]), i };
+            int64_t id = (flags & PZPD_WORDS_CANONICAL) ? pzpd_sdict_find(&from, c.c, c.clen) : -1;
+            if (id >= 0) { c.c = (const char *) toheap.data + ((const uint64_t *) tooff.data)[2 * id]; c.clen = (uint32_t) ((const uint64_t *) tooff.data)[2 * id + 1]; }
+            if (!pzpd_buf_append(&canon, &c, sizeof(c))) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        }
+    }
+    if (ok)
+    {
+        struct pzpd_wcanon *c = (struct pzpd_wcanon *) canon.data;
+        size_t nc = canon.len / sizeof(*c);
+        if (flags & PZPD_WORDS_CANONICAL) { qsort(c, nc, sizeof(*c), pzpd_cmp_wcanon); }
+        // Groups of equal canonical words (the surface view: every word its own group, already sorted)
+        uint32_t n = 0;
+        uint64_t hb = 0;
+        for (size_t i = 0; i < nc; i++) { if ( (i == 0) || pzpd_word_cmp(c[i - 1].c, c[i - 1].clen, c[i].c, c[i].clen) ) { n++; hb += c[i].clen; } }
+        w->n = n;
+        w->heap    = (char *) malloc(hb ? hb : 1);
+        w->offsets = (uint64_t *) malloc(sizeof(uint64_t) * ((size_t) n + 1));
+        w->records = (uint64_t *) calloc((size_t) n + 1, sizeof(uint64_t));
+        w->count   = (uint64_t *) calloc((size_t) n + 1, sizeof(uint64_t));
+        w->sstart  = (uint32_t *) malloc(sizeof(uint32_t) * ((size_t) n + 1));
+        // sidx: [0, ns) the surface words of each group in group order; canonical view: [ns, 2 ns) the handle word of each surface word
+        w->sidx    = (uint32_t *) malloc(sizeof(uint32_t) * ((flags & PZPD_WORDS_CANONICAL) ? 2 * (size_t) nc + 1 : (size_t) nc + 1));
+        if ( (w->heap == NULL) || (w->offsets == NULL) || (w->records == NULL) || (w->count == NULL) || (w->sstart == NULL) || (w->sidx == NULL) )
+            { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        uint64_t o = 0;
+        uint32_t h = 0;
+        for (size_t i = 0; ok && (i < nc); i++)
+        {
+            if ( (i == 0) || pzpd_word_cmp(c[i - 1].c, c[i - 1].clen, c[i].c, c[i].clen) )
+            {
+                if (i > 0) { h++; }
+                w->offsets[h] = o;
+                w->sstart[h]  = (uint32_t) i;
+                memcpy(w->heap + o, c[i].c, c[i].clen);
+                o += c[i].clen;
+            }
+            w->sidx[i] = c[i].sid;
+            if (flags & PZPD_WORDS_CANONICAL) { w->sidx[nc + c[i].sid] = h; }
+            w->count[h]   += e[c[i].sid].count;
+            w->records[h] += e[c[i].sid].records;      // exact for single-word groups; merged groups are recounted below
+        }
+        if (ok) { w->offsets[n] = o; w->sstart[n] = (uint32_t) nc; }
+        // Canonical groups of several surface words: records = |union of their postings| (opens the shards holding them)
+        for (uint32_t g = 0; ok && (flags & PZPD_WORDS_CANONICAL) && (g < n); g++)
+        {
+            if (w->sstart[g + 1] - w->sstart[g] < 2) { continue; }
+            ok = pzpd_words_records_buf(w, g, &recs);
+            if (ok) { w->records[g] = recs.len / 8; }
+        }
+    }
+    pzpd_sdict_free(&from);
+    pzpd_buf_free(&toheap); pzpd_buf_free(&tooff); pzpd_buf_free(&canon); pzpd_buf_free(&recs); pzpd_buf_free(&ents);
+    if (!ok)
+    {
+        struct pzpd_saved_error se;
+        pzpd_error_save(&se);
+        pzpd_words_close(w);
+        pzpd_error_restore(&se);
+        return 0;
+    }
+    *out = w;
+    return 1;
+}
+
+uint32_t pzpd_words_count(const pzpd_words *w) { return (w == NULL) ? 0 : w->n; }
+
+const char *pzpd_words_word(const pzpd_words *w, uint32_t id, size_t *len)
+{
+    if ( (w == NULL) || (id >= w->n) ) { return NULL; }
+    if (len != NULL) { *len = (size_t)(w->offsets[id + 1] - w->offsets[id]); }
+    return w->heap + w->offsets[id];
+}
+
+int pzpd_words_stats(const pzpd_words *w, uint32_t id, uint64_t *records, uint64_t *count)
+{
+    if ( (w == NULL) || (id >= w->n) ) { return 0; }
+    if (records != NULL) { *records = w->records[id]; }
+    if (count != NULL)   { *count = w->count[id]; }
+    return 1;
+}
+
+uint32_t pzpd_words_arrays(const pzpd_words *w, const uint64_t **records, const uint64_t **count, const char **heap, const uint64_t **offsets)
+{
+    if (w == NULL) { return 0; }
+    if (records != NULL) { *records = w->records; }
+    if (count != NULL)   { *count = w->count; }
+    if (heap != NULL)    { *heap = w->heap; }
+    if (offsets != NULL) { *offsets = w->offsets; }
+    return w->n;
+}
+
+int pzpd_words_info(const pzpd_words *w, unsigned *tokenizer, uint64_t *covered_records)
+{
+    if (w == NULL) { return 0; }
+    if (tokenizer != NULL) { *tokenizer = PZPD_TOKENIZER_V1; }
+    if (covered_records != NULL) { *covered_records = w->covered; }
+    return 1;
+}
+
+size_t pzpd_words_records(pzpd_words *w, uint32_t id, uint64_t *ordinals, size_t max)
+{
+    pzpd_clear_error();
+    if ( (w == NULL) || (id >= w->n) || ((ordinals == NULL) && (max > 0)) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    struct pzpd_buf r = {0};
+    size_t n = 0;
+    if (pzpd_words_records_buf(w, id, &r))
+    {
+        n = r.len / 8;
+        if ( (n > 0) && (max > 0) ) { memcpy(ordinals, r.data, ((n < max) ? n : max) * 8); }
+    }
+    pzpd_buf_free(&r);
+    return n;
+}
+
+size_t pzpd_words_of_record(pzpd_words *w, uint64_t ordinal, uint32_t *ids, size_t max)
+{
+    pzpd_clear_error();
+    if ( (w == NULL) || ((ids == NULL) && (max > 0)) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    pzpd *a = w->a;
+    unsigned mi; uint64_t local;
+    struct pzpd_archive *ar = pzpd_route(a, ordinal, &mi, &local);
+    if (ar == NULL) { return 0; }
+    int si = pzpd_shard_of(ar, local);
+    if (si < 0) { return 0; }
+    struct pzpd_wstate *st = pzpd_words_state(w, a->m[mi].shard_base + (unsigned) si);
+    if ( (st == NULL) || !st->has ) { return 0; }
+    uint64_t r = ordinal - st->first;
+    if (r >= st->sub.records) { pzpd_set_error(PZPD_E_FORMAT, "word index: record %llu missing from its shard's index", (unsigned long long) ordinal); return 0; }
+    uint32_t b0 = st->sub.fwd_index[r], b1 = st->sub.fwd_index[r + 1];
+    if ( (b0 > b1) || (b1 > st->sub.postings) ) { pzpd_set_error(PZPD_E_FORMAT, "word index: forward list of record %llu is damaged", (unsigned long long) ordinal); return 0; }
+    size_t n = b1 - b0;
+    uint32_t stackIds[256];
+    uint32_t *t = (n <= 256) ? stackIds : (uint32_t *) malloc(n * sizeof(uint32_t));
+    if (t == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    for (size_t i = 0; i < n; i++)
+    {
+        uint32_t k = st->sub.fwd[b0 + i];
+        if (k >= st->sub.words) { if (t != stackIds) { free(t); } pzpd_set_error(PZPD_E_FORMAT, "word index: forward list of record %llu is damaged", (unsigned long long) ordinal); return 0; }
+        t[i] = st->map[k];
+    }
+    if ( (w->flags & PZPD_WORDS_CANONICAL) && (n > 1) )
+    {
+        // Surface words of one group map to the same canonical id: sort and deduplicate
+        qsort(t, n, sizeof(uint32_t), pzpd_cmp_u32);
+        size_t o = 0;
+        for (size_t i = 1; i < n; i++) { if (t[i] != t[o]) { t[++o] = t[i]; } }
+        n = o + 1;
+    }
+    if ( (n > 0) && (max > 0) ) { memcpy(ids, t, ((n < max) ? n : max) * sizeof(uint32_t)); }
+    if (t != stackIds) { free(t); }
+    return n;
+}
+
+int pzpd_words_index(pzpd *a, unsigned i, const char **table, const char **column, const char **source_column)
+{
+    pzpd_clear_error();
+    if (a == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL handle"); return 0; }
+    const struct pzpd_disk_words *seen[PZPD_MAX_MEMBERS > 64 ? 64 : PZPD_MAX_MEMBERS];
+    unsigned nseen = 0;
+    for (unsigned mi = 0; mi < a->member_count; mi++)
+    {
+        struct pzpd_archive *ar = a->m[mi].arch;
+        if (ar == NULL) { continue; }
+        const struct pzpd_disk_words *dir;
+        const unsigned char *map;
+        uint64_t mlen;
+        int manifest = !ar->standalone;
+        if (manifest) { if (ar->mwords_bad) { continue; } dir = ar->mwords; map = ar->mmap_manifest; mlen = ar->manifest_len; }
+        else
+        {
+            struct pzpd_rshard *s = pzpd_shard(ar, 0);
+            if ( (s == NULL) || s->words_bad ) { pzpd_clear_error(); continue; }
+            dir = s->sb.words; map = s->map; mlen = s->map_len;
+        }
+        for (unsigned j = 0; j < pzpd_words_used(dir); j++)
+        {
+            int dup = 0;
+            for (unsigned k = 0; k < nseen; k++) { if ( !strncmp(seen[k]->table, dir[j].table, 24) && !strncmp(seen[k]->column, dir[j].column, 24) ) { dup = 1; } }
+            if (dup) { continue; }
+            if (nseen == i)
+            {
+                struct pzpd_wsec v;
+                const char *src = "";
+                if ( pzpd_check_section(map, mlen, dir[j].section_offset, manifest ? PZPD_SECT_MWORDS : PZPD_SECT_WORDS, dir[j].section_bytes) &&
+                     pzpd_wsec_parse(map + dir[j].section_offset, dir[j].section_bytes, manifest, &v) )
+                    { src = (const char *) (map + dir[j].section_offset + offsetof(struct pzpd_disk_words_head, source_column)); }
+                pzpd_clear_error();
+                if (table != NULL)         { *table = dir[j].table; }
+                if (column != NULL)        { *column = dir[j].column; }
+                if (source_column != NULL) { *source_column = src; }
+                return 1;
+            }
+            if (nseen < sizeof(seen) / sizeof(seen[0])) { seen[nseen++] = &dir[j]; }
+        }
+    }
+    return 0;
+}
+
+size_t pzpd_words_sources(pzpd *a, const char *table, const char *column, const char **names, size_t *lens, size_t max)
+{
+    pzpd_clear_error();
+    if ( (a == NULL) || (table == NULL) || (column == NULL) || (((names == NULL) || (lens == NULL)) && (max > 0)) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    struct pzpd_buf all = {0};
+    int ok = 1;
+    for (unsigned mi = 0; ok && (mi < a->member_count); mi++)
+    {
+        struct pzpd_wsec v;
+        struct pzpd_wsub sub;
+        int has = 0;
+        int r = pzpd_words_member_vocab(a, mi, table, column, NULL, 0, &v, &sub, &has);
+        if (r < 0) { ok = 0; break; }
+        if (r == 0) { continue; }
+        for (unsigned k = 1; ok && (k < v.nsub); k++)
+        {
+            struct pzpd_wsub sk;
+            ok = pzpd_wsec_sub(&v, k, v.manifest ? -1 : (int64_t) sub.records, &sk);
+            struct pzpd_bstr b = { sk.source, sk.source_len };
+            if (ok && !pzpd_buf_append(&all, &b, sizeof(b))) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        }
+    }
+    size_t n = 0;
+    if (ok)
+    {
+        struct pzpd_bstr *b = (struct pzpd_bstr *) all.data;
+        n = all.len / sizeof(*b);
+        if (n > 1)
+        {
+            qsort(b, n, sizeof(*b), pzpd_cmp_bstr);
+            size_t o = 0;
+            for (size_t i = 1; i < n; i++) { if (pzpd_cmp_bstr(&b[o], &b[i]) != 0) { b[++o] = b[i]; } }
+            n = o + 1;
+        }
+        for (size_t i = 0; (i < n) && (i < max); i++) { names[i] = b[i].s; lens[i] = b[i].len; }
+    }
+    pzpd_buf_free(&all);
+    return n;
 }
 
 //-----------------------------------------------------------------------------------------------
@@ -6098,7 +7911,8 @@ int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_pa
         }
         char streams[PZPD_MAX_STREAMS][24];
         memcpy(streams, a0->streams, sizeof(streams));
-        ok = pzpd_write_manifest(manifest_path, a0->shards[0].sb.archive_uuid, total, a0->S, streams, n, &shardTab, &names, &ghash, a0->T, tabs);
+        ok = pzpd_write_manifest(manifest_path, a0->shards[0].sb.archive_uuid, total, a0->S, streams, n, &shardTab, &names, &ghash, a0->T, tabs,
+                                 byIndex);
     }
     struct pzpd_saved_error e;
     pzpd_error_save(&e);
@@ -6316,6 +8130,14 @@ struct pzpd_tslot
     uint64_t               bytes; ///< Its size
 };
 
+/** @brief One word index section of a shard's new layout (pzpd_write_generation()). */
+struct pzpd_wslot
+{
+    struct pzpd_disk_words slot;  ///< Directory slot (section_offset / _bytes filled when written)
+    const unsigned char   *data;  ///< Section data to write, or NULL to keep the existing section at slot.section_offset
+    uint64_t               bytes; ///< Its size
+};
+
 /** @brief Write one full superblock block (4 KiB) at off. */
 static int pzpd_write_sb_block(int fd, const struct pzpd_disk_superblock *sb, uint64_t off)
 {
@@ -6334,10 +8156,12 @@ static int pzpd_write_sb_block(int fd, const struct pzpd_disk_superblock *sb, ui
  *  @param map Mapping of the shard (for the unchanged index sections and kept table sections).
  *  @return 1 on success (new superblock in *out), 0 on failure (error set). */
 static int pzpd_write_generation(int fd, const unsigned char *map, const struct pzpd_disk_superblock *base, uint64_t at,
-                                 unsigned T, struct pzpd_tslot *ts, int truncate_after_flip, struct pzpd_disk_superblock *out)
+                                 unsigned T, struct pzpd_tslot *ts, unsigned W, const struct pzpd_wslot *ws, int truncate_after_flip,
+                                 struct pzpd_disk_superblock *out)
 {
     struct pzpd_disk_superblock sb = *base;
     memset(sb.tables, 0, sizeof(sb.tables));
+    memset(sb.words, 0, sizeof(sb.words));
     XXH64_state_t *idx = XXH64_createState();
     if (idx == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
     XXH64_reset(idx, 0);
@@ -6363,6 +8187,21 @@ static int pzpd_write_generation(int fd, const unsigned char *map, const struct 
         else { XXH64_update(idx, map + ts[t].slot.section_offset, (size_t) ts[t].slot.section_bytes); }
     }
     sb.index_checksum = XXH64_digest(idx);
+    // Word indexes after the tables, with their own checksum
+    XXH64_reset(idx, 0);
+    for (unsigned j = 0; ok && (j < W); j++)
+    {
+        sb.words[j] = ws[j].slot;
+        if (ws[j].data != NULL)
+        {
+            uint64_t dataOff = 0;
+            ok = pzpd_write_section(fd, &off, PZPD_SECT_WORDS, ws[j].data, ws[j].bytes, &dataOff, idx);
+            sb.words[j].section_offset = dataOff;
+            sb.words[j].section_bytes  = ws[j].bytes;
+        }
+        else { XXH64_update(idx, map + ws[j].slot.section_offset, (size_t) ws[j].slot.section_bytes); }
+    }
+    sb.words_checksum = (W > 0) ? XXH64_digest(idx) : 0;
     XXH64_freeState(idx);
     if (!ok) { return 0; }
     sb.generation = base->generation + 1;
@@ -6422,6 +8261,26 @@ static int pzpd_edit_finish(const char *manifest, struct pzpd_archive *m)
     return ok;
 }
 
+/** @brief Build a shard's word index section from one of its table sections (edits and reindex).
+ *  @return 1 on success, 0 on failure (error set, e.g. the column is gone from a replaced table). */
+static int pzpd_words_build_view(struct pzpd_buf *out, const struct pzpd_tschema *sc, const struct pzpd_tview *tv, uint64_t records,
+                                 const char *column, const char *source_column)
+{
+    int ct = -1, cs = -1;
+    for (unsigned c = 0; c < sc->ncols; c++)
+    {
+        if (!strcmp(sc->colname[c], column)) { ct = (int) c; }
+        if ( (source_column != NULL) && !strcmp(sc->colname[c], source_column) ) { cs = (int) c; }
+    }
+    if ( (ct < 0) || (sc->type[ct] != PZPD_TYPE_STR) || (sc->count[ct] != 1) || (sc->flags & PZPD_TABLE_GLOBAL) )
+        { pzpd_set_error(PZPD_E_ARG, "word index %s.%s: the table has no such str column (drop the word index first: reindex --drop)", sc->name, column); return 0; }
+    if ( (source_column != NULL) && ((cs < 0) || (sc->type[cs] != PZPD_TYPE_STR) || (sc->count[cs] != 1) || (cs == ct)) )
+        { pzpd_set_error(PZPD_E_ARG, "word index %s.%s: source column %s is not another str column", sc->name, column, source_column); return 0; }
+    if ( (tv->index == NULL) || (tv->records != records) ) { pzpd_set_error(PZPD_E_FORMAT, "word index %s.%s: the table's row index is damaged", sc->name, column); return 0; }
+    struct pzpd_wsrc src = { records, tv->index, tv->rowdata, tv->rows, sc->stride, tv->heap, tv->heap_bytes, sc->offset[ct], (cs >= 0) ? (int64_t) sc->offset[cs] : -1 };
+    return pzpd_words_build(out, &src, source_column);
+}
+
 int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const char *schema, unsigned table_flags,
                     const pzpd_edit_rows *rows, size_t n, const char *global_csv, size_t global_len, unsigned flags, uint64_t *unmatched)
 {
@@ -6478,6 +8337,11 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
     {
         gn = pzpd_csv_parse(&nsc, (global_csv != NULL) ? global_csv : "", (global_csv != NULL) ? global_len : 0, &grows, &gheap);
         if (gn < 0) { ok = 0; }
+    }
+    // The word index's merge rules are checked before any shard is touched
+    if ( ok && (op != PZPD_EDIT_DROP) && !strcmp(table, PZPD_SYNONYMS_TABLE) )
+    {
+        ok = pzpd_synonyms_check(&nsc, grows.data, (gn > 0) ? (uint64_t) gn : 0, (const char *) gheap.data, gheap.len);
     }
 
     struct pzpd_buf secbuf = {0}, trows = {0}, theap = {0}, tindex = {0};
@@ -6569,6 +8433,32 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
             ts[T].bytes = secbuf.len;
             T++;
         }
+        // Word indexes: rebuilt with a replaced table, dropped with a dropped one, kept otherwise. A damaged word
+        // directory is not carried over (the indexes are re-derivable with reindex).
+        struct pzpd_wslot ws[PZPD_MAX_WORD_INDEXES];
+        struct pzpd_buf wbufs[PZPD_MAX_WORD_INDEXES];
+        memset(wbufs, 0, sizeof(wbufs));
+        unsigned W = 0, nw = s->words_bad ? 0 : pzpd_words_used(s->sb.words);
+        for (unsigned j = 0; ok && (j < nw); j++)
+        {
+            const struct pzpd_disk_words *d = &s->sb.words[j];
+            int mine = !strncmp(d->table, table, sizeof(d->table));
+            if (mine && (op == PZPD_EDIT_DROP)) { continue; }
+            memset(&ws[W], 0, sizeof(ws[W]));
+            ws[W].slot = *d;
+            if (mine && (op == PZPD_EDIT_REPLACE))
+            {
+                struct pzpd_wsec v;
+                struct pzpd_tschema tsc;
+                struct pzpd_tview tv;
+                ok = pzpd_shard_wsec(s, j, &v) &&
+                     pzpd_table_parse(secbuf.data, secbuf.len, &tsc, &tv, (int64_t) s->sb.record_count) &&
+                     pzpd_words_build_view(&wbufs[W], &tsc, &tv, s->sb.record_count, d->column, v.source_column[0] ? v.source_column : NULL);
+                ws[W].data  = wbufs[W].data;
+                ws[W].bytes = wbufs[W].len;
+            }
+            W++;
+        }
         if (ok)
         {
             int fd = open(s->path, O_RDWR | O_CLOEXEC);
@@ -6576,10 +8466,11 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
             if (fd < 0) { pzpd_set_error(PZPD_E_IO, "cannot open %s for writing: %s", s->path, strerror(errno)); ok = 0; }
             else
             {
-                ok = pzpd_write_generation(fd, s->map, &s->sb, s->sb.file_bytes, T, ts, 0, &nsb);
+                ok = pzpd_write_generation(fd, s->map, &s->sb, s->sb.file_bytes, T, ts, W, ws, 0, &nsb);
                 close(fd);
             }
         }
+        for (unsigned j = 0; j < PZPD_MAX_WORD_INDEXES; j++) { pzpd_buf_free(&wbufs[j]); }
         arch_close(sa);
     }
     if (ok) { ok = pzpd_edit_finish(manifest, m); }
@@ -6592,6 +8483,91 @@ int pzpd_edit_table(const char *manifest, unsigned op, const char *table, const 
     pzpd_buf_free(&grows); pzpd_buf_free(&gheap);
     free(keys);
     free(matched);
+    arch_close(m);
+    if (!ok) { pzpd_error_restore(&e); }
+    return ok;
+}
+
+int pzpd_edit_words(const char *manifest, unsigned op, const char *table, const char *column, const char *source_column)
+{
+    pzpd_clear_error();
+    if ( (manifest == NULL) || (table == NULL) || (column == NULL) || (op < PZPD_EDIT_ADD) || (op > PZPD_EDIT_DROP) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    struct pzpd_archive *m = pzpd_edit_open(manifest);
+    if (m == NULL) { return 0; }
+    int ok = 1, t = -1;
+    for (unsigned k = 0; k < m->T; k++) { if (!strcmp(m->tables[k].name, table)) { t = (int) k; } }
+    if ( (op != PZPD_EDIT_DROP) && (t < 0) ) { pzpd_set_error(PZPD_E_NOTFOUND, "no table %s", table); ok = 0; }
+    struct pzpd_buf wbuf = {0};
+    for (unsigned k = 0; ok && (k < m->shard_count); k++)
+    {
+        struct pzpd_archive *sa = arch_open(m->shards[k].path, 0);
+        if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
+        struct pzpd_rshard *s = &sa->shards[0];
+        unsigned nw = s->words_bad ? 0 : pzpd_words_used(s->sb.words);   // a damaged directory: only the named index is rebuilt
+        int j = s->words_bad ? -1 : pzpd_words_slot(s->sb.words, table, column);
+        // Resume: a shard already in the target state is left alone (a rebuild is simply redone)
+        int done = 0;
+        if ( (op == PZPD_EDIT_DROP) && (j < 0) ) { done = 1; }
+        if ( (op == PZPD_EDIT_ADD) && (j >= 0) )
+        {
+            struct pzpd_wsec v;
+            ok = pzpd_shard_wsec(s, (unsigned) j, &v);
+            if (ok && strcmp(v.source_column, (source_column != NULL) ? source_column : "")) { pzpd_set_error(PZPD_E_DUPLICATE, "%s already has word index %s.%s with another source column", s->path, table, column); ok = 0; }
+            done = 1;
+        }
+        if ( ok && !done && (op != PZPD_EDIT_DROP) && (j < 0) && (nw >= PZPD_MAX_WORD_INDEXES) ) { pzpd_set_error(PZPD_E_ARG, "more than %d word indexes", PZPD_MAX_WORD_INDEXES); ok = 0; }
+        if (ok && done) { ok = pzpd_finish_flip(s); }
+        if (!ok || done) { arch_close(sa); continue; }
+
+        // The new directory: kept sections stay where they are
+        struct pzpd_wslot ws[PZPD_MAX_WORD_INDEXES];
+        unsigned W = 0;
+        int target = -1;                                   // the slot rebuilt (at most one per call)
+        for (unsigned q = 0; q < nw; q++)
+        {
+            if ( ((int) q == j) && (op == PZPD_EDIT_DROP) ) { continue; }
+            memset(&ws[W], 0, sizeof(ws[W]));
+            ws[W].slot = s->sb.words[q];
+            if ((int) q == j) { target = (int) W; }
+            W++;
+        }
+        if ( (op != PZPD_EDIT_DROP) && (j < 0) )
+        {
+            memset(&ws[W], 0, sizeof(ws[W]));
+            snprintf(ws[W].slot.table, sizeof(ws[W].slot.table), "%s", table);
+            snprintf(ws[W].slot.column, sizeof(ws[W].slot.column), "%s", column);
+            target = (int) W;
+            W++;
+        }
+        if (target >= 0)
+        {
+            int st = -1;
+            for (unsigned u = 0; u < sa->T; u++) { if (!strcmp(sa->tables[u].name, table)) { st = (int) u; } }
+            if (st < 0) { pzpd_set_error(PZPD_E_FORMAT, "%s lacks table %s", s->path, table); ok = 0; }
+            ok = ok && pzpd_words_build_view(&wbuf, &sa->tables[st], &s->tv[st], s->sb.record_count, column, source_column);
+            ws[target].data  = wbuf.data;
+            ws[target].bytes = wbuf.len;
+        }
+        // Tables stay as they are
+        struct pzpd_tslot ts[PZPD_MAX_TABLES];
+        for (unsigned u = 0; u < sa->T; u++) { memset(&ts[u], 0, sizeof(ts[u])); ts[u].slot = s->sb.tables[u]; }
+        if (ok)
+        {
+            int fd = open(s->path, O_RDWR | O_CLOEXEC);
+            struct pzpd_disk_superblock nsb;
+            if (fd < 0) { pzpd_set_error(PZPD_E_IO, "cannot open %s for writing: %s", s->path, strerror(errno)); ok = 0; }
+            else
+            {
+                ok = pzpd_write_generation(fd, s->map, &s->sb, s->sb.file_bytes, sa->T, ts, W, ws, 0, &nsb);
+                close(fd);
+            }
+        }
+        arch_close(sa);
+    }
+    if (ok) { ok = pzpd_edit_finish(manifest, m); }
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    pzpd_buf_free(&wbuf);
     arch_close(m);
     if (!ok) { pzpd_error_restore(&e); }
     return ok;
@@ -6644,6 +8620,21 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed)
             live += pzpd_align_up(sizeof(struct pzpd_disk_section) + ts[T].bytes, PZPD_BLOCK);
             T++;
         }
+        // Word index sections move with the tables
+        unsigned W = s->words_bad ? 0 : pzpd_words_used(sb.words);
+        struct pzpd_wslot ws[PZPD_MAX_WORD_INDEXES];
+        unsigned char *wcopies[PZPD_MAX_WORD_INDEXES] = {0};
+        for (unsigned j = 0; ok && (j < W); j++)
+        {
+            memset(&ws[j], 0, sizeof(ws[j]));
+            ws[j].slot  = sb.words[j];
+            ws[j].bytes = sb.words[j].section_bytes;
+            wcopies[j]  = (unsigned char *) malloc(ws[j].bytes ? ws[j].bytes : 1);
+            if (wcopies[j] == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; break; }
+            memcpy(wcopies[j], s->map + sb.words[j].section_offset, (size_t) ws[j].bytes);
+            ws[j].data = wcopies[j];
+            live += pzpd_align_up(sizeof(struct pzpd_disk_section) + ws[j].bytes, PZPD_BLOCK);
+        }
         uint64_t compactEnd = start + live + PZPD_BLOCK;
         if (ok && (compactEnd < sb.file_bytes))
         {
@@ -6654,15 +8645,16 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed)
             if (fd < 0) { pzpd_set_error(PZPD_E_IO, "cannot open %s for writing: %s", s->path, strerror(errno)); ok = 0; }
             else
             {
-                ok = pzpd_write_generation(fd, s->map, &sb, sb.file_bytes, T, ts, 0, &g1);
+                ok = pzpd_write_generation(fd, s->map, &sb, sb.file_bytes, T, ts, W, ws, 0, &g1);
                 if (ok) { pzpd_test_crash("compact"); }       // between the two generations
-                ok = ok && pzpd_write_generation(fd, s->map, &g1, start, T, ts, 1, &g2);
+                ok = ok && pzpd_write_generation(fd, s->map, &g1, start, T, ts, W, ws, 1, &g2);
                 close(fd);
                 if (ok && (reclaimed != NULL)) { *reclaimed += sb.file_bytes - g2.file_bytes; }
                 changed = 1;
             }
         }
         for (unsigned t = 0; t < T; t++) { free(copies[t]); }
+        for (unsigned j = 0; j < PZPD_MAX_WORD_INDEXES; j++) { free(wcopies[j]); }
         arch_close(sa);
     }
     if (ok && changed) { ok = pzpd_edit_finish(manifest, m); }
@@ -6716,6 +8708,13 @@ static int pzpd_rewrite_shard(struct pzpd_archive *sa, unsigned newS, char names
     for (unsigned t = 0; ok && (t < sa->T); t++)
     {
         if (sa->tables[t].flags & PZPD_TABLE_GLOBAL) { ok = pzpd_writer_global_rows(w, t, sa->gview[t].rowdata, (uint32_t) sa->gview[t].rows, sa->gview[t].heap, sa->gview[t].heap_bytes); }
+    }
+    // The shard's word indexes, rebuilt from the copied rows when the new shard closes
+    unsigned nw = s->words_bad ? 0 : pzpd_words_used(sb.words);
+    for (unsigned j = 0; ok && (j < nw); j++)
+    {
+        struct pzpd_wsec v;
+        ok = pzpd_shard_wsec(s, j, &v) && pzpd_writer_words(w, sb.words[j].table, sb.words[j].column, v.source_column[0] ? v.source_column : NULL);
     }
     // The shard's groups, with their ids and names
     for (uint64_t g = 0; ok && (s->groups != NULL) && (g < s->sb.group_count); g++)

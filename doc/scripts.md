@@ -183,3 +183,19 @@ python3 scripts/benchmark.py \
 
 PNG and JPEG sources are automatically pre-converted to PPM for `pzp` /
 `spzp` / `dpzp` (which read PNM/PPM only), keeping the comparison fair.
+
+---
+
+## `vendorIntoDataLoader.sh` — re-vendor PZP and pzpdir into the DataLoader
+
+Copies `pzp.h` / `pzp.c` to the DataLoader's `codecs/` and `pzpdir.h` / `pzpdir.c` /
+`third_party/xxhash.h` to its `pzpdir/`, then checks the DataLoader build in a scratch
+directory (`src/pzpdir/scripts/check_client_build.sh` and the `pzp` CLI as `makeLibrary.sh`
+builds it). A destination with uncommitted changes in the DataLoader repository is only
+overwritten with `--force`. Nothing is committed and `libDataLoader.so` is not rebuilt.
+
+```bash
+scripts/vendorIntoDataLoader.sh --check            # which vendored files differ (exit 1 if any)
+scripts/vendorIntoDataLoader.sh                    # vendor into the default DataLoader path
+scripts/vendorIntoDataLoader.sh --force /path/to/DataLoader
+```

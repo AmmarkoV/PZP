@@ -1505,32 +1505,34 @@ static unsigned char *pzp_container_read_frame_from_memory(
         return NULL;
     }
 
-    /* chain[0] = frame_index, chain[n-1] = the keyframe it depends on */
+    /* chain[k] = frame k; frames first..frame_index are decoded, chain[first] is the keyframe */
     PZPFrame    *chain = (PZPFrame *)malloc(((size_t)frame_index + 1) * sizeof(PZPFrame));
-    unsigned int n     = 0;
+    unsigned int first = frame_index + 1;   /* nothing decoded yet */
     int          ok    = (chain != NULL);
-    for (unsigned int k = frame_index; ok; k--)
+    while (ok)
     {
-        ok = pzp_container_decode_entry(file_data, file_size, &entries[k], k, &chain[n]);
+        unsigned int k = first - 1;
+        ok = pzp_container_decode_entry(file_data, file_size, &entries[k], k, &chain[k]);
         if (!ok) break;
-        n++;
-        if (!(chain[n - 1].configuration & USE_INTER_DELTA) || (k == 0)) break;
+        first = k;
+        if (!(chain[k].configuration & USE_INTER_DELTA) || (k == 0)) break;
     }
     free(entries);
 
     unsigned char *out = NULL;
     if (ok)
     {
-        for (unsigned int j = n - 1; j-- > 0; )
-            pzp_frame_add_reference(&chain[j], &chain[j + 1]);
-        out            = chain[0].pixels;
-        *width         = chain[0].width;   *height = chain[0].height;
-        *bpp_ext       = chain[0].bpp_ext; *ch_ext = chain[0].ch_ext;
-        *bpp_int       = chain[0].bpp_int; *ch_int = chain[0].ch_int;
-        *configuration = chain[0].configuration;
+        for (unsigned int k = first + 1; k <= frame_index; k++)
+            pzp_frame_add_reference(&chain[k], &chain[k - 1]);
+        const PZPFrame *fr = &chain[frame_index];
+        out            = fr->pixels;
+        *width         = fr->width;   *height = fr->height;
+        *bpp_ext       = fr->bpp_ext; *ch_ext = fr->ch_ext;
+        *bpp_int       = fr->bpp_int; *ch_int = fr->ch_int;
+        *configuration = fr->configuration;
     }
-    else if (n > 0) free(chain[0].pixels);
-    for (unsigned int j = 1; j < n; j++) free(chain[j].pixels);
+    for (unsigned int k = first; k <= frame_index; k++)
+        if (chain[k].pixels != out) free(chain[k].pixels);
     free(chain);
     return out;
 }

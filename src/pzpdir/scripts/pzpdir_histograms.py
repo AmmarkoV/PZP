@@ -11,6 +11,7 @@ global table for the whole archive (`h:u16[256], pixels:u64, files:u64`). Values
   --depth STREAM[:H,L]  hist_depth: 16-bit depth in 256 fixed bins (depth >> 8); a 16-bit single-channel image, or
                                     two 8-bit channels H (high byte) and L (low byte), default 1,2 (label + depth files)
 
+The bins, values and table layouts are in pzp.histograms (shared with RGBToPoseDetect2D's convertToPZPD.py).
 The global histogram is pixel-weighted: the pixel counts of every file are summed, then normalized. Tables that
 already exist are replaced; no record data is rewritten (spec §7). Run it again after the files change.
 
@@ -24,7 +25,6 @@ Author     : Ammar Qammaz (AmmarkoV)
 """
 
 import argparse
-import io
 import os
 import sys
 from multiprocessing import Pool
@@ -33,12 +33,11 @@ import numpy as np
 
 try:
     import pzp.pzpdir as pzpdir
+    import pzp.histograms as H
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
     import pzp.pzpdir as pzpdir
-
-SCHEMA = "h:u16[256]"
-GLOBAL_SCHEMA = "h:u16[256] pixels:u64 files:u64"
+    import pzp.histograms as H
 
 
 def decode(a, ordinal, stream):
@@ -48,55 +47,7 @@ def decode(a, ordinal, stream):
         return None
     if inf["format"] in ("PZP ", "PZPC"):
         return a.read_image(ordinal, stream)
-    from PIL import Image
-    img = Image.open(io.BytesIO(a.read(ordinal, stream)))
-    if img.mode.startswith("I"):
-        # 16-bit images open as "I;16" or, with older Pillow, as 32-bit "I": both become uint16
-        return np.clip(np.array(img), 0, 65535).astype(np.uint16)
-    if img.mode not in ("L", "RGB", "RGBA"):
-        img = img.convert("RGB")
-    return np.array(img)
-
-
-def luminance(arr):
-    """8-bit luminance with PIL's integer rule (Image.convert("L")); 16-bit input is reduced to its high byte."""
-    if arr.dtype != np.uint8:
-        arr = (arr.astype(np.uint32) >> 8).astype(np.uint8)
-    if arr.ndim == 2 or arr.shape[2] == 1:
-        return arr.reshape(arr.shape[0], arr.shape[1])
-    r, g, b = (arr[:, :, i].astype(np.uint32) for i in range(3))
-    return ((19595 * r + 38470 * g + 7471 * b + 32768) >> 16).astype(np.uint8)
-
-
-def depth16(arr, hi_lo):
-    """The 16-bit depth of an image: itself (16-bit, one channel) or its (high, low) 8-bit channels."""
-    if arr.dtype == np.uint16:
-        return arr if arr.ndim == 2 else arr[:, :, 0]
-    if arr.ndim != 3:
-        raise ValueError("an 8-bit depth image needs two channels (high, low)")
-    hi, lo = hi_lo
-    return (arr[:, :, hi].astype(np.uint16) << 8) | arr[:, :, lo]
-
-
-def counts_of(arr, kind, spec):
-    """Pixel counts of the 256 bins (int64)."""
-    if kind == "rgb":
-        v = luminance(arr)
-    elif kind == "seg":
-        if arr.dtype != np.uint8:
-            raise ValueError("segmentation labels must be 8-bit")
-        v = arr if arr.ndim == 2 else arr[:, :, spec]
-    else:
-        v = (depth16(arr, spec) >> 8).astype(np.uint8)
-    return np.bincount(v.ravel(), minlength=256).astype(np.int64)
-
-
-def normalize(counts):
-    """Counts -> u16 fractions of the total (65535 = 1.0), rounded to nearest."""
-    total = int(counts.sum())
-    if total == 0:
-        return np.zeros(256, dtype=np.int64)
-    return (counts * 65535 + total // 2) // total
+    return H.decode_pil(a.read(ordinal, stream))
 
 
 _A = None
@@ -119,7 +70,7 @@ def _work(rng):
             if stream not in cache:
                 cache[stream] = decode(_A, o, stream)
             arr = cache[stream]
-            got[kind] = None if arr is None else counts_of(arr, kind, spec)
+            got[kind] = None if arr is None else H.counts_of(arr, kind, spec)
         out.append((o, got))
     return out
 
@@ -136,10 +87,6 @@ def parse_jobs(args):
         hi, lo = (int(x) for x in hl.split(",")) if hl else (1, 2)
         jobs.append(("depth", st, (hi, lo)))
     return jobs
-
-
-def csv_row(values):
-    return ",".join(str(int(v)) for v in values)
 
 
 def main():
@@ -175,7 +122,7 @@ def main():
                 for kind, c in got.items():
                     if c is None:
                         continue
-                    rows[kind].append((keys[o], csv_row(normalize(c))))
+                    rows[kind].append((keys[o], H.csv_row(H.normalize(c))))
                     total[kind] += c
                     files[kind] += 1
             done += len(part)
@@ -185,11 +132,11 @@ def main():
     for kind, _, _ in jobs:
         name, gname = "hist_" + kind, "hist_%s_global" % kind
         op = "replace" if name in existing else "add"
-        um = pzpdir.edit_table(args.archive, op, name, rows[kind], schema=SCHEMA, bulk=True)
+        um = pzpdir.edit_table(args.archive, op, name, rows[kind], schema=H.SCHEMA, bulk=True)
         if um:
             sys.exit("%s: %d rows matched no record" % (name, um))
-        g = csv_row(list(normalize(total[kind])) + [int(total[kind].sum()), files[kind]])
-        pzpdir.edit_table(args.archive, "replace" if gname in existing else "add", gname, schema=GLOBAL_SCHEMA, global_=True, global_csv=g)
+        g = H.csv_row(list(H.normalize(total[kind])) + [int(total[kind].sum()), files[kind]])
+        pzpdir.edit_table(args.archive, "replace" if gname in existing else "add", gname, schema=H.GLOBAL_SCHEMA, global_=True, global_csv=g)
         print("%-10s %6d files  %12d pixels  -> tables %s, %s" % (kind, files[kind], int(total[kind].sum()), name, gname))
 
 

@@ -255,7 +255,8 @@ dated revisions, recorded in the changelog below.
     `depth >> 8`) as bulk record tables `h:u16[256]`, plus global `hist_<kind>_global` rows
     `h:u16[256], pixels:u64, files:u64`.
   - **Values:** fractions of the pixels (65535 = 1.0), with the global rows pixel-weighted.
-  - **Tools:** built by `scripts/pzpdir_histograms.py` and checked by `tests/check_histograms.py`.
+  - **Tools:** built by `scripts/pzpdir_histograms.py` (an existing archive) or RGBToPoseDetect2D's `convertToPZPD.py` (while
+    converting), both through the Python module `pzp.histograms`, and checked by `tests/check_histograms.py`.
   - **Verified on COCO val2017** (5000 files, 1.37 G pixels): 500 random rows and all three global rows equal an
     independent recomputation.
 

@@ -550,7 +550,8 @@ static unsigned char *pzp_compress_frame_to_memory(
     PZPChannelGroup default_group = { (unsigned char)ch_int, 8,
                                       (configuration & USE_RLE) ? PZP_PREDICT_LEFT : PZP_PREDICT_NONE, 0 };
     if (!groups || group_count == 0) { groups = &default_group; group_count = 1; }
-    if ((ch_int > 255) || !pzp_channel_groups_valid(groups, group_count, ch_int, bpp_int, configuration))
+    if ((ch_int > 255) || ((configuration & USE_PALETTE) && (ch_int > 8)) ||   /* palettes hold 8 channels */
+        !pzp_channel_groups_valid(groups, group_count, ch_int, bpp_int, configuration))
     {
         fprintf(stderr, "pzp: unsupported channel group table for %u channels @ %u bit (configuration %u)\n",
                 ch_int, bpp_int, configuration);
@@ -970,7 +971,7 @@ static int pzp_container_write(
         return 0;
     }
 
-    fwrite(&hdr, sizeof(unsigned int), 12, out);
+    int ok = (fwrite(&hdr, sizeof(unsigned int), 12, out) == 12);
 
     for (unsigned int f = 0; f < frame_count; f++)
     {
@@ -979,26 +980,27 @@ static int pzp_container_write(
         entry.compressed_size = (unsigned int)frame_sizes[f];
         entry.delay_ms        = delay_ms_arr ? delay_ms_arr[f] : 0;
         entry.reserved        = 0;
-        fwrite(&entry, sizeof(unsigned int), 4, out);
+        ok = ok && (fwrite(&entry, sizeof(unsigned int), 4, out) == 4);
     }
 
     for (unsigned int f = 0; f < frame_count; f++)
     {
-        fwrite(frame_bufs[f], 1, frame_sizes[f], out);
+        ok = ok && (fwrite(frame_bufs[f], 1, frame_sizes[f], out) == frame_sizes[f]);
         free(frame_bufs[f]);
     }
 
     if (metadata && metadata_bytes > 0)
-        fwrite(metadata, 1, metadata_bytes, out);
+        ok = ok && (fwrite(metadata, 1, metadata_bytes, out) == metadata_bytes);
 
     if (audio && audio_bytes > 0)
-        fwrite(audio, 1, audio_bytes, out);
+        ok = ok && (fwrite(audio, 1, audio_bytes, out) == audio_bytes);
 
-    fclose(out);
+    ok = (fclose(out) == 0) && ok;   /* a full disk often only shows up here */
     free(frame_bufs);
     free(frame_sizes);
     free(frame_offsets);
-    return 1;
+    if (!ok) fail("pzp_container_write: writing the output file failed");
+    return ok;
 }
 
 //-----------------------------------------------------------------------------------------------
@@ -1054,13 +1056,28 @@ static int pzp_container_attach(
         free(entries); free(file_data); return 0;
     }
 
+    /* a blob that is not being replaced is kept from the input file */
+    if (!(metadata && metadata_bytes > 0) && (hdr.container_flags & PZP_CONTAINER_HAS_METADATA) &&
+        (hdr.metadata_bytes > 0) && ((size_t)hdr.metadata_offset + hdr.metadata_bytes <= file_size))
+    {
+        metadata       = (const unsigned char *)file_data + hdr.metadata_offset;
+        metadata_bytes = hdr.metadata_bytes;
+    }
+    if (!(audio && audio_bytes > 0) && (hdr.container_flags & PZP_CONTAINER_HAS_AUDIO) &&
+        (hdr.audio_bytes > 0) && ((size_t)hdr.audio_offset + hdr.audio_bytes <= file_size))
+    {
+        audio        = (const unsigned char *)file_data + hdr.audio_offset;
+        audio_bytes  = hdr.audio_bytes;
+        audio_format = hdr.audio_format;
+    }
+
     unsigned int new_meta_offset  = (metadata && metadata_bytes > 0) ? data_end : 0;
     unsigned int new_audio_offset = 0;
     if (audio && audio_bytes > 0)
         new_audio_offset = new_meta_offset ? (new_meta_offset + metadata_bytes) : data_end;
 
     /* update header fields */
-    unsigned int flags = hdr.container_flags;
+    unsigned int flags = hdr.container_flags & ~(PZP_CONTAINER_HAS_METADATA | PZP_CONTAINER_HAS_AUDIO);
     if (metadata && metadata_bytes > 0) flags |= PZP_CONTAINER_HAS_METADATA;
     if (audio    && audio_bytes    > 0) flags |= PZP_CONTAINER_HAS_AUDIO;
 
@@ -1069,7 +1086,7 @@ static int pzp_container_attach(
     hdr.metadata_bytes  = (metadata && metadata_bytes > 0) ? metadata_bytes : 0;
     hdr.audio_offset    = new_audio_offset;
     hdr.audio_bytes     = (audio && audio_bytes > 0) ? audio_bytes : 0;
-    hdr.audio_format    = audio_format;
+    hdr.audio_format    = (audio && audio_bytes > 0) ? audio_format : 0;
     hdr.header_checksum = hash_checksum(&hdr, sizeof(unsigned int) * 10);
 
     /* recompute frame offsets (they stay the same relative structure) */
@@ -1084,22 +1101,23 @@ static int pzp_container_attach(
     FILE *out = fopen(output_filename, "wb");
     if (!out) { free(entries); free(file_data); return 0; }
 
-    fwrite(&hdr, sizeof(unsigned int), 12, out);
-    fwrite(entries, sizeof(unsigned int), 4 * hdr.frame_count, out);
+    int ok = (fwrite(&hdr, sizeof(unsigned int), 12, out) == 12);
+    ok = ok && (fwrite(entries, sizeof(unsigned int), 4 * hdr.frame_count, out) == 4 * (size_t)hdr.frame_count);
 
     /* copy all frame data from original file */
-    fwrite((const unsigned char *)file_data + frame_area_start, 1, total_frame_bytes, out);
+    ok = ok && (fwrite((const unsigned char *)file_data + frame_area_start, 1, total_frame_bytes, out) == total_frame_bytes);
 
     if (metadata && metadata_bytes > 0)
-        fwrite(metadata, 1, metadata_bytes, out);
+        ok = ok && (fwrite(metadata, 1, metadata_bytes, out) == metadata_bytes);
 
     if (audio && audio_bytes > 0)
-        fwrite(audio, 1, audio_bytes, out);
+        ok = ok && (fwrite(audio, 1, audio_bytes, out) == audio_bytes);
 
-    fclose(out);
+    ok = (fclose(out) == 0) && ok;
     free(entries);
     free(file_data);
-    return 1;
+    if (!ok) fprintf(stderr, "pzp_container_attach: writing %s failed\n", output_filename);
+    return ok;
 }
 
 //-----------------------------------------------------------------------------------------------

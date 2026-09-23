@@ -4,7 +4,8 @@
 #   pzp.h                          -> codecs/pzp.h                  (decoder used by codecs/pzpInput.c)
 #   pzp.c                          -> codecs/pzp.c                  (the pzp CLI makeLibrary.sh builds)
 #   src/pzpdir/pzpdir.h            -> pzpdir/pzpdir.h
-#   src/pzpdir/pzpdir.c            -> pzpdir/pzpdir.c
+#   src/pzpdir/pzpdir.c            -> pzpdir/pzpdir.c              (the one file clients compile)
+#   src/pzpdir/pzpdir_*.inc.c      -> pzpdir/pzpdir_*.inc.c        (its parts, #included by pzpdir.c)
 #   src/pzpdir/pzpdir_unicode.h    -> pzpdir/pzpdir_unicode.h      (word index tokenizer tables, generated)
 #   src/pzpdir/third_party/xxhash.h -> pzpdir/third_party/xxhash.h
 #
@@ -34,6 +35,7 @@ pzp.c:codecs/pzp.c
 src/pzpdir/pzpdir.h:pzpdir/pzpdir.h
 src/pzpdir/pzpdir.c:pzpdir/pzpdir.c
 src/pzpdir/pzpdir_unicode.h:pzpdir/pzpdir_unicode.h
+$(cd "$HERE" && for p in src/pzpdir/pzpdir_*.inc.c; do echo "$p:pzpdir/${p##*/}"; done)
 src/pzpdir/third_party/xxhash.h:pzpdir/third_party/xxhash.h"
 
 CHANGED=""; LOCAL=""

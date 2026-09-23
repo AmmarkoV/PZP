@@ -9,6 +9,19 @@ PROJECT_BRIEF          = "PZP directory archives: many files grouped into record
 OUTPUT_DIRECTORY       = $(DOXYGEN_OUTPUT)
 INPUT                  = $(DOXYGEN_INPUT)/pzpdir.h \
                          $(DOXYGEN_INPUT)/pzpdir.c \
+                         $(DOXYGEN_INPUT)/pzpdir_format.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_detect.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_tables.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_words_build.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_writer.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_reader.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_handle.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_words_read.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_collections.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_prefetch.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_recovery.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_edit.inc.c \
+                         $(DOXYGEN_INPUT)/pzpdir_groups.inc.c \
                          $(DOXYGEN_INPUT)/pzpdir_cli.c \
                          $(DOXYGEN_INPUT)/doc/pzpdir.md
 FILE_PATTERNS          = *.c *.h *.md

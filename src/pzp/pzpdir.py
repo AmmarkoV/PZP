@@ -566,9 +566,11 @@ class Archive:
             if not p:
                 _raise()
             try:
-                dt = np.uint16 if bpp.value == 16 else np.uint8
-                n = w.value * hh.value * ch.value * dt().itemsize
-                arr = np.frombuffer(ctypes.string_at(p, n), dtype=dt).reshape(hh.value, w.value, ch.value).copy()
+                # 16-bit samples are decoded big-endian (hi byte first, as in PNM): one copy into native order
+                dt = np.dtype(">u2") if bpp.value == 16 else np.dtype(np.uint8)
+                n = w.value * hh.value * ch.value * dt.itemsize
+                view = np.frombuffer((ctypes.c_ubyte * n).from_address(p), dtype=dt).reshape(hh.value, w.value, ch.value)
+                arr = view.astype(np.uint16) if bpp.value == 16 else view.copy()
             finally:
                 _lib.pzpd_free(p)
             return arr

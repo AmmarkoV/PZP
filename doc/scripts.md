@@ -188,8 +188,8 @@ PNG and JPEG sources are automatically pre-converted to PPM for `pzp` /
 
 ## `vendorIntoDataLoader.sh` — re-vendor PZP and pzpdir into the DataLoader
 
-Copies `pzp.h` / `pzp.c` to the DataLoader's `codecs/` and `pzpdir.h` / `pzpdir.c` /
-`third_party/xxhash.h` to its `pzpdir/`, then checks the DataLoader build in a scratch
+Copies `pzp.h` / `pzp.c` to the DataLoader's `codecs/` and `pzpdir.h` / `pzpdir.c` (with its
+`pzpdir_*.inc.c` parts) / `pzpdir_unicode.h` / `third_party/xxhash.h` to its `pzpdir/`, then checks the DataLoader build in a scratch
 directory (`src/pzpdir/scripts/check_client_build.sh` and the `pzp` CLI as `makeLibrary.sh`
 builds it). A destination with uncommitted changes in the DataLoader repository is only
 overwritten with `--force`. Nothing is committed and `libDataLoader.so` is not rebuilt.

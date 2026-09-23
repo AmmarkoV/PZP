@@ -2,7 +2,7 @@
 # First-client build check (PLAN.md §5): pzpdir must build inside the DataLoader
 # (RGBToPoseDetect2D/datasets/DataLoader) exactly the way the DataLoader builds itself.
 #
-#  1. Vendor pzpdir.h, pzpdir.c and third_party/xxhash.h into a scratch copy (as DataLoader/pzpdir/
+#  1. Vendor pzpdir.h, pzpdir.c (+ its pzpdir_*.inc.c parts), pzpdir_unicode.h and third_party/xxhash.h into a scratch copy (as DataLoader/pzpdir/
 #     would), with PZPDIR_WITH_PZP=0 and no pzp.h on the include path.
 #  2. Compile under the DataLoader's release, AVX2, ASan and -pg flag sets (makeLibrary.sh / Makefile),
 #     plus -Wall -Wextra -Werror: zero warnings allowed.
@@ -16,7 +16,7 @@ HERE="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 DL=${1:-/home/ammar/Documents/Programming/RGBToPoseDetect2D/datasets/DataLoader}
 T=${PZPDIR_TEST_DIR:-/tmp/pzpdir_test}/client
 rm -rf "$T"; mkdir -p "$T/pzpdir/third_party"
-cp "$HERE/pzpdir.h" "$HERE/pzpdir.c" "$T/pzpdir/"
+cp "$HERE/pzpdir.h" "$HERE/pzpdir.c" "$HERE"/pzpdir_*.inc.c "$HERE/pzpdir_unicode.h" "$T/pzpdir/"
 cp "$HERE/third_party/xxhash.h" "$T/pzpdir/third_party/"
 
 FAIL=0

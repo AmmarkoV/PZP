@@ -23,13 +23,13 @@ THUMBDIR     = $(PREFIX)/share/thumbnailers
 
 all: $(PZP) $(DPZP) $(SPZP) $(LIBPZP)
 
-$(PZP): $(SRC)
+$(PZP): $(SRC) pzp.h
 	$(CC) $(SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(PZP)
 
-$(DPZP): $(SRC)
+$(DPZP): $(SRC) pzp.h
 	$(CC) $(SRC) $(DEBUG_FLAGS) $(CFLAGS) -o $(DPZP)
 
-$(SPZP): $(SRC)
+$(SPZP): $(SRC) pzp.h
 	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(SPZP)
 
 $(LIBPZP): $(LIB_SRC) pzp.h

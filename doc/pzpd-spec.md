@@ -38,7 +38,7 @@ dated revisions, recorded in the changelog below.
     hash. Superblock and manifest `*_offset` fields point at the section **data**, right after
     its header. The shard `index_checksum` covers the data of the record, blob, hash, heap and meta
     sections, in that order.
-  - **Exact byte layouts** are defined, and size-checked with `_Static_assert`, in `pzpdir.c`:
+  - **Exact byte layouts** are defined, and size-checked with `_Static_assert`, in `pzpdir.c` (its part `pzpdir_format.inc.c`):
     - shard superblock: adds `hash_count` and `file_bytes`; `sb_checksum` at byte 1728;
     - record header: 40 bytes, followed by one 40-byte descriptor per blob
       `{stream, meta_flags, bits, format, rel_offset, size, width, height, channels, frames, name_len, xxh32}`,
@@ -981,6 +981,10 @@ Packaging: `pzpdir.h` holds only declarations, types and constants. The whole
 implementation (format, writer, reader, tables, prefetcher with pthreads) is in
 `pzpdir.c`, which builds into `libpzpdir.so` (Python, DataLoader) and
 `libpzpdir.a` (static linking). Consumers link the library or vendor both files.
+`pzpdir.c` is split into parts, `pzpdir_*.inc.c` (format, detection, tables, word index,
+writer, reader, handle, collections, prefetcher, recovery, edits, groups), which it `#include`s
+in order: it stays one translation unit, so clients still compile only `pzpdir.c` (the parts
+must sit next to it) and every internal function stays `static`.
 Hashing uses the official single-header **xxHash** (BSD-2), vendored as
 `third_party/xxhash.h`: XXH32 for blobs and record headers, XXH64 for index
 sections, superblocks and key hashes. There is no new system dependency beyond zstd / lz4.

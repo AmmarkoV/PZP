@@ -12,7 +12,9 @@ Opens an archive (manifest, single shard, or collection) and shows:
     when the record has a `persons` table; text blobs shown as text; a 3-channel 8-bit PZP image
     can also be viewed as its segmentation (channel 0) or its 16-bit depth (channels 1+2), the
     layout of the combined label + depth files;
-  - an archive summary: members, shards (storage, recovery, AUTO prefetch mode), streams, tables.
+  - an archive summary: members, shards (storage, recovery, AUTO prefetch mode), streams, tables;
+  - the record's histograms (hist_rgb / hist_seg / hist_depth tables, spec §3.8) as bars over the
+    archive-wide ones as a line.
 The selected blob can be saved to a file.
 
 Usage:
@@ -143,6 +145,97 @@ def search_text_index(columns, needle):
     return np.unique(np.concatenate(hits)) if hits else np.zeros(0, dtype=np.int64)
 
 
+def histogram_kinds(archive):
+    """Kinds with a per-file histogram table `hist_<kind>` (record table `h:u16[256]`, spec §3.8), in table order."""
+    kinds = []
+    for t in archive.tables:
+        if t.startswith("hist_") and not t.endswith("_global"):
+            sc = archive.schema(t)
+            if not sc["global"] and [(n, ty, c) for n, ty, c, _o in sc["columns"]] == [("h", "u16", 256)]:
+                kinds.append(t[5:])
+    return kinds
+
+
+def global_histogram(archive, kind):
+    """
+    The archive-wide histogram of a kind as fractions (numpy float, 256), or None without `hist_<kind>_global`.
+    Several members are combined pixel-weighted with their `pixels` totals.
+    """
+    name = "hist_%s_global" % kind
+    if name not in archive.tables:
+        return None
+    acc, pixels = np.zeros(256), 0
+    for m in range(len(archive.members)):
+        try:
+            rows = archive.global_table(name, member=m)
+        except pzpdir.PzpdError:          # a missing member contributes nothing
+            continue
+        for r in rows:
+            acc += r["h"].astype(np.float64) / 65535.0 * int(r["pixels"])
+            pixels += int(r["pixels"])
+    return acc / pixels if pixels else None
+
+
+class HistogramPanel(wx.Panel):
+    """The selected record's histograms (bars) over the archive-wide ones (line), one band per kind (spec §3.8)."""
+
+    TITLES = {"rgb": "luminance", "seg": "segmentation labels", "depth": "depth (bin = depth >> 8)"}
+    COLOURS = {"rgb": wx.Colour(210, 210, 210), "seg": wx.Colour(120, 205, 120), "depth": wx.Colour(110, 160, 255)}
+
+    def __init__(self, parent):
+        super().__init__(parent, style=wx.FULL_REPAINT_ON_RESIZE)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.bands, self.message = [], ""
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+
+    def show(self, bands, message=""):
+        """bands: [(kind, this file's fractions or None, archive-wide fractions or None)]."""
+        self.bands, self.message = bands, message
+        self.Refresh()
+
+    def on_paint(self, _evt):
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(wx.Colour(40, 40, 40)))
+        dc.Clear()
+        dc.SetTextForeground(wx.Colour(220, 220, 220))
+        dc.SetFont(wx.Font(wx.FontInfo(8)))
+        W, H = self.GetClientSize()
+        if not self.bands:
+            dc.DrawText(self.message, 10, 10)
+            return
+        bh = H // len(self.bands)
+        for b, (kind, fh, gh) in enumerate(self.bands):
+            top, left, right = b * bh, 50, W - 10
+            pw, ph = max(1, right - left), max(1, bh - 34)
+            y0 = top + 18 + ph                          # the plot's baseline
+            ymax = max([float(x.max()) for x in (fh, gh) if x is not None] + [1e-6])
+            colour = self.COLOURS.get(kind, wx.Colour(230, 180, 90))
+            what = "this file (bars)" if fh is not None else "this file: none"
+            dc.DrawText("%s  -  %s, archive (line)%s   peak %.1f%%" % (self.TITLES.get(kind, kind), what, "" if gh is not None else ": none", 100 * ymax), left, top + 2)
+            dc.SetPen(wx.Pen(wx.Colour(90, 90, 90)))
+            dc.DrawLine(left, y0, right, y0)
+            for v in (0, 64, 128, 192, 255):            # bin ticks
+                x = left + int((v + 0.5) * pw / 256)
+                dc.DrawLine(x, y0, x, y0 + 3)
+                tw = dc.GetTextExtent(str(v))[0]
+                dc.DrawText(str(v), min(x - tw // 2, right - tw), y0 + 3)
+            dc.DrawText("%.0f%%" % (100 * ymax), 4, top + 16)
+            if fh is not None:
+                dc.SetPen(wx.TRANSPARENT_PEN)
+                dc.SetBrush(wx.Brush(colour))
+                for i in range(256):
+                    h = int(round(fh[i] / ymax * ph))
+                    if h > 0:
+                        x0, x1 = left + i * pw // 256, left + (i + 1) * pw // 256
+                        dc.DrawRectangle(x0, y0 - h, max(1, x1 - x0), h)
+            if gh is not None:
+                dc.SetPen(wx.Pen(wx.Colour(255, 120, 60), 2))
+                dc.DrawLines([wx.Point(left + int((i + 0.5) * pw / 256), y0 - int(round(gh[i] / ymax * ph))) for i in range(256)])
+            if kind == "seg" and fh is not None:        # which labels the file holds most
+                top3 = [i for i in np.argsort(-fh)[:3] if fh[i] > 0]
+                dc.DrawText("labels: " + "  ".join("%d %.1f%%" % (i, 100 * fh[i]) for i in top3), right - 260, top + 2 + 14)
+
+
 class RecordList(wx.ListCtrl):
     """Virtual list of the (filtered) records: ordinal, key, member."""
 
@@ -269,8 +362,11 @@ class ViewerFrame(wx.Frame):
         self.archiveText = wx.TextCtrl(self.tabs, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
         self.recordText.SetFont(mono)
         self.archiveText.SetFont(mono)
+        self.hist = HistogramPanel(self.tabs)
         self.tabs.AddPage(self.recordText, "Record")
         self.tabs.AddPage(self.archiveText, "Archive")
+        self.tabs.AddPage(self.hist, "Histograms")
+        self.hist_kinds, self.hist_global = [], {}
         rsplit.SplitHorizontally(self.preview, self.tabs, 470)
         rsplit.SetMinimumPaneSize(80)
         rs = wx.BoxSizer(wx.VERTICAL)
@@ -316,6 +412,8 @@ class ViewerFrame(wx.Frame):
         else:
             self.overlay.SetToolTip("this archive has no persons table")
         self.archiveText.SetValue(self.archive_summary())
+        self.hist_kinds = histogram_kinds(a)
+        self.hist_global = {k: global_histogram(a, k) for k in self.hist_kinds}
         self.SetStatusText("%d records, %d streams, %d tables" % (len(a), len(a.streams), len(a.tables)))
         if len(a):
             self.records.Select(0)
@@ -384,7 +482,19 @@ class ViewerFrame(wx.Frame):
     def on_select(self, evt):
         self.current = self.records.ordinals[evt.GetIndex()]
         self.recordText.SetValue(self.record_summary(self.current))
+        self.show_histograms()
         self.show_preview()
+
+    def show_histograms(self):
+        a, o = self.archive, self.current
+        if not self.hist_kinds:
+            self.hist.show([], "this archive has no histogram tables (add them with scripts/pzpdir_histograms.py)")
+            return
+        bands = []
+        for k in self.hist_kinds:
+            rows = a.table(o, "hist_" + k)
+            bands.append((k, rows["h"][0].astype(np.float64) / 65535.0 if len(rows) else None, self.hist_global.get(k)))
+        self.hist.show(bands)
 
     def record_summary(self, o):
         a = self.archive
@@ -417,6 +527,9 @@ class ViewerFrame(wx.Frame):
                         arr = np.asarray(v, dtype=np.float64)
                         fields.append("%s=[%d values, norm %.4f: %s ...]" % (name, count, float(np.linalg.norm(arr)),
                                                                           ", ".join("%.4g" % x for x in arr[:6])))
+                    elif count > 16:                   # long integer arrays, e.g. histograms (Histograms tab)
+                        arr = np.asarray(v, dtype=np.int64)
+                        fields.append("%s=[%d values, sum %d: %s ...]" % (name, count, int(arr.sum()), ", ".join(str(x) for x in arr[:8])))
                     else:
                         fields.append("%s=%s" % (name, np.asarray(v).tolist()))
                 out.append("  " + "  ".join(fields))

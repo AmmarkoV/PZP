@@ -250,6 +250,15 @@ dated revisions, recorded in the changelog below.
     - **Measured:** on 1 M synthetic records, the surface view opens in ~0 ms (from the manifest) and the canonical view
       in 190 ms (unions for 6 synonym rules). A word's postings take 1–60 ms, and a record's word list 25–210 ns.
 
+- **v0.4 revision 13 (2026-09-23): histograms (§3.8)**, a table convention with no format change.
+  - **Tables:** per-file `hist_rgb` (luminance), `hist_seg` (labels) and `hist_depth` (16-bit depth in 256 fixed bins,
+    `depth >> 8`) as bulk record tables `h:u16[256]`, plus global `hist_<kind>_global` rows
+    `h:u16[256], pixels:u64, files:u64`.
+  - **Values:** fractions of the pixels (65535 = 1.0), with the global rows pixel-weighted.
+  - **Tools:** built by `scripts/pzpdir_histograms.py` and checked by `tests/check_histograms.py`.
+  - **Verified on COCO val2017** (5000 files, 1.37 G pixels): 500 random rows and all three global rows equal an
+    independent recomputation.
+
 ---
 
 ## 1. Problem
@@ -736,6 +745,32 @@ a.word_sources("descriptions.text")            # ['deepseekvl2', 'old']; None = 
 At ImageNet scale (1.28 M records, ~16 words each, two sources) that is ≈ 365 MB, about 0.25% of the
 data. It is stored uncompressed for zero-parse `mmap`. Delta-varint postings
 (measured 3.4× smaller) are a possible later option.
+
+### 3.8 Histograms: per-file and archive-wide pixel distributions (revision 13)
+
+**What.** 256-bin histograms of the image streams, stored as **ordinary tables**, so there is no format change.
+Each file gets one row, and each archive one global row. They serve dataset statistics, class and depth
+balancing, and outlier checks. None of them needs a pixel decoded at training time.
+
+| Table | Kind | Schema | Bins |
+|---|---|---|---|
+| `hist_rgb` | record, `bulk` | `h:u16[256]` | luminance of RGB images: Pillow's `convert("L")` rule `(19595 R + 38470 G + 7471 B + 32768) >> 16`; grayscale images as they are; 16-bit images by their high byte |
+| `hist_seg` | record, `bulk` | `h:u16[256]` | segmentation labels 0..255 (an 8-bit channel, by default channel 0 of the label + depth files) |
+| `hist_depth` | record, `bulk` | `h:u16[256]` | 16-bit depth in 256 **fixed** bins, `bin = depth >> 8` (a 16-bit single-channel image, or high / low byte channels, by default 1 and 2) |
+| `hist_<kind>_global` | global | `h:u16[256], pixels:u64, files:u64` | the same bins over every file of the archive |
+
+- **Values are fractions of the pixels**, `u16` with 65535 = 1.0. Each bin is rounded to nearest,
+  `(count × 65535 + total / 2) / total`, so a row sums to 65535 within rounding.
+- **The global row is pixel-weighted:** the files' pixel counts are summed, then normalized.
+  `pixels` and `files` are its totals, so the global rows of several archives opened as one
+  combine pixel-weighted as `Σ h_i × pixels_i / Σ pixels_i`.
+- **A record without a blob in the stream has no row** (0 rows).
+- **Built by `src/pzpdir/scripts/pzpdir_histograms.py`**
+  (`--rgb STREAM --seg STREAM[:CH] --depth STREAM[:H,L]`). It decodes every blob (PZP natively, others through
+  Pillow) and adds or replaces the tables with table edits (§7), so no record data is rewritten. Run it again after
+  the files change. `tests/check_histograms.py` recomputes them independently.
+- **Size:** 512 B per file and stream (7.7 MB for the three tables of COCO val2017; ~2 GB for three streams of
+  1.28 M ImageNet records, bulk, so not copied into record headers).
 
 ## 4. On-disk format (all little-endian)
 

@@ -389,6 +389,40 @@ def test_words():
         assert a.verify()
 
 
+def test_histograms():
+    """scripts/pzpdir_histograms.py (spec §3.8) against tests/check_histograms.py's independent recomputation."""
+    import subprocess
+    from PIL import Image
+    d = fresh("hist")
+    path = os.path.join(d, "h.pzpd")
+    r = np.random.default_rng(5)
+
+    def png(arr):
+        b = io.BytesIO()
+        Image.fromarray(arr).save(b, format="PNG")
+        return b.getvalue()
+    with pzpdir.Writer(path, ["rgb", "lab", "dep"], align=64, shard_size="16K") as w:
+        for i in range(24):
+            with w.record("k%d" % i):
+                hw = (9 + i, 13 + i)
+                if i != 3:
+                    w.add("rgb", "k%d.png" % i, png(r.integers(0, 256, hw + (3,), dtype=np.uint8)))
+                w.add("lab", "k%d.l.png" % i, png(r.integers(0, 40, hw, dtype=np.uint8)))
+                w.add("dep", "k%d.d.png" % i, png(r.integers(0, 65536, hw, dtype=np.uint16)))
+    env = dict(os.environ, PYTHONPATH=os.path.join(HERE, "..", ".."))
+    run = lambda *a: subprocess.run([sys.executable] + list(a), env=env, capture_output=True, text=True)
+    t = run(os.path.join(HERE, "..", "scripts", "pzpdir_histograms.py"), path, "--rgb", "rgb", "--seg", "lab", "--depth", "dep", "--workers", "2")
+    assert t.returncode == 0, t.stderr
+    c = run(os.path.join(HERE, "check_histograms.py"), path, "--rgb", "rgb", "--seg", "lab", "--depth", "dep")
+    assert c.returncode == 0, c.stdout + c.stderr
+    with pzpdir.open(path) as a:
+        idx, rows = a.table_all("hist_rgb")
+        assert idx[4] - idx[3] == 0 and len(rows) == 23 and rows["h"].dtype == np.uint16    # record 3 has no rgb
+        g = a.global_table("hist_depth_global")
+        assert int(g["files"][0]) == 24 and abs(int(g["h"][0].astype(np.int64).sum()) - 65535) <= 128
+        assert a.verify()
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

@@ -217,6 +217,12 @@ class ViewerFrame(wx.Frame):
         if a.streams:
             self.stream.SetSelection(0)
         self.records.set_records(a, list(range(len(a))))
+        has_persons = "persons" in a.tables   # an archive packed without annotations has nothing to draw
+        self.overlay.Enable(has_persons)
+        if has_persons:
+            self.overlay.UnsetToolTip()
+        else:
+            self.overlay.SetToolTip("this archive has no persons table")
         self.archiveText.SetValue(self.archive_summary())
         self.SetStatusText("%d records, %d streams, %d tables" % (len(a), len(a.streams), len(a.tables)))
         if len(a):

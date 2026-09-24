@@ -15,10 +15,12 @@ Opens an archive (manifest, single shard, or collection) and shows:
   - an archive summary: members, shards (storage, recovery, AUTO prefetch mode), streams, tables;
   - the record's histograms (hist_rgb / hist_seg / hist_depth tables, spec §3.8) as bars over the
     archive-wide ones as a line.
-The selected blob can be saved to a file.
+The selected blob can be saved to a file as is, the previewed image as a .png (at the view's own bit
+depth where PNG allows it: 8 or 16-bit greyscale, 8-bit RGB / RGBA; otherwise as displayed), and the
+Record / Archive tab text as a .txt.
 
 Usage:
-    python3 pzpdir_viewer.py [archive.pzpd]
+    python3 scripts/pzpdir_viewer.py [archive.pzpd]
 
 Needs wxPython, numpy (>= 2.0, for the search indexes), PIL, and the PZP Python package (pzp.pzpdir); when that isn't installed
 it is taken from this repository's src/ directory.
@@ -32,11 +34,12 @@ import sys
 
 import numpy as np
 import wx
+from PIL import Image
 
 try:
     import pzp.pzpdir as pzpdir
 except ImportError:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
     import pzp.pzpdir as pzpdir
 
 IMAGE_FORMATS = {"JPEG", "PNG", "PZP", "PZPC", "PNM", "PFM"}
@@ -101,6 +104,25 @@ def to_display(arr):
     if arr.shape[2] == 1:
         arr = np.repeat(arr, 3, axis=2)
     return np.ascontiguousarray(arr)
+
+
+def png_image(data, rgb):
+    """
+    The PIL image to save for a previewed view: data itself when PNG holds it losslessly (uint8 with
+    1 / 3 / 4 channels, uint16 greyscale), otherwise rgb, the 8-bit display version.
+    """
+    if data.ndim == 3 and data.shape[2] == 1:
+        data = data[:, :, 0]
+    if data.dtype == np.uint8 and (data.ndim == 2 or data.shape[2] in (3, 4)):
+        return Image.fromarray(np.ascontiguousarray(data))
+    if data.dtype == np.uint16 and data.ndim == 2:
+        return Image.fromarray(np.ascontiguousarray(data))   # I;16
+    return Image.fromarray(rgb)
+
+
+def safe_filename(text):
+    """text with the characters that do not belong in a file name replaced by '_'."""
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in text)
 
 
 def build_key_index(archive):
@@ -312,12 +334,15 @@ class ViewerFrame(wx.Frame):
     def __init__(self, path=None):
         super().__init__(None, title="pzpdir viewer", size=(1280, 820))
         self.archive, self.path, self.current = None, None, None
+        self.shown = None        # (stream, view, view data, display rgb) of the previewed image, for Save image
         self.key_index = None    # build_key_index() of the open archive, built on the first key search
         self.text_index = None   # build_text_index() of the open archive, built on the first text search
 
         menu = wx.Menu()
         self.Bind(wx.EVT_MENU, self.on_open, menu.Append(wx.ID_OPEN, "&Open...\tCtrl+O"))
         self.Bind(wx.EVT_MENU, self.on_save_blob, menu.Append(wx.ID_SAVEAS, "&Save blob...\tCtrl+S"))
+        self.Bind(wx.EVT_MENU, self.on_save_image, menu.Append(wx.ID_ANY, "Save image as &PNG...\tCtrl+E"))
+        self.Bind(wx.EVT_MENU, self.on_save_text, menu.Append(wx.ID_ANY, "Save &text as TXT...\tCtrl+T"))
         menu.AppendSeparator()
         self.Bind(wx.EVT_MENU, lambda _e: self.Close(), menu.Append(wx.ID_EXIT, "&Quit\tCtrl+Q"))
         bar = wx.MenuBar()
@@ -488,7 +513,7 @@ class ViewerFrame(wx.Frame):
     def show_histograms(self):
         a, o = self.archive, self.current
         if not self.hist_kinds:
-            self.hist.show([], "this archive has no histogram tables (add them with scripts/pzpdir_histograms.py)")
+            self.hist.show([], "this archive has no histogram tables (add them with src/pzpdir/scripts/pzpdir_histograms.py)")
             return
         bands = []
         for k in self.hist_kinds:
@@ -543,6 +568,7 @@ class ViewerFrame(wx.Frame):
             return
         st = a.streams[self.stream.GetSelection()]
         inf = a.info(o, st)
+        self.shown = None
         self.view.Disable()   # enabled again below once an image with several views is decoded
         if inf is None:
             self.preview.show(message="record %d has no %s blob" % (o, st))
@@ -587,6 +613,7 @@ class ViewerFrame(wx.Frame):
             else:
                 size = (rgb.shape[1], rgb.shape[0])
         self.preview.show(rgb, persons, size)
+        self.shown = (st, view, data, rgb)
         self.SetStatusText("%s  %s  %dx%d x%d @%d bit%s" % (a.key(o), st, inf["width"], inf["height"], inf["channels"], inf["bits"], detail))
 
     # --- menu ---------------------------------------------------------------------------------
@@ -610,6 +637,52 @@ class ViewerFrame(wx.Frame):
                 with open(dlg.GetPath(), "wb") as f:
                     f.write(a.read(o, st))
                 self.SetStatusText("saved %s (%d bytes)" % (dlg.GetPath(), inf["size"]))
+
+    def on_save_image(self, _evt):
+        if self.shown is None:
+            self.SetStatusText("no image previewed to save")
+            return
+        st, view, data, rgb = self.shown
+        suffix = {SEGMENTATION_VIEW: "_seg", DEPTH_VIEW: "_depth"}.get(view, "")
+        name = safe_filename("%s_%s%s.png" % (self.archive.key(self.current), st, suffix))
+        with wx.FileDialog(self, "Save image as PNG", defaultFile=name, wildcard="PNG images (*.png)|*.png",
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            path = dlg.GetPath()
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        img = png_image(data, rgb)
+        try:
+            img.save(path)
+        except OSError as e:
+            wx.MessageBox("Cannot save %s:\n%s" % (path, e), "pzpdir viewer", wx.ICON_ERROR)
+            return
+        self.SetStatusText("saved %s (%dx%d %s)" % (path, img.width, img.height, img.mode))
+
+    def on_save_text(self, _evt):
+        if self.archive is None:
+            return
+        if self.tabs.GetCurrentPage() is self.archiveText:
+            text, name = self.archiveText.GetValue(), os.path.basename(self.path) + "_summary.txt"
+        elif self.current is not None:
+            text, name = self.recordText.GetValue(), self.archive.key(self.current) + ".txt"
+        else:
+            return
+        with wx.FileDialog(self, "Save text as TXT", defaultFile=safe_filename(name), wildcard="Text files (*.txt)|*.txt",
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            path = dlg.GetPath()
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            wx.MessageBox("Cannot save %s:\n%s" % (path, e), "pzpdir viewer", wx.ICON_ERROR)
+            return
+        self.SetStatusText("saved %s (%d lines)" % (path, text.count("\n") + 1))
 
     def on_close(self, evt):
         if self.archive is not None:

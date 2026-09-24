@@ -118,6 +118,28 @@ Dependencies: `pip install numpy pygame`
 
 ---
 
+## `pzpdir_viewer.py` — browse `.pzpd` archives
+
+wxPython explorer for pzpdir archives (manifest, single shard, or collection).
+Lists the records (filter by key, or by the text of the record tables), shows
+every blob and table row of the selected record, previews any image stream
+(persons drawn on top when the archive has a `persons` table), and shows an
+archive summary and the per-record histograms.
+
+```bash
+python3 scripts/pzpdir_viewer.py archive.pzpd
+```
+
+| Menu (File) | Action |
+|---|---|
+| `Save blob...` (Ctrl+S) | The selected stream's blob, byte for byte |
+| `Save image as PNG...` (Ctrl+E) | The previewed image / view; kept at its own bit depth when PNG can hold it (8 or 16-bit greyscale, 8-bit RGB / RGBA), otherwise saved as displayed |
+| `Save text as TXT...` (Ctrl+T) | The Record tab (or the Archive tab when that one is shown) |
+
+Dependencies: `pip install wxPython numpy Pillow` (numpy >= 2.0)
+
+---
+
 ## `compare_load_speed.py` — compare load speed: PNG vs PZP
 
 Loads every matched pair from two directories (one PNG, one PZP) using

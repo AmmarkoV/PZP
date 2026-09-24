@@ -111,5 +111,5 @@ python3 -c "import PZP; img = PZP.read('output.pzp'); print(img.shape)"
 | CLI subcommands and flags | [doc/cli.md](doc/cli.md) |
 | C API (`pzp.h`) and shared library (`libpzp.so`) ABI | [doc/c-api.md](doc/c-api.md) |
 | Python package — read, write, container API, thread lifecycle | [doc/python-api.md](doc/python-api.md) |
-| Scripts — encode_directory, encode_animation_with_sound, pzp-player, benchmark | [doc/scripts.md](doc/scripts.md) |
+| Scripts — encode_directory, encode_animation_with_sound, pzp-player, pzpdir_viewer, benchmark | [doc/scripts.md](doc/scripts.md) |
 | Performance benchmarks and SIMD notes | [doc/performance.md](doc/performance.md) |

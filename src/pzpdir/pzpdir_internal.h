@@ -571,7 +571,8 @@ struct pzpd_sdict
     uint64_t *off;           ///< Bytes of id in `bytes`
     uint32_t *len;           ///< Their length
     uint64_t *hash;          ///< Their XXH64
-    uint32_t  n, ecap;       ///< Ids, capacity of off / len / hash
+    uint32_t  n;             ///< Ids in use
+    uint32_t  ecap;          ///< Capacity of off / len / hash
     struct pzpd_buf bytes;   ///< Every string
 };
 
@@ -612,7 +613,10 @@ struct pzpd_wsub
     uint64_t    postings;            ///< Shard: record-word pairs
     const struct pzpd_disk_word  *vocab;   ///< Shard vocabulary
     const struct pzpd_disk_mword *mvocab;  ///< Manifest vocabulary
-    const uint32_t *post_index, *post, *fwd_index, *fwd;  ///< Shard CSR parts
+    const uint32_t *post_index;      ///< Shard: (words + 1) postings starts
+    const uint32_t *post;            ///< Shard: postings (shard-local ordinals, ascending per word)
+    const uint32_t *fwd_index;       ///< Shard: (records + 1) forward list starts
+    const uint32_t *fwd;             ///< Shard: forward lists (word ids, ascending per record)
     const char *heap;                ///< Word bytes
     uint64_t    heap_bytes;          ///< Their size
 };
@@ -821,7 +825,11 @@ struct pzpd_went
 };
 
 /** @brief A byte string pointer + length (source values). */
-struct pzpd_bstr { const char *s; uint32_t len; };
+struct pzpd_bstr
+{
+    const char *s;    ///< Bytes (not NUL-terminated)
+    uint32_t    len;  ///< Their length
+};
 
 //-----------------------------------------------------------------------------------------------
 // Handles: collections of archives (pzpdir_handle.c)
@@ -976,6 +984,7 @@ PZPD_INTERNAL struct pzpd_rshard *pzpd_shard(struct pzpd_archive *a, unsigned i)
 PZPD_INTERNAL int pzpd_shard_of(const struct pzpd_archive *a, uint64_t ordinal);
 PZPD_INTERNAL struct pzpd_rshard *pzpd_locate(struct pzpd_archive *a, uint64_t ordinal, uint64_t *local);
 PZPD_INTERNAL const struct pzpd_disk_blob *pzpd_blob_entry(const struct pzpd_rshard *s, uint64_t local, unsigned stream);
+PZPD_INTERNAL void pzpd_blob_meta_of(const struct pzpd_disk_blob *b, pzpd_blob_meta *m);
 PZPD_INTERNAL struct pzpd_archive *pzpd_arch_open(const char *path, unsigned int flags);
 PZPD_INTERNAL void pzpd_arch_close(struct pzpd_archive *a);
 PZPD_INTERNAL int pzpd_shard_wsec(const struct pzpd_rshard *s, unsigned j, struct pzpd_wsec *v);

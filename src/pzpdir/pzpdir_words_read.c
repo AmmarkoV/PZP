@@ -287,7 +287,12 @@ static int pzpd_words_synonyms(pzpd *a, struct pzpd_sdict *from, struct pzpd_buf
 }
 
 /** @brief A surface word with its canonical form, for grouping (pzpd_words_open()). */
-struct pzpd_wcanon { const char *c; uint32_t clen; uint32_t sid; };
+struct pzpd_wcanon
+{
+    const char *c;     ///< Canonical word bytes (the surface word itself without a synonym rule)
+    uint32_t    clen;  ///< Their length
+    uint32_t    sid;   ///< Surface word id
+};
 
 static int pzpd_cmp_wcanon(const void *a, const void *b)
 {

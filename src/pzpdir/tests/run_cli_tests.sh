@@ -298,6 +298,22 @@ if [ $RC = 99 ] && [ $EXTRA = 1 ] && "$BIN" verify "$E/arc/a.pzpd" --blobs >/dev
 "$BIN" replace-stream "$E/arc/a.pzpd" depth "$E/depth2.tsv" --missing drop >/dev/null 2>"$T/err" || bad "rerun replace-stream: `cat $T/err`"
 rm -rf "$E/u1" "$E/u2"; "$BIN" unpack "$E/arc/a.pzpd" "$E/u1" >/dev/null 2>&1; "$BIN" unpack "$E/ref/a.pzpd" "$E/u2" >/dev/null 2>&1
 if diff -r "$E/u1" "$E/u2" >/dev/null && [ "`ls "$E/u1/depth2" | wc -l`" = 20 ] && [ ! -d "$E/u1/depth" ]; then ok "replace-stream --missing drop: 20 new depth files, the rest dropped; = uninterrupted"; else bad "replace-stream result differs"; fi
+# An interrupted table edit also leaves a shard ahead of the manifest: replace-stream must still rewrite it
+for i in $(seq 0 39); do head -c $((300+i)) /dev/urandom > "$E/src/f$i.png"; printf 'k%d\tdepth\t%s\tdepth3/f%d.png\n' $i "$E/src/f$i.png" $i; done > "$E/depth3.tsv"
+"$BIN" replace-stream "$E/ref/a.pzpd" depth "$E/depth3.tsv" >/dev/null 2>&1 || bad "reference replace-stream (depth3)"
+PZPDIR_TEST_CRASH=flip:1 "$BIN" replace-table "$E/arc/a.pzpd" text "$E/text.tsv" >/dev/null 2>&1; RC=$?
+"$BIN" replace-stream "$E/arc/a.pzpd" depth "$E/depth3.tsv" >/dev/null 2>"$T/err" || bad "replace-stream after an interrupted table edit: `cat $T/err`"
+"$BIN" replace-table "$E/arc/a.pzpd" text "$E/text.tsv" >/dev/null 2>"$T/err" || bad "rerun replace-table: `cat $T/err`"
+rm -rf "$E/u1" "$E/u2"; "$BIN" unpack "$E/arc/a.pzpd" "$E/u1" >/dev/null 2>&1; "$BIN" unpack "$E/ref/a.pzpd" "$E/u2" >/dev/null 2>&1
+if [ $RC = 99 ] && diff -r "$E/u1" "$E/u2" >/dev/null && same_as_ref x "text score persons"; then ok "replace-stream after an interrupted table edit rewrites the shard that edit left ahead of the manifest"; else bad "replace-stream skipped a shard an interrupted table edit left ahead (rc $RC)"; fi
+# replace-stream's own crash after 2 shards: the rerun skips them (same inode) and ends like the uninterrupted edit
+for i in $(seq 0 29); do head -c $((500+i)) /dev/urandom > "$E/src/g$i.png"; printf 'k%d\tdepth\t%s\tdepth4/g%d.png\n' $i "$E/src/g$i.png" $i; done > "$E/depth4.tsv"
+"$BIN" replace-stream "$E/ref/a.pzpd" depth "$E/depth4.tsv" --missing drop >/dev/null 2>&1 || bad "reference replace-stream (depth4)"
+PZPDIR_TEST_CRASH=shard:2 "$BIN" replace-stream "$E/arc/a.pzpd" depth "$E/depth4.tsv" --missing drop >/dev/null 2>&1; RC=$?
+INO=`stat -c %i "$E/arc/a.00000.pzpd"`
+"$BIN" replace-stream "$E/arc/a.pzpd" depth "$E/depth4.tsv" --missing drop >/dev/null 2>"$T/err" || bad "rerun replace-stream (depth4): `cat $T/err`"
+rm -rf "$E/u1" "$E/u2"; "$BIN" unpack "$E/arc/a.pzpd" "$E/u1" >/dev/null 2>&1; "$BIN" unpack "$E/ref/a.pzpd" "$E/u2" >/dev/null 2>&1
+if [ $RC = 99 ] && [ "$INO" = "`stat -c %i "$E/arc/a.00000.pzpd"`" ] && diff -r "$E/u1" "$E/u2" >/dev/null && same_as_ref x "text score persons"; then ok "replace-stream killed after 2 of $NSH shards, rerun: done shards skipped, = uninterrupted"; else bad "resumed replace-stream (rc $RC)"; fi
 if ! "$BIN" add-stream "$E/arc/a.pzpd" rgb "$E/depth.tsv" >/dev/null 2>"$T/err" && grep -q "expected key" "$T/err"; then ok "a list for another stream is refused with its line"; else bad "stream list check: `cat $T/err`"; fi
 printf 'k1\tdepth\t%s\tsub dir/f2.bin\n' "$E/src/d1.png" > "$E/clash.tsv"
 if ! "$BIN" replace-stream "$E/arc/a.pzpd" depth "$E/clash.tsv" >/dev/null 2>"$T/err" && grep -q "already exists" "$T/err"; then ok "a new name that exists elsewhere in the archive is refused before anything is written"; else bad "name clash: `cat $T/err`"; fi

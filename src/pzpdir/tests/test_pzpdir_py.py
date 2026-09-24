@@ -82,7 +82,7 @@ def fresh(name):
 
 def test_abi():
     """ctypes structs have the C sizes (x86-64 / LP64 values from sizeof in pzpdir.h)."""
-    want = {"Group": 40, "BlobMeta": 20, "BlobInfo": 72, "BlobRef": 24, "ShardInfo": 48, "Column": 16, "Schema": 32, "TableView": 56,
+    want = {"Group": 40, "BlobMeta": 20, "BlobInfo": 72, "BlobRef": 40, "ShardInfo": 48, "Column": 16, "Schema": 32, "TableView": 56,
             "PrefetchOpts": 32, "Ticket": 32, "PrefetchStats": 136, "WriterOpts": 32, "EditRows": 32, "EditBlob": 40,
             "SalvagedBlob": 72, "SalvagedRows": 72, "SalvagedRecord": 64, "SalvageInfo": 816}
     for name, size in want.items():
@@ -171,6 +171,8 @@ def test_prefetcher_modes_and_threads():
                                 want = exp.get((i, s))
                                 if (want is None) != (s not in rec) or (want is not None and bytes(rec[s]) != want):
                                     errors.append((i, s))
+                                elif want is not None and rec.meta[s] != {k: v for k, v in a.info(i, s).items() if k in rec.meta[s]}:
+                                    errors.append((i, s, "meta"))
                 th = [threading.Thread(target=worker, args=(t,)) for t in range(4)]
                 [x.start() for x in th]
                 [x.join() for x in th]

@@ -179,7 +179,9 @@ dated revisions, recorded in the changelog below.
     shard. Copied blobs keep their stored metadata bits exactly; new files are detected. The new stream is appended
     last; a dropped one is removed from the stream table (stream ids after it shift).
   - **Resume:** rerunning the same command finishes an interrupted edit: add / drop are recognised by content, a
-    replaced stream by the shard's generation being ahead of the manifest's, a replaced table is simply redone.
+    replaced stream by the shard's generation being ahead of the manifest's **and** its content (every listed file
+    already stored as the stream's blob with the same name, size and XXH32; with `--missing drop`, no other record
+    has the stream), since an interrupted table edit or compact also leaves a shard ahead; a replaced table is simply redone.
     Until then the manifest may be stale for edited shards (their tables / streams differ).
   - **Limits:** record-header row copies keep the packed rows (salvage after a table edit recovers the packed
     version; after `drop-table`, the copies' table ids refer to the packed table list). Metadata JSON keeps the
@@ -1078,7 +1080,10 @@ const void*pzpd_view(pzpd *a, uint64_t ordinal, unsigned stream, size_t *size); 
 ssize_t    pzpd_read_record(pzpd *a, uint64_t ordinal, uint32_t stream_mask,
                             void *buf, size_t cap, pzpd_blob_ref refs[/*S*/]);
            // reads the smallest byte span covering the requested streams;
-           // refs[s] = {ptr into buf, size, type} or {NULL,0} if absent / not requested
+           // refs[s] = {ptr into buf, size, format, meta} or all zero if absent / not requested;
+           // meta = the blob's stored format + dimensions (as pzpd_blob_info_get()), so a decoder knows
+           // width x height x channels @ bits before parsing the file. Same for pzpd_read_range() and
+           // pzpd_prefetch_get(). A present but empty blob is reported (size 0), not treated as absent
 size_t     pzpd_record_span(const pzpd *a, uint64_t ordinal, uint32_t stream_mask); // buffer size needed
 
 // ---- tables (§3.6): index-resident, no data I/O, zero-copy pointers into mmap ----

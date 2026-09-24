@@ -66,8 +66,8 @@ struct pzpd_tok
 {
     struct pzpd_buf word;   ///< Its bytes (ASCII, lower-case)
     int  foreign;           ///< 1 once a non-ASCII word character joined it: the word is dropped (spec §3.7)
-    int  (*emit)(const char *, size_t, void *);
-    void *user;
+    int  (*emit)(const char *, size_t, void *); ///< Called per word; non-zero stops the tokenizer
+    void *user;             ///< Passed to emit
     size_t emitted;         ///< Words emitted
     int  stop;              ///< 1 after emit asked to stop
 };
@@ -213,10 +213,19 @@ PZPD_INTERNAL int64_t pzpd_sdict_id(struct pzpd_sdict *d, const char *s, size_t 
 }
 
 /** @brief One word occurrence in a record: (word id, source id; 0 = no source). */
-struct pzpd_wocc { uint32_t tid; uint32_t sid; };
+struct pzpd_wocc
+{
+    uint32_t tid;  ///< Word id (builder dictionary)
+    uint32_t sid;  ///< Source id + 1, 0 = no source
+};
 
 /** @brief One (word, record, occurrences) pair of a sub-index, in record order. */
-struct pzpd_wpair { uint32_t tid; uint32_t rec; uint32_t cnt; };
+struct pzpd_wpair
+{
+    uint32_t tid;  ///< Word id (builder dictionary)
+    uint32_t rec;  ///< Shard-local record
+    uint32_t cnt;  ///< Occurrences of the word in the record
+};
 
 static int pzpd_cmp_wocc(const void *a, const void *b)
 {
@@ -270,8 +279,8 @@ PZPD_INTERNAL int pzpd_buf_pad8(struct pzpd_buf *b)
 /** @brief One sub-index serialized: pzpd_disk_subindex offsets relative to the start of `parts`. */
 struct pzpd_wsub_out
 {
-    struct pzpd_disk_subindex head;
-    struct pzpd_buf parts;
+    struct pzpd_disk_subindex head;  ///< Sub-index head, offsets relative to `parts`
+    struct pzpd_buf parts;           ///< Vocabulary, postings, forward lists and heap, each 8-aligned
 };
 
 /** @brief Build one sub-index from its pairs (record order, word ids ascending within a record). */
@@ -491,7 +500,12 @@ PZPD_INTERNAL int pzpd_words_build(struct pzpd_buf *out, const struct pzpd_wsrc 
 }
 
 /** @brief Tokenizer callback that counts the words and keeps the first. */
-struct pzpd_one_word { const char *w; size_t len; unsigned n; };
+struct pzpd_one_word
+{
+    const char *w;    ///< First word
+    size_t      len;  ///< Its length
+    unsigned    n;    ///< Words seen
+};
 
 static int pzpd_one_word_emit(const char *w, size_t len, void *user)
 {

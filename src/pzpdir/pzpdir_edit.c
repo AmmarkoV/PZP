@@ -708,6 +708,57 @@ static int pzpd_rewrite_shard(struct pzpd_archive *sa, unsigned newS, char names
     return ok;
 }
 
+/** @brief Resume check of replace-stream for a shard whose generation is ahead of the manifest. Its generation was
+ *  raised either by an interrupted run of this edit (the shard holds the new files) or by another interrupted edit
+ *  (a table edit or compact: the shard still holds the old files), so the content decides: every input file of the
+ *  shard's records is the stream's blob (same name, size and XXH32), and with PZPD_EDIT_DROP_MISSING no other record
+ *  has a blob in the stream.
+ *  @return 1 if the shard is already edited, 0 if it still needs the rewrite (also when a file can't be read: the
+ *          rewrite then reports it). */
+static int pzpd_stream_replaced(struct pzpd_archive *sa, const char *stream, const pzpd_edit_blob *blobs, size_t n, const struct pzpd_ekey *keys, unsigned flags)
+{
+    struct pzpd_rshard *s = &sa->shards[0];
+    int st = -1;
+    for (unsigned u = 0; u < sa->S; u++) { if (!strcmp(sa->streams[u], stream)) { st = (int) u; } }
+    unsigned char *buf = (unsigned char *) malloc(1u << 20);
+    XXH32_state_t *xs = XXH32_createState();
+    int same = (st >= 0) && (buf != NULL) && (xs != NULL);
+    for (uint64_t i = 0; same && (i < s->sb.record_count); i++)
+    {
+        size_t kl = 0;
+        const char *key = pzpd_arch_record_key(sa, i, &kl);
+        const struct pzpd_disk_blob *b = (key != NULL) ? pzpd_blob_entry(s, i, (unsigned) st) : NULL;
+        if (b == NULL) { same = 0; break; }
+        const pzpd_edit_blob *src = NULL;
+        uint64_t h = XXH64(key, kl, 0);
+        for (size_t e = pzpd_ekey_find(keys, n, h); (e < n) && (keys[e].hash == h); e++)
+        {
+            const pzpd_edit_blob *c = &blobs[keys[e].idx];
+            if ( (c->key_len == kl) && !memcmp(c->key, key, kl) ) { src = c; break; }
+        }
+        if (src == NULL) { same = !( (flags & PZPD_EDIT_DROP_MISSING) && (b->rel_offset != PZPD_MISSING) ); continue; }
+        uint32_t want = 0;
+        same = (b->rel_offset != PZPD_MISSING) && (b->name_len == src->name_len) && !memcmp(s->heap + b->name_offset, src->name, src->name_len) &&
+               pzpd_header_blob_xxh(s, i, (unsigned) st, &want);
+        // Same name: the bytes decide (a replacement may keep the names)
+        int fd = same ? open(src->path, O_RDONLY | O_CLOEXEC) : -1;
+        struct stat fs;
+        same = same && (fd >= 0) && (fstat(fd, &fs) == 0) && ((uint64_t) fs.st_size == b->size);
+        if (same)
+        {
+            ssize_t r;
+            XXH32_reset(xs, 0);
+            while ( (r = read(fd, buf, 1u << 20)) > 0 ) { XXH32_update(xs, buf, (size_t) r); }
+            same = (r == 0) && (XXH32_digest(xs) == want);
+        }
+        if (fd >= 0) { close(fd); }
+    }
+    XXH32_freeState(xs);
+    free(buf);
+    pzpd_clear_error();                                           // a failed check only means "not done"
+    return same;
+}
+
 int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, const pzpd_edit_blob *blobs, size_t n, unsigned flags, uint64_t *unmatched)
 {
     pzpd_clear_error();
@@ -778,7 +829,8 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
         if (sa == NULL) { pzpd_error_wrap(PZPD_OK, "%s", m->shards[k].path); ok = 0; break; }
         int has = 0;
         for (unsigned u = 0; u < sa->S; u++) { if (!strcmp(sa->streams[u], stream)) { has = 1; } }
-        int done = (op == PZPD_EDIT_ADD) ? has : (op == PZPD_EDIT_DROP) ? !has : (sa->shards[0].sb.generation > m->mshards[k].generation);
+        int done = (op == PZPD_EDIT_ADD) ? has : (op == PZPD_EDIT_DROP) ? !has :
+                   ( (sa->shards[0].sb.generation > m->mshards[k].generation) && pzpd_stream_replaced(sa, stream, blobs, n, keys, flags) );
         todo[k] = !done;
         // Names: a new name must not exist anywhere in the archive, except as the blob it replaces. The shard's
         // hash and the input names are both sorted by hash: one merge pass, not a lookup per name per shard

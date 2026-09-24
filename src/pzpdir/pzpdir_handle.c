@@ -574,7 +574,7 @@ ssize_t pzpd_read_record(pzpd *a, uint64_t ordinal, uint32_t stream_mask, void *
     if (refs != NULL)
     {
         memset(refs, 0, sizeof(pzpd_blob_ref) * a->S);
-        if (r > 0)
+        if (r >= 0)   // 0 also when every requested blob is present but empty: their refs still say so
         {
             for (unsigned u = 0; u < a->S; u++)
             {

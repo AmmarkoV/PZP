@@ -112,6 +112,7 @@ ssize_t pzpd_read_range(pzpd *a, uint64_t first, uint32_t count, uint32_t stream
             rf->data   = (const unsigned char *) buf + (s->rtab[sl + k].offset + b->rel_offset - lo);
             rf->size   = b->size;
             rf->format = b->format;
+            pzpd_blob_meta_of(b, &rf->meta);
             if (ar->flags & PZPD_O_VERIFY)
             {
                 uint32_t want;

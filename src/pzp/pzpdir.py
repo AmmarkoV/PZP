@@ -104,7 +104,7 @@ class BlobInfo(ctypes.Structure):
 
 
 class BlobRef(ctypes.Structure):
-    _fields_ = [("data", c_void_p), ("size", c_size), ("format", c_u32)]
+    _fields_ = [("data", c_void_p), ("size", c_size), ("format", c_u32), ("meta", BlobMeta)]
 
 
 class ShardInfo(ctypes.Structure):
@@ -870,10 +870,12 @@ class Archive:
 
 class Record:
     """Blobs of one record handed out by Prefetcher.get(): mapping stream -> memoryview.
-    The views are valid until release() (BUFFERS mode) or the archive is closed (MAP / PAGECACHE)."""
+    The views are valid until release() (BUFFERS mode) or the archive is closed (MAP / PAGECACHE).
+    meta: stream -> dict of format and dimensions from the index (as Archive.info()), known before decoding."""
 
-    def __init__(self, pf, ordinal, views, ticket):
+    def __init__(self, pf, ordinal, views, ticket, meta=None):
         self._pf, self.ordinal, self._views, self._ticket = pf, ordinal, views, ticket
+        self.meta = meta if meta is not None else {}
 
     def __getitem__(self, stream):
         return self._views[stream]
@@ -959,11 +961,12 @@ class Prefetcher:
         r = _lib.pzpd_prefetch_get(self._h, int(ordinal), mask, refs, ctypes.byref(t))
         if r < 0:
             _raise("record %d" % ordinal)
-        views = {}
+        views, meta = {}, {}
         for u in range(S):
             if refs[u].data:
                 views[self._a._streams[u]] = memoryview((ctypes.c_char * refs[u].size).from_address(refs[u].data)).cast("B")
-        return Record(self, int(ordinal), views, t)
+                meta[self._a._streams[u]] = _meta_dict(refs[u].meta)
+        return Record(self, int(ordinal), views, t, meta)
 
     def discard(self, ordinal):
         """Drop the first pending claim of an ordinal without reading it."""

@@ -66,7 +66,7 @@ struct pzpd_pf_loc
 {
     uint64_t off;      ///< File offset
     uint32_t size;     ///< Bytes
-    uint32_t format;   ///< FourCC
+    pzpd_blob_meta meta; ///< Format and dimensions from the index
     int      mstream;  ///< Member stream id
     int      present;  ///< 1 if the record has this blob
 };
@@ -331,7 +331,7 @@ static struct pzpd_rshard *pzpd_pf_locate(pzpd *a, uint64_t ordinal, uint32_t ma
         if (b->rel_offset == PZPD_MISSING) { continue; }
         loc[u].off     = s->rtab[sl].offset + b->rel_offset;
         loc[u].size    = b->size;
-        loc[u].format  = b->format;
+        pzpd_blob_meta_of(b, &loc[u].meta);
         loc[u].mstream = ms;
         loc[u].present = 1;
     }
@@ -422,7 +422,7 @@ static int pzpd_pf_buffer_refs(const struct pzpd_pf_loc *loc, unsigned S, uint32
     for (unsigned u = 0; u < S; u++)
     {
         if ( !(want & (1u << u)) || !loc[u].present ) { continue; }
-        if (loc[u].size == 0) { refs[u].data = empty; refs[u].size = 0; refs[u].format = loc[u].format; continue; }
+        if (loc[u].size == 0) { refs[u].data = empty; refs[u].size = 0; refs[u].format = loc[u].meta.format; refs[u].meta = loc[u].meta; continue; }
         uint64_t bo = 0;
         unsigned k = 0;
         for (; k < n; k++)
@@ -432,7 +432,8 @@ static int pzpd_pf_buffer_refs(const struct pzpd_pf_loc *loc, unsigned S, uint32
             {
                 refs[u].data   = buf + bo + (loc[u].off - alo);
                 refs[u].size   = loc[u].size;
-                refs[u].format = loc[u].format;
+                refs[u].format = loc[u].meta.format;
+                refs[u].meta   = loc[u].meta;
                 break;
             }
             bo += ((r[k].hi + PZPD_PF_DIO - 1) & ~(uint64_t)(PZPD_PF_DIO - 1)) - alo;
@@ -966,7 +967,8 @@ int pzpd_prefetch_get(pzpd_prefetcher *p, uint64_t ordinal, uint32_t mask, pzpd_
             if (!loc[u].present) { continue; }
             refs[u].data   = s->map + loc[u].off;
             refs[u].size   = loc[u].size;
-            refs[u].format = loc[u].format;
+            refs[u].format = loc[u].meta.format;
+            refs[u].meta   = loc[u].meta;
         }
     }
     // Count the blobs; with PZPD_O_VERIFY, check each against the XXH32 in its record header

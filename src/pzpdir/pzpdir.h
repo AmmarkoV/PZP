@@ -72,7 +72,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *  pzpd_blob_ref refs[PZPD_MAX_STREAMS];
  *  if (pzpd_read_record(a,(uint64_t)i,mask,buf,need,refs) >= 0)
  *  {
- *      // refs[rgb].data, refs[rgb].size, refs[rgb].format ...
+ *      // refs[rgb].data, refs[rgb].size, refs[rgb].meta.width / .height / .channels / .bits ...
  *  }
  *  free(buf);
  *  pzpd_close(a);
@@ -133,7 +133,7 @@ extern "C"
 #include <sys/types.h>
 
 /** @brief Library version, printed by programs that vendor pzpdir so copies can be told apart. */
-static const char pzpdirVersion[]="0.11"; //0.11: phase 8, word index (per-source + merged sub-indexes, synonyms, reindex); 0.10: prefetcher lanes (a lock per lane, atomic window / budget), batched I/O-thread takes and wake-ups, stream names checked for the metadata JSON, faster resumed edit-stream; 0.9: review fixes (section-scan recovery after table edits, writer finish cleanup, NPY probe bound, faster edit-stream name check); 0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
+static const char pzpdirVersion[]="0.12"; //0.12: pzpd_blob_ref carries the stored blob metadata (dimensions), present-but-empty blobs of read_record reported, replace-stream resume checks content; 0.11: phase 8, word index (per-source + merged sub-indexes, synonyms, reindex); 0.10: prefetcher lanes (a lock per lane, atomic window / budget), batched I/O-thread takes and wake-ups, stream names checked for the metadata JSON, faster resumed edit-stream; 0.9: review fixes (section-scan recovery after table edits, writer finish cleanup, NPY probe bound, faster edit-stream name check); 0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
 
 #ifndef PZPDIR_WITH_PZP
 /** @brief 1 enables pzpd_read_pzp() (includes pzp.h). Build with 0 when the program decodes PZP itself. */
@@ -199,7 +199,7 @@ static const char pzpdirVersion[]="0.11"; //0.11: phase 8, word index (per-sourc
 /** @brief Most distinct source values (per-source sub-indexes) in one word index. */
 #define PZPD_MAX_WORD_SOURCES 255
 
-/** @brief Word index tokenizer v1: `re.findall(r'\w+', text.lower())` of Python, all-ASCII tokens only (spec §3.7). */
+/** @brief Word index tokenizer v1: `re.findall(r'\\w+', text.lower())` of Python, all-ASCII tokens only (spec §3.7). */
 #define PZPD_TOKENIZER_V1 1
 
 /** @brief pzpd_words_open() flag: apply the `synonyms` global table (canonical view); without it, surface words. */
@@ -315,12 +315,15 @@ typedef struct
     unsigned       shard;     ///< Shard holding the record (index over all members' shards, as pzpd_shard_info_get())
 } pzpd_blob_info;
 
-/** @brief One blob inside a buffer filled by pzpd_read_record(). */
+/** @brief One blob handed out by pzpd_read_record(), pzpd_read_range() or pzpd_prefetch_get(): its bytes, plus the
+ *  dimensions stored in the index at pack time (so a decoder knows width, height, channels and bits before it parses
+ *  the file's own header). All zero when the blob is absent or not requested. */
 typedef struct
 {
-    const void *data;    ///< Start of the blob inside the caller's buffer, NULL if absent or not requested
-    size_t      size;    ///< Payload bytes, 0 if absent or not requested
-    uint32_t    format;  ///< FourCC of the blob, 0 if absent or not requested
+    const void    *data;    ///< Start of the blob (in the caller's buffer, a prefetch buffer or the mapping), NULL if absent or not requested
+    size_t         size;    ///< Payload bytes, 0 if absent or not requested
+    uint32_t       format;  ///< FourCC of the blob (= meta.format), 0 if absent or not requested
+    pzpd_blob_meta meta;    ///< Format and dimensions from the index, as pzpd_blob_info_get() returns them (check PZPD_META_VALID)
 } pzpd_blob_ref;
 
 /** @brief Location and size of one shard, for tools. Filled by pzpd_shard_info_get(). */
@@ -957,7 +960,10 @@ typedef struct pzpd_words pzpd_words;
 int pzpd_words_open(pzpd *a, const char *table, const char *column, const char *source, size_t source_len,
                     unsigned flags, pzpd_words **out);
 
-/** @brief Close a word index handle (NULL is ignored). The pzpd handle must outlive it. */
+/**
+ * @brief Close a word index handle. The pzpd handle must outlive it.
+ * @param w Handle from pzpd_words_open(); NULL is ignored.
+ */
 void pzpd_words_close(pzpd_words *w);
 
 /**
@@ -983,16 +989,39 @@ size_t pzpd_words_sources(pzpd *a, const char *table, const char *column, const 
  */
 int pzpd_words_index(pzpd *a, unsigned i, const char **table, const char **column, const char **source_column);
 
-/** @brief Words in the handle's vocabulary. */
+/**
+ * @brief Words in the handle's vocabulary.
+ * @param w Handle.
+ * @return The vocabulary size (word ids are 0 .. size - 1), 0 for a NULL handle.
+ */
 uint32_t pzpd_words_count(const pzpd_words *w);
 
-/** @brief Bytes of word id (not NUL-terminated), or NULL if out of range. */
+/**
+ * @brief Bytes of a word.
+ * @param w   Handle.
+ * @param id  Word id.
+ * @param len Receives the length (may be NULL).
+ * @return The bytes (not NUL-terminated; valid while the handle is open), or NULL if id is out of range.
+ */
 const char *pzpd_words_word(const pzpd_words *w, uint32_t id, size_t *len);
 
-/** @brief Id of a word (exact bytes), or -1 if it is not in the vocabulary. */
+/**
+ * @brief Id of a word (exact bytes).
+ * @param w    Handle.
+ * @param word Word bytes.
+ * @param len  Their length.
+ * @return The id, or -1 if it is not in the vocabulary.
+ */
 int64_t pzpd_words_find(const pzpd_words *w, const char *word, size_t len);
 
-/** @brief Records containing word id, and its total occurrences. No shard is opened. @return 1, or 0 if out of range. */
+/**
+ * @brief Records containing a word, and its total occurrences. No shard is opened.
+ * @param w       Handle.
+ * @param id      Word id.
+ * @param records Receives the number of records containing it (may be NULL).
+ * @param count   Receives its occurrences (may be NULL).
+ * @return 1, or 0 if id is out of range.
+ */
 int pzpd_words_stats(const pzpd_words *w, uint32_t id, uint64_t *records, uint64_t *count);
 
 /**
@@ -1029,7 +1058,10 @@ size_t pzpd_words_of_record(pzpd_words *w, uint64_t ordinal, uint32_t *ids, size
 /**
  * @brief Tokenizer version of the index, and how many records are covered (records of the members that
  *        have this word index; the others have no words).
- * @return 1.
+ * @param w               Handle.
+ * @param tokenizer       Receives the tokenizer version, PZPD_TOKENIZER_V1 (may be NULL).
+ * @param covered_records Receives the records covered (may be NULL).
+ * @return 1, or 0 for a NULL handle.
  */
 int pzpd_words_info(const pzpd_words *w, unsigned *tokenizer, uint64_t *covered_records);
 

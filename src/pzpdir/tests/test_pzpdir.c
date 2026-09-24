@@ -218,6 +218,7 @@ static void test_roundtrip(uint64_t N)
             const void *v = pzpd_view(a, i, s, &vs);
             CHECK( (vs == (size_t) sz) && ((sz == 0) || ((v != NULL) && (memcmp(v, want, (size_t) sz) == 0))), "view %llu/%u", (unsigned long long) i, s);
             CHECK( (refs[s].size == (size_t) sz) && ((sz == 0) || (memcmp(refs[s].data, want, (size_t) sz) == 0)), "read_record ref %llu/%u", (unsigned long long) i, s);
+            CHECK( (memcmp(&refs[s].meta, &bi.meta, sizeof(bi.meta)) == 0) && (refs[s].format == bi.meta.format), "read_record ref %llu/%u carries the index metadata", (unsigned long long) i, s);
             CHECK(pzpd_find(a, name, nl, &so) == (int64_t) i && (so == (int) s), "find name %llu/%u", (unsigned long long) i, s);
         }
         if ( (i % 997) == 0 ) { CHECK(pzpd_verify_record(a, i, 1), "verify %llu", (unsigned long long) i); }
@@ -1113,7 +1114,8 @@ static void *pf_consumer(void *arg)
             pzpd_blob_info bi;
             present++;
             if ( (refs[u].data == NULL) || (refs[u].size != (size_t) n) || memcmp(refs[u].data, buf, (size_t) n) ||
-                 !pzpd_blob_info_get(j->a, j->ord[pos], u, &bi) || (refs[u].format != bi.meta.format) ) { j->errs++; }
+                 !pzpd_blob_info_get(j->a, j->ord[pos], u, &bi) || (refs[u].format != bi.meta.format) ||
+                 memcmp(&refs[u].meta, &bi.meta, sizeof(bi.meta)) ) { j->errs++; }
         }
         if (present != r) { j->errs++; }
         pzpd_prefetch_release(j->pf, &tk);
@@ -1970,6 +1972,8 @@ static void test_groups(void)
                 ssize_t m = pzpd_read_into(a, firstOf[c] + k, s2, one, sizeof(one));
                 if ( (m == 0) != (refs[k * 2 + s2].data == NULL) ) { same = 0; }
                 if ( (m > 0) && ((refs[k * 2 + s2].size != (size_t) m) || memcmp(refs[k * 2 + s2].data, one, (size_t) m)) ) { same = 0; }
+                pzpd_blob_info bi;
+                if ( (m > 0) && (!pzpd_blob_info_get(a, firstOf[c] + k, s2, &bi) || memcmp(&refs[k * 2 + s2].meta, &bi.meta, sizeof(bi.meta))) ) { same = 0; }
             }
         }
         CHECK(same, "read_range of clip %d (%u frames, one pread of %zu bytes) = the single reads", c, n, span);

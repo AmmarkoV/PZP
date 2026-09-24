@@ -16,8 +16,9 @@
 // Reader
 //-----------------------------------------------------------------------------------------------
 
-/** @brief Bytes of a header's revision-12 extension covered by ext_checksum. */
+/** @brief Bytes of a superblock's revision-12 extension covered by ext_checksum. */
 #define PZPD_SB_EXT_BYTES (offsetof(struct pzpd_disk_superblock, ext_checksum) - offsetof(struct pzpd_disk_superblock, words))
+/** @brief Bytes of a manifest header's revision-12 extension covered by ext_checksum. */
 #define PZPD_MH_EXT_BYTES (offsetof(struct pzpd_disk_manifest, ext_checksum) - offsetof(struct pzpd_disk_manifest, words))
 
 /** @brief Read a table directory (superblock or manifest) into schemas / views.
@@ -477,6 +478,18 @@ PZPD_INTERNAL const struct pzpd_disk_blob *pzpd_blob_entry(const struct pzpd_rsh
         return NULL;
     }
     return b;
+}
+
+/** @brief The metadata of a blob table entry, as the public pzpd_blob_meta. */
+PZPD_INTERNAL void pzpd_blob_meta_of(const struct pzpd_disk_blob *b, pzpd_blob_meta *m)
+{
+    m->format     = b->format;
+    m->width      = b->width;
+    m->height     = b->height;
+    m->channels   = b->channels;
+    m->frames     = b->frames;
+    m->bits       = b->bits;
+    m->meta_flags = b->meta_flags;
 }
 
 /** @brief Single-archive part of pzpd_open(): ordinals, shards and stream ids are local to the archive. */
@@ -970,13 +983,7 @@ PZPD_INTERNAL int pzpd_arch_blob_info_get(struct pzpd_archive *a, uint64_t ordin
     if (b->rel_offset == PZPD_MISSING) { return 1; }
     out->present          = 1;
     out->size             = b->size;
-    out->meta.format      = b->format;
-    out->meta.width       = b->width;
-    out->meta.height      = b->height;
-    out->meta.channels    = b->channels;
-    out->meta.frames      = b->frames;
-    out->meta.bits        = b->bits;
-    out->meta.meta_flags  = b->meta_flags;
+    pzpd_blob_meta_of(b, &out->meta);
     out->name             = s->heap + b->name_offset;
     out->name_len         = b->name_len;
     return 1;
@@ -1152,6 +1159,7 @@ PZPD_INTERNAL ssize_t pzpd_arch_read_record(struct pzpd_archive *a, uint64_t ord
             refs[st].data   = p;
             refs[st].size   = b->size;
             refs[st].format = b->format;
+            pzpd_blob_meta_of(b, &refs[st].meta);
         }
     }
     return (ssize_t)(end - start);

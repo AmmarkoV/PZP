@@ -283,6 +283,8 @@ PZPD_INTERNAL int pzpd_writer_close_shard(pzpd_writer *w)
     // Backup first, then the primary: a crash leaves either no valid primary (file is still .tmp) or both
     if (!pzpd_pwrite_all(w->fd, block, PZPD_BLOCK, sb.file_bytes - PZPD_BLOCK)) { return 0; }
     if (!pzpd_pwrite_all(w->fd, block, PZPD_BLOCK, 0)) { return 0; }
+    // A record whose write failed part-way (disk full, EFBIG) may have left bytes past the end: the backup must end the file
+    if (ftruncate(w->fd, (off_t) sb.file_bytes) != 0) { pzpd_set_error(PZPD_E_IO, "ftruncate %s: %s", w->tmp_path, strerror(errno)); return 0; }
     if (fsync(w->fd) != 0) { pzpd_set_error(PZPD_E_IO, "fsync %s: %s", w->tmp_path, strerror(errno)); return 0; }
     close(w->fd);
     w->fd = -1;

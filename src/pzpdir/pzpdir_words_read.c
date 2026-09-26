@@ -382,7 +382,7 @@ int pzpd_words_open(pzpd *a, const char *table, const char *column, const char *
     {
         struct pzpd_wcanon *c = (struct pzpd_wcanon *) canon.data;
         size_t nc = canon.len / sizeof(*c);
-        if (flags & PZPD_WORDS_CANONICAL) { qsort(c, nc, sizeof(*c), pzpd_cmp_wcanon); }
+        if ( (flags & PZPD_WORDS_CANONICAL) && (nc > 1) ) { qsort(c, nc, sizeof(*c), pzpd_cmp_wcanon); }   // c is NULL for an empty vocabulary
         // Groups of equal canonical words (the surface view: every word its own group, already sorted)
         uint32_t n = 0;
         uint64_t hb = 0;

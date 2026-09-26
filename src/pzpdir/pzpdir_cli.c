@@ -322,6 +322,7 @@ static int parse_list(const char *path, const char *fixed_streams, struct record
 
     size_t cap = 1024;
     L->records = (struct list_record *) calloc(cap, sizeof(struct list_record));
+    if (L->records == NULL) { fprintf(stderr, CLI_RED "out of memory" CLI_NORMAL "\n"); return 0; }
     uint32_t group = PZPD_NO_GROUP, nextGroup = 0, frame = 0;
     size_t lineNo = 0;
     char *p = L->text, *end = L->text + len;
@@ -965,13 +966,20 @@ static int cmd_export_table(const char *const *paths, int np, const char *table)
     int multi = (pzpd_member_count(a) > 1), rc = 0;
     size_t cap = 1 << 16;
     char *buf = (char *) malloc(cap);
+    if (buf == NULL) { fprintf(stderr, CLI_RED "out of memory" CLI_NORMAL "\n"); pzpd_close(a); return 1; }
     if (sc->flags & PZPD_TABLE_GLOBAL)
     {
         for (unsigned m = 0; m < pzpd_member_count(a); m++)
         {
             ssize_t n = pzpd_global_csv(a, m, (unsigned) t, NULL, 0);
             if (n < 0) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); rc = 1; continue; }
-            if ((size_t) n + 1 > cap) { cap = (size_t) n + 1; buf = (char *) realloc(buf, cap); }
+            if ((size_t) n + 1 > cap)
+            {
+                char *nb = (char *) realloc(buf, (size_t) n + 1);
+                if (nb == NULL) { fprintf(stderr, CLI_RED "out of memory" CLI_NORMAL "\n"); rc = 1; continue; }
+                buf = nb;
+                cap = (size_t) n + 1;
+            }
             pzpd_global_csv(a, m, (unsigned) t, buf, cap);
             char prefix[256];
             snprintf(prefix, sizeof(prefix), "%s%s@row %s ", multi ? pzpd_member_alias(a, m) : "", multi ? "\t" : "", sc->name);
@@ -986,7 +994,13 @@ static int cmd_export_table(const char *const *paths, int np, const char *table)
             ssize_t n = pzpd_table_csv(a, i, (unsigned) t, NULL, 0);
             if (n < 0) { fprintf(stderr, CLI_RED "record %llu: %s" CLI_NORMAL "\n", (unsigned long long) i, pzpd_last_error()); rc = 1; continue; }
             if (n == 0) { continue; }
-            if ((size_t) n + 1 > cap) { cap = (size_t) n + 1; buf = (char *) realloc(buf, cap); }
+            if ((size_t) n + 1 > cap)
+            {
+                char *nb = (char *) realloc(buf, (size_t) n + 1);
+                if (nb == NULL) { fprintf(stderr, CLI_RED "out of memory" CLI_NORMAL "\n"); rc = 1; continue; }
+                buf = nb;
+                cap = (size_t) n + 1;
+            }
             pzpd_table_csv(a, i, (unsigned) t, buf, cap);
             size_t kl = 0;
             const char *k = pzpd_record_key(a, i, &kl);
@@ -1496,6 +1510,7 @@ static int cmd_collect(const char *out, const char *const *args, int n, int abso
     if (n < 1) { usage(); return 1; }
     const char **paths   = (const char **) calloc((size_t) n, sizeof(char *));
     char       **aliases = (char **) calloc((size_t) n, sizeof(char *));
+    if ( (paths == NULL) || (aliases == NULL) ) { fprintf(stderr, CLI_RED "out of memory" CLI_NORMAL "\n"); free(paths); free(aliases); return 1; }
     int anyAlias = 0;
     for (int i = 0; i < n; i++)
     {

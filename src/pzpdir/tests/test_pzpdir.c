@@ -613,6 +613,39 @@ static void test_misc(void)
         CHECK(access(tmp, F_OK) != 0, "...and leaves no .tmp shard behind");
         CHECK(count_fds() == fdsBefore - 1, "...and closes the shard's descriptor (%ld -> %ld open)", fdsBefore, count_fds());
     }
+
+    // A record whose payload write fails part-way (file size limit, as a full disk would) is refused; the writer goes
+    // on, and the finished shard still ends at its file_bytes, so the backup superblock is at EOF
+    {
+        char fp[1200], sp[1300];
+        snprintf(fp, sizeof(fp), "%s/fail_record.pzpd", dir);
+        snprintf(sp, sizeof(sp), "%s/fail_record.00000.pzpd", dir);
+        const char *fs[1] = { "data" };
+        pzpd_writer_opts fo = { fs, 1, 0, 64 };
+        pzpd_writer *fw = pzpd_writer_create(fp, &fo);
+        size_t big = 1u << 20;
+        unsigned char *bd = (unsigned char *) calloc(1, big);
+        struct rlimit old, lim;
+        getrlimit(RLIMIT_FSIZE, &old);
+        lim = old;
+        lim.rlim_cur = 256 * 1024;                               // the big payload stops part-way
+        void (*oldSig)(int) = signal(SIGXFSZ, SIG_IGN);
+        setrlimit(RLIMIT_FSIZE, &lim);
+        int bok = (fw != NULL) && (bd != NULL) && pzpd_writer_begin(fw, "big", 3, PZPD_NO_GROUP, 0) && pzpd_writer_blob(fw, 0, "big", 3, bd, big) && pzpd_writer_end(fw);
+        setrlimit(RLIMIT_FSIZE, &old);
+        signal(SIGXFSZ, oldSig);
+        free(bd);
+        CHECK(!bok && (pzpd_last_error_code() == PZPD_E_IO), "a record whose write fails is refused");
+        CHECK( (fw != NULL) && pzpd_writer_begin(fw, "small", 5, PZPD_NO_GROUP, 0) && pzpd_writer_blob(fw, 0, "small", 5, "hello", 5) &&
+               pzpd_writer_end(fw) && pzpd_writer_finish(fw), "...the writer goes on and finishes");
+        struct stat st;
+        pzpd *fa = pzpd_open(fp, 0);
+        pzpd_shard_info si;
+        CHECK( (fa != NULL) && (stat(sp, &st) == 0) && pzpd_shard_info_get(fa, 0, &si) && ((uint64_t) st.st_size == si.file_bytes),
+               "...and the shard ends at its file_bytes (backup superblock at EOF)");
+        CHECK( (fa != NULL) && (pzpd_count(fa) == 1) && pzpd_verify_shard(fa, 0) && pzpd_verify_record(fa, 0, 1), "...and verifies");
+        pzpd_close(fa);
+    }
 }
 
 /** @brief Phase 1c: table schemas, CSV, binary rows, strings, global tables, collections. */

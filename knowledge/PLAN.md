@@ -444,6 +444,13 @@ A second review of `pzpdir.c`. Each bug fix has a unit test that fails (or trips
 - **`pzpd_blob_ref` carries the blob's stored metadata** (`meta`: format, width, height, channels, bits, frames, flags, as `pzpd_blob_info_get()`), so `pzpd_read_record()` / `pzpd_read_range()` / `pzpd_prefetch_get()` hand workers the dimensions with the bytes, before any header is parsed. The struct grows from 24 to 40 bytes (`format` kept); Python `BlobRef` updated, prefetched `Record.meta[stream]`; the DataLoader's vendored `pzpdir/` updated and rebuilt. Found on the way: `pzpd_read_record()` through a handle reported a record's present-but-empty blobs as absent when every requested blob was empty (refs were copied only for a non-zero span)
 - Doxygen gate back at **0 warnings** (the 43 of the word-index code: undocumented parameters, struct members, a `\w` in a brief)
 
+### Review fixes (2026-09-26)
+A full read of `src/pzpdir/` plus `gcc -fanalyzer` and `clang --analyze` over every file.
+- **Writer: a shard could end past its `file_bytes`.** When a record's payload write failed part-way (disk full, EFBIG), `pzpd_writer_end()` refused the record and the writer went on, as documented, but the bytes it had written stayed past the end of the finished shard, so the backup superblock was not at EOF (1 MiB file, 32 KiB `file_bytes` in the repro). `pzpd_writer_close_shard()` now cuts the file at `file_bytes`. Unit test (`RLIMIT_FSIZE`) fails on the old code
+- `pzpd_words_open()` with the canonical view of an empty vocabulary called `qsort(NULL, 0, …)` (UB: glibc declares it `nonnull`)
+- CLI: unchecked allocations in `export-table`, `collect` and the record-list parser
+- The analyzers' other reports are false positives (invariants checked earlier). Timing on `/dev/shm` (COCO val2017 rgb+all, 2 GB): pack 1.5 s (0.3 s user CPU; the rest is kernel copies), `verify --blobs` 0.45 s (XXH32 speed), word-index commands < 20 ms, so no performance change was made
+
 ### DataLoader integration (first client; separate repo and branch)
 Covered by §5 (constraints) and §7 (plan). It starts after phase 6 (§5 order of work) and lives in
 `RGBToPoseDetect2D/datasets/DataLoader`: vendored `pzpdir/` sources, a ~100-line `PZPDLoader.c`

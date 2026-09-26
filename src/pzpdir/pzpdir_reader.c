@@ -242,11 +242,18 @@ PZPD_INTERNAL int pzpd_sb_from_sections(const unsigned char *map, uint64_t file,
 
     memcpy(sb.magic, PZPD_MAGIC_SHARD, 8);
     sb.version       = PZPD_FORMAT_VERSION;
+    // Hex digits parsed by hand: sscanf() would first run strlen() over the mapping, which has no terminator
     const char *uu = pzpd_meta_value(meta, mlen, "archive_uuid");
     for (int i = 0; (uu != NULL) && (uu + 33 <= meta + mlen) && (*uu == '"') && (i < 16); i++)
     {
-        unsigned v = 0;
-        if (sscanf(uu + 1 + 2 * i, "%2x", &v) != 1) { break; }
+        int v = 0;
+        for (int k = 1; k <= 2; k++)
+        {
+            char c = uu[2 * i + k];
+            int d = ( (c >= '0') && (c <= '9') ) ? c - '0' : ( (c >= 'a') && (c <= 'f') ) ? c - 'a' + 10 : ( (c >= 'A') && (c <= 'F') ) ? c - 'A' + 10 : -1;
+            v = ( (d < 0) || (v < 0) ) ? -1 : v * 16 + d;
+        }
+        if (v < 0) { break; }
         sb.archive_uuid[i] = (uint8_t) v;
     }
     sb.generation    = pzpd_meta_u64(meta, mlen, "generation", 1);
@@ -1218,9 +1225,11 @@ PZPD_INTERNAL int pzpd_arch_verify_shard(struct pzpd_archive *a, unsigned shard)
     if ( (a == NULL) || (shard >= a->shard_count) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
     struct pzpd_rshard *s = pzpd_shard(a, shard);
     if (s == NULL) { return 0; }
-    uint64_t offs[6 + PZPD_MAX_TABLES]  = { s->sb.rtab_offset, s->sb.btab_offset, s->sb.hash_offset, s->sb.heap_offset, s->sb.meta_offset };
-    uint32_t kinds[6 + PZPD_MAX_TABLES] = { PZPD_SECT_RECORDS, PZPD_SECT_BLOBS, PZPD_SECT_HASH, PZPD_SECT_HEAP, PZPD_SECT_META };
-    int nsec = 5;
+    uint64_t offs[6 + PZPD_MAX_TABLES]  = { s->sb.rtab_offset, s->sb.btab_offset, s->sb.hash_offset, s->sb.heap_offset };
+    uint32_t kinds[6 + PZPD_MAX_TABLES] = { PZPD_SECT_RECORDS, PZPD_SECT_BLOBS, PZPD_SECT_HASH, PZPD_SECT_HEAP };
+    int nsec = 4;
+    // no metadata section (0 / 0) only after a section-scan recovery that didn't find one (as pzpd_shard_load() accepts)
+    if ( (s->sb.meta_offset != 0) || (s->sb.meta_bytes != 0) ) { offs[nsec] = s->sb.meta_offset; kinds[nsec] = PZPD_SECT_META; nsec++; }
     if (s->sb.group_count > 0) { offs[nsec] = s->sb.groups_offset; kinds[nsec] = PZPD_SECT_GROUPS; nsec++; }
     for (unsigned t = 0; t < a->T; t++) { offs[nsec] = s->sb.tables[t].section_offset; kinds[nsec] = PZPD_SECT_TABLE; nsec++; }
     XXH64_state_t *idx = XXH64_createState();

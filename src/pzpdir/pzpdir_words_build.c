@@ -543,7 +543,8 @@ PZPD_INTERNAL int pzpd_synonyms_check(const struct pzpd_tschema *sc, const unsig
         memcpy(&f[1], rows + r * sc->stride + sc->offset[1], 8);
         for (int c = 0; ok && (c < 2); c++)
         {
-            if (!pzpd_in_file(f[c].offset, f[c].len, heap_bytes) || !pzpd_is_one_word(heap + f[c].offset, f[c].len))
+            if (!pzpd_in_file(f[c].offset, f[c].len, heap_bytes)) { pzpd_set_error(PZPD_E_FORMAT, "%s row %llu: a string lies outside the table's strings", PZPD_SYNONYMS_TABLE, (unsigned long long)(r + 1)); ok = 0; }
+            else if (!pzpd_is_one_word(heap + f[c].offset, f[c].len))
                 { pzpd_set_error(PZPD_E_ARG, "%s row %llu: \"%.*s\" is not a single lower-case word", PZPD_SYNONYMS_TABLE, (unsigned long long)(r + 1), (int)(f[c].len > 100 ? 100 : f[c].len), heap + f[c].offset); ok = 0; }
         }
         if (ok && (f[0].len == f[1].len) && !memcmp(heap + f[0].offset, heap + f[1].offset, f[0].len))

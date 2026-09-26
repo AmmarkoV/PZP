@@ -1648,6 +1648,32 @@ static void test_recovery(void)
           !strcmp(pzpd_stream_name(one, 1), "depth") && pzpd_table_count(one) == 3, "a shard without superblocks opens standalone (streams, tables from its sections)");
     pzpd_close(one);
 
+    // Same shard without its metadata section too (magic of the kind-5 section zeroed): it opens with placeholder
+    // stream names, and its index verifies (the rebuilt superblock has no metadata section to check)
+    char nometa[1300];
+    snprintf(nometa, sizeof(nometa), "%s/nometa.pzpd", dir);
+    CHECK(copy_file(shards[2], nometa), "copy the shard without superblocks");
+    {
+        int fd = open(nometa, O_RDWR);
+        struct stat nst;
+        fstat(fd, &nst);
+        int hit = 0;
+        for (uint64_t off = 4096; !hit && (off + 16 <= (uint64_t) nst.st_size); off += 4096)
+        {
+            unsigned char h[16];
+            uint32_t kind = 0;
+            if ( (pread(fd, h, 16, (off_t) off) == 16) && !memcmp(h, "PZPDSECT", 8) && (memcpy(&kind, h + 12, 4), kind == 5) )
+                { hit = (pwrite(fd, "\0\0\0\0\0\0\0\0", 8, (off_t) off) == 8); }
+        }
+        close(fd);
+        CHECK(hit, "zero the metadata section's magic");
+    }
+    one = pzpd_open(nometa, 0);
+    CHECK(one != NULL && pzpd_shard_info_get(one, 0, &s2) && s2.recovery == 2 && pzpd_count(one) == o2.record_count && !strcmp(pzpd_stream_name(one, 1), "stream1"),
+          "a shard without superblocks and metadata opens standalone (placeholder stream names)");
+    CHECK(one != NULL && pzpd_verify_shard(one, 0), "its index verifies without a metadata section (%s)", pzpd_last_error());
+    pzpd_close(one);
+
     // Same shard, but record 0's offset + bytes wraps around past 2^64 (section checksum re-sealed):
     // the rebuilt superblock must refuse it like any record past the end of the file
     char wrapped[1300];

@@ -369,11 +369,14 @@ class Archive:
         self._streams = [_s(_lib.pzpd_stream_name(self._h, u)) for u in range(_lib.pzpd_stream_count(self._h))]
         self._tables = {}
         self._words = weakref.WeakSet()      # open Words views: closed before the archive
+        self._prefetchers = weakref.WeakSet()   # open Prefetchers: their I/O threads read the archive, stopped before it closes
 
     # --- lifetime ---------------------------------------------------------------------------
     def close(self):
-        """Close the archive. Views, memoryviews and prefetchers of it must not be used afterwards."""
+        """Close the archive (and its prefetchers). Views, memoryviews and prefetchers of it must not be used afterwards."""
         if self._h:
+            for p in list(self._prefetchers):
+                p.close()
             for w in list(self._words):
                 w.close()
             _lib.pzpd_close(self._h)
@@ -900,13 +903,16 @@ class Record:
 
     def release(self):
         """Give the record back to the prefetcher (frees its buffer in BUFFERS mode)."""
-        if self._ticket is not None and self._pf._h:
+        if self._ticket is not None:
             for v in self._views.values():
                 try:
                     v.release()
                 except BufferError:      # the caller still holds a slice of it; it must not be used after this
                     pass
-            _lib.pzpd_prefetch_release(self._pf._h, ctypes.byref(self._ticket))
+            if self._pf._h:
+                _lib.pzpd_prefetch_release(self._pf._h, ctypes.byref(self._ticket))
+            elif self._ticket.buf:
+                _lib.pzpd_free(self._ticket.buf)     # the prefetcher is gone: its BUFFERS ticket buffer is ours to free
         self._ticket = None
         self._views = {}
 
@@ -936,6 +942,7 @@ class Prefetcher:
         self._h = _lib.pzpd_prefetcher_create(archive._handle(), ctypes.byref(o))
         if not self._h:
             _raise()
+        archive._prefetchers.add(self)
 
     def submit(self, ordinals, streams=None):
         """Append records to the schedule. streams: None (the prefetcher's), or one list per ordinal."""

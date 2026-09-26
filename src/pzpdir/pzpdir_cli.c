@@ -752,16 +752,26 @@ static int cmd_cat(const char *const *paths, int np, const char *what, const cha
 /** @brief Counter of one metadata combination for `info`. */
 struct combo
 {
-    uint32_t format;  ///< FourCC
     pzpd_blob_meta m; ///< Metadata (format, dims, channels, bits, flags)
     uint64_t count;   ///< Blobs with this combination
+    uint64_t first;   ///< Record of its first blob (ties are listed in first-seen order)
 };
 
-/** @brief qsort comparator: most frequent combination first. */
+/** @brief qsort comparator: equal metadata together, in record order. */
+static int cmp_combo_meta(const void *a, const void *b)
+{
+    const struct combo *x = (const struct combo *) a, *y = (const struct combo *) b;
+    int c = memcmp(&x->m, &y->m, sizeof(x->m));
+    if (c != 0) { return c; }
+    return (x->first < y->first) ? -1 : (x->first > y->first);
+}
+
+/** @brief qsort comparator: most frequent combination first, then first seen. */
 static int cmp_combo(const void *a, const void *b)
 {
     const struct combo *x = (const struct combo *) a, *y = (const struct combo *) b;
-    return (x->count < y->count) ? 1 : (x->count > y->count) ? -1 : 0;
+    if (x->count != y->count) { return (x->count < y->count) ? 1 : -1; }
+    return (x->first < y->first) ? -1 : (x->first > y->first);
 }
 
 /** @brief `pzpdir info --dups`: record keys present in more than one member. @return exit code. */
@@ -868,8 +878,9 @@ static int cmd_info(const char *const *paths, int np, const char *only, int dups
     {
         if ( (only != NULL) && (strcmp(only, pzpd_stream_name(a, s)) != 0) ) { continue; }
         uint64_t present = 0, bytes = 0;
-        size_t cc = 0, ccap = 64;
-        struct combo *combos = (struct combo *) calloc(ccap, sizeof(struct combo));
+        size_t cc = 0;
+        // One entry per blob, sorted by metadata, then equal runs folded: O(n log n) however many combinations there are
+        struct combo *combos = (struct combo *) malloc(((n > 0) ? n : 1) * sizeof(struct combo));
         for (uint64_t i = 0; (combos != NULL) && (i < n); i++)
         {
             pzpd_blob_info bi;
@@ -877,17 +888,21 @@ static int cmd_info(const char *const *paths, int np, const char *only, int dups
             if (!bi.present) { continue; }
             present++;
             bytes += bi.size;
-            pzpd_blob_meta m = bi.meta;
-            size_t j;
-            for (j = 0; j < cc; j++) { if (memcmp(&combos[j].m, &m, sizeof(m)) == 0) { break; } }
-            if (j == cc)
+            memcpy(&combos[cc].m, &bi.meta, sizeof(bi.meta));   // padding included: zeroed by pzpd_blob_info_get()
+            combos[cc].count = 1;
+            combos[cc].first = i;
+            cc++;
+        }
+        if (combos != NULL)
+        {
+            qsort(combos, cc, sizeof(struct combo), cmp_combo_meta);
+            size_t o = 0;
+            for (size_t j = 1; j < cc; j++)
             {
-                if (cc == ccap) { ccap *= 2; struct combo *nc = (struct combo *) realloc(combos, ccap * sizeof(struct combo)); if (nc == NULL) { break; } combos = nc; }
-                memset(&combos[cc], 0, sizeof(combos[cc]));
-                combos[cc].m = m;
-                cc++;
+                if (memcmp(&combos[o].m, &combos[j].m, sizeof(combos[o].m)) == 0) { combos[o].count++; }
+                else { combos[++o] = combos[j]; }
             }
-            combos[j].count++;
+            cc = (cc > 0) ? o + 1 : 0;
         }
         printf("stream %s  present %llu / %llu  %.1f MB  avg %.1f KB\n", pzpd_stream_name(a, s), (unsigned long long) present,
                (unsigned long long) n, (double) bytes / 1e6, present ? (double) bytes / (double) present / 1024.0 : 0.0);

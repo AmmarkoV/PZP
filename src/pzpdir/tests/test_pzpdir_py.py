@@ -191,6 +191,21 @@ def test_prefetcher_modes_and_threads():
             assert pf.stats()["discarded"] == 1
 
 
+def test_prefetcher_outlived_by_its_archive():
+    # Closing the archive stops its prefetchers first: their I/O threads must not read closed shards, and a
+    # prefetcher dropped after the archive must not touch the freed handle (both crashed before)
+    d = fresh("pfclose")
+    path = os.path.join(d, "a.pzpd")
+    build(path, with_tables=False)
+    with pzpdir.open(path) as a:
+        pf = a.prefetcher(mode="buffers", io_threads=4)
+        pf.submit(range(N))
+        held = pf.get(0)                                       # a BUFFERS ticket still held when everything closes
+    assert pf._h is None
+    held.release()                                             # frees its buffer itself; no prefetcher to give it back to
+    del pf
+
+
 def test_collections():
     d = fresh("coll")
     pa, pb = os.path.join(d, "a.pzpd"), os.path.join(d, "b.pzpd")

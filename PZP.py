@@ -204,6 +204,7 @@ USE_RLE          = 2
 USE_PALETTE      = 4
 USE_INTER_DELTA  = 8   # inter-frame delta: frame[N] stores frame[N] - frame[N-1]
 USE_LZ4          = 16  # use LZ4 instead of ZSTD (faster decompress, larger output)
+USE_OPENZL       = 32  # use OpenZL instead of ZSTD (libpzp.so built with PZP_USE_OPENZL=1)
 
 # Channel group predictors (PZPPredictor in pzp.h)
 _PREDICTORS = {"none": 0, "left": 1, "gradient": 2}

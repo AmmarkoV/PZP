@@ -16,8 +16,20 @@ DEBUG    = -O0 -g3 -fno-omit-frame-pointer -fsanitize=address,undefined $(BASE)
 SIMD     = -O3 -mavx2 -DINTEL_OPTIMIZATIONS $(BASE)
 LIBS     = -lzstd -llz4 -lm
 
+# Optional OpenZL ( `make PZP_USE_OPENZL=1` ): OpenZL-compressed PZP frames get their metadata detected
+# and pzpd_read_pzp() decodes them. libopenzl.a is fetched / built by the top-level Makefile, in the
+# same OPENZL_DIR. libpzpdir.a does not contain it: programs linking that archive add libopenzl.a too.
+PZP_USE_OPENZL ?= 0
+OPENZL_DIR     ?= $(PZP_DIR)/build/openzl
+OPENZL_LIB      = $(abspath $(OPENZL_DIR))/build-pzp/libopenzl.a
+ifeq ($(PZP_USE_OPENZL),1)
+OPENZL_DEP = $(OPENZL_LIB)
+BASE      += -DPZP_USE_OPENZL=1 -I$(OPENZL_DIR)/include -I$(OPENZL_DIR)/build-pzp/include
+LIBS      := $(OPENZL_LIB) -lstdc++ $(LIBS)
+endif
+
 LIB_SRC  = $(filter-out pzpdir_cli.c,$(wildcard pzpdir_*.c))
-LIB_DEPS = $(LIB_SRC) pzpdir.h pzpdir_internal.h pzpdir_unicode.h third_party/xxhash.h $(PZP_DIR)/pzp.h
+LIB_DEPS = $(LIB_SRC) pzpdir.h pzpdir_internal.h pzpdir_unicode.h third_party/xxhash.h $(PZP_DIR)/pzp.h $(OPENZL_DEP)
 CLI_SRC  = pzpdir_cli.c
 
 .PHONY: all clean test test-py fuzz doc check-client bench
@@ -56,6 +68,9 @@ bench_dataloader_replay: scripts/bench_dataloader_replay.c $(LIB_DEPS)
 
 bench_pzpdir_early: scripts/bench_pzpdir_early.c $(LIB_DEPS)
 	$(CC) $(RELEASE) $(LIB_SRC) scripts/bench_pzpdir_early.c -o $@ $(LIBS) -ljpeg -lpng
+
+$(OPENZL_LIB):
+	$(MAKE) -C $(PZP_DIR) PZP_USE_OPENZL=1 OPENZL_DIR=$(abspath $(OPENZL_DIR)) $@
 
 test: tests/test_pzpdir dpzpdir
 	./tests/test_pzpdir

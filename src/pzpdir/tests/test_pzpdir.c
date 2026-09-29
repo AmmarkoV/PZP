@@ -30,6 +30,10 @@
 #include <pthread.h>
 #include <zstd.h>
 #include <lz4.h>
+#if PZP_USE_OPENZL
+#include "openzl/zl_compress.h"
+#include "openzl/zl_compressor.h"
+#endif
 
 #define XXH_INLINE_ALL
 #include "../third_party/xxhash.h"
@@ -310,7 +314,31 @@ static void test_rejections(void)
           "rebuild-manifest names the shard and the cause");
 }
 
-/** @brief Build a single-frame PZP: 40-byte header (+ pixels), size prefix, zstd or lz4. */
+#if PZP_USE_OPENZL
+/** @brief OpenZL-compress bytes as a u8 numeric stream, as pzp.h's USE_OPENZL does. @return size, 0 on failure. */
+static size_t openzl_compress_u8(void *dst, size_t cap, const void *src, size_t n)
+{
+    ZL_Compressor *c = ZL_Compressor_create();
+    ZL_CCtx *cctx = ZL_CCtx_create();
+    size_t out = 0;
+    if ( (c != NULL) && (cctx != NULL) &&
+         !ZL_isError(ZL_Compressor_setParameter(c, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION)) &&
+         !ZL_isError(ZL_Compressor_selectStartingGraphID(c, ZL_GRAPH_COMPRESS_GENERIC)) &&
+         !ZL_isError(ZL_CCtx_refCompressor(cctx, c)) )
+    {
+        ZL_TypedRef *in = ZL_TypedRef_createNumeric(src, 1, n);
+        ZL_Report r = ZL_CCtx_compressTypedRef(cctx, dst, cap, in);
+        ZL_TypedRef_free(in);
+        if (!ZL_isError(r)) { out = ZL_validResult(r); }
+    }
+    ZL_CCtx_free(cctx);
+    ZL_Compressor_free(c);
+    return out;
+}
+#endif
+
+/** @brief Build a single-frame PZP: 40-byte header (+ pixels), size prefix, zstd or lz4 ( or OpenZL,
+ *  codec 2, in PZP_USE_OPENZL builds ). */
 static size_t make_pzp(unsigned char *out, size_t cap, uint32_t w, uint32_t h, uint32_t bpp, uint32_t ch, int lz4)
 {
     uint32_t payload[10 + 64];
@@ -319,8 +347,11 @@ static size_t make_pzp(unsigned char *out, size_t cap, uint32_t w, uint32_t h, u
     payload[1] = bpp; payload[2] = ch; payload[3] = w; payload[4] = h; payload[5] = 8; payload[6] = ch;
     uint32_t usize = sizeof(payload);
     size_t c;
-    if (lz4) { c = (size_t) LZ4_compress_default((const char *) payload, (char *) out + 4, (int) usize, (int)(cap - 4)); usize |= 0x80000000u; }
-    else     { c = ZSTD_compress(out + 4, cap - 4, payload, sizeof(payload), 3); }
+    if (lz4 == 1) { c = (size_t) LZ4_compress_default((const char *) payload, (char *) out + 4, (int) usize, (int)(cap - 4)); usize |= 0x80000000u; }
+#if PZP_USE_OPENZL
+    else if (lz4 == 2) { c = openzl_compress_u8(out + 4, cap - 4, payload, sizeof(payload)); }
+#endif
+    else          { c = ZSTD_compress(out + 4, cap - 4, payload, sizeof(payload), 3); }
     memcpy(out, &usize, 4);
     return c + 4;
 }
@@ -396,6 +427,15 @@ static void test_formats(void)
     CHECK(pzpd_detect_format(pz, pn, NULL, 0, &m) == PZPD_FORMAT_PZP && m.width == 320 && m.height == 240 && m.bits == 16 && m.channels == 1, "PZP zstd");
     pn = make_pzp(pz, sizeof(pz), 64, 48, 8, 3, 1);
     CHECK(pzpd_detect_format(pz, pn, NULL, 0, &m) == PZPD_FORMAT_PZP && m.width == 64 && m.height == 48 && m.bits == 8 && m.channels == 3, "PZP lz4");
+#if PZP_USE_OPENZL
+    pn = make_pzp(pz, sizeof(pz), 96, 72, 8, 1, 2);
+    CHECK(pzpd_detect_format(pz, pn, NULL, 0, &m) == PZPD_FORMAT_PZP && m.width == 96 && m.height == 72 && m.bits == 8 && m.channels == 1 &&
+          (m.meta_flags & PZPD_META_VALID), "PZP OpenZL");
+#endif
+    // An OpenZL stream magic ( 0xD7B1A5C0 + format version ) that does not decode, or that this build cannot decode
+    const unsigned char ozl[16] = { 0x28, 0x01, 0, 0, 0xDB, 0xA5, 0xB1, 0xD7, 1, 2, 3, 4, 5, 6, 7, 8 };
+    CHECK(pzpd_detect_format(ozl, sizeof(ozl), NULL, 0, &m) == PZPD_FORMAT_PZP && m.frames == 1 && !(m.meta_flags & PZPD_META_VALID),
+          "undecodable OpenZL PZP frame: format known, metadata not");
     CHECK(strcmp(pzpd_format_name(PZPD_FORMAT_PNG, f), "PNG ") == 0, "format name");
 }
 

@@ -34,6 +34,20 @@ extern "C"
 #include <lz4.h>
 //sudo apt install liblz4-dev
 
+/* Build with PZP_USE_OPENZL=1 ( `make PZP_USE_OPENZL=1` fetches and builds OpenZL v0.3.0 ) to read
+ * and write OpenZL-compressed frames ( USE_OPENZL ). Without it such frames are detected and
+ * rejected with a message instead of being handed to zstd. */
+#ifndef PZP_USE_OPENZL
+#define PZP_USE_OPENZL 0
+#endif
+
+#if PZP_USE_OPENZL
+#include "openzl/zl_compress.h"
+#include "openzl/zl_compressor.h"
+#include "openzl/zl_decompress.h"
+#include "openzl/zl_graph_api.h"
+#endif
+
 #if INTEL_OPTIMIZATIONS
 #include <immintrin.h>  // AVX intrinsics
 #include <emmintrin.h>  // SSE2
@@ -87,6 +101,13 @@ static inline void pzp_thread_init(void)
         _pzp_zstd_dctx = ZSTD_createDCtx();
 }
 
+#if PZP_USE_OPENZL
+/* Per-thread OpenZL state, created lazily like _pzp_zstd_dctx */
+static _Thread_local ZL_Compressor *_pzp_zl_compressor = NULL;
+static _Thread_local ZL_CCtx       *_pzp_zl_cctx       = NULL;
+static _Thread_local ZL_DCtx       *_pzp_zl_dctx       = NULL;
+#endif
+
 static inline void pzp_thread_cleanup(void)
 {
     if (_pzp_zstd_dctx)
@@ -94,6 +115,11 @@ static inline void pzp_thread_cleanup(void)
         ZSTD_freeDCtx(_pzp_zstd_dctx);
         _pzp_zstd_dctx = NULL;
     }
+#if PZP_USE_OPENZL
+    ZL_Compressor_free(_pzp_zl_compressor); _pzp_zl_compressor = NULL;
+    ZL_CCtx_free(_pzp_zl_cctx);             _pzp_zl_cctx       = NULL;
+    ZL_DCtx_free(_pzp_zl_dctx);             _pzp_zl_dctx       = NULL;
+#endif
 }
 
 
@@ -110,7 +136,8 @@ typedef enum
     USE_RLE          = 1 << 1,  // 0010 — intra-frame delta filter before zstd
     USE_PALETTE      = 1 << 2,  // 0100 — per-channel palette indexing
     USE_INTER_DELTA  = 1 << 3,  // 1000 — inter-frame delta: store frame[N] - frame[N-1]
-    USE_LZ4          = 1 << 4   // 10000 — use LZ4 instead of ZSTD (faster decompress on ramdisk)
+    USE_LZ4          = 1 << 4,  // 10000 — use LZ4 instead of ZSTD (faster decompress on ramdisk)
+    USE_OPENZL       = 1 << 5   // 100000 — use OpenZL instead of ZSTD ( needs PZP_USE_OPENZL )
 } PZPFlags;
 
 /* ─── Channel groups ─────────────────────────────────────────────────────────
@@ -152,6 +179,12 @@ typedef struct
  * Bits 0–30 hold the uncompressed payload size (max ~2 GB). */
 #define PZP_CODEC_LZ4_FLAG  0x80000000u
 #define PZP_CODEC_SIZE_MASK 0x7FFFFFFFu
+
+/* With bit 31 = 0 the stream's own magic tells ZSTD and OpenZL apart: ZSTD frames start with
+ * 0xFD2FB528, OpenZL frames with 0xD7B1A5C0 + format version ( low 6 bits, 27 in OpenZL v0.3.0 ).
+ * Decoders without OpenZL support would hand an OpenZL frame to zstd, which rejects it. */
+#define PZP_OPENZL_MAGIC_BASE 0xD7B1A5C0u
+#define PZP_OPENZL_MAGIC_MASK 0xFFFFFFC0u
 
 // ─── Container format constants ──────────────────────────────────────────────
 
@@ -537,6 +570,76 @@ static void pzp_RLE_filter(unsigned char **buffers, int num_buffers, int WIDTH, 
  *
  * NOTE: modifies buffers[] in-place (palette encoding then prediction).
  */
+/* 1 if a bit-31-clear frame stream starts with the OpenZL magic ( see PZP_OPENZL_MAGIC_BASE ) */
+static int pzp_is_openzl_stream(const void *stream, size_t size)
+{
+    unsigned int magic;
+    if (size < sizeof(unsigned int)) return 0;
+    memcpy(&magic, stream, sizeof(unsigned int));
+    return (magic & PZP_OPENZL_MAGIC_MASK) == PZP_OPENZL_MAGIC_BASE;
+}
+
+#if PZP_USE_OPENZL
+/* The payload goes in as a numeric stream of bytes, split by sparse_num_auto into runs of its most
+ * common value plus literals, both sent to the generic graph. On COCO segmentation maps this is
+ * ~15% smaller than zstd -19 and decodes faster ( scripts/openzl_bench ). Checksums are off, as
+ * for the zstd frames pzp writes. Returns the compressed size, 0 on failure. */
+static size_t pzp_openzl_compress(void *dst, size_t dst_capacity, const void *src, size_t src_size)
+{
+    if (!_pzp_zl_compressor)
+    {
+        ZL_Compressor *c = ZL_Compressor_create();
+        ZL_GraphID start = c ? ZL_Compressor_registerStaticGraph_fromNode(c, ZL_NODE_SPARSE_NUM_AUTO,
+                               ZL_GRAPHLIST(ZL_GRAPH_COMPRESS_GENERIC, ZL_GRAPH_COMPRESS_GENERIC)) : ZL_GRAPH_ILLEGAL;
+        if (!c || !ZL_GraphID_isValid(start) ||
+            ZL_isError(ZL_Compressor_setParameter(c, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION)) ||
+            ZL_isError(ZL_Compressor_setParameter(c, ZL_CParam_compressionLevel, ZL_COMPRESSIONLEVEL_DEFAULT)) ||
+            ZL_isError(ZL_Compressor_setParameter(c, ZL_CParam_compressedChecksum, ZL_TernaryParam_disable)) ||
+            ZL_isError(ZL_Compressor_setParameter(c, ZL_CParam_contentChecksum, ZL_TernaryParam_disable)) ||
+            ZL_isError(ZL_Compressor_selectStartingGraphID(c, start)))
+        {
+            fprintf(stderr, "pzp: could not set up the OpenZL compressor\n");
+            ZL_Compressor_free(c);
+            return 0;
+        }
+        _pzp_zl_compressor = c;
+    }
+    if (!_pzp_zl_cctx && !(_pzp_zl_cctx = ZL_CCtx_create())) return 0;
+    if (ZL_isError(ZL_CCtx_refCompressor(_pzp_zl_cctx, _pzp_zl_compressor))) return 0;
+
+    ZL_TypedRef *input = ZL_TypedRef_createNumeric(src, 1, src_size);
+    if (!input) return 0;
+    ZL_Report r = ZL_CCtx_compressTypedRef(_pzp_zl_cctx, dst, dst_capacity, input);
+    ZL_TypedRef_free(input);
+    if (ZL_isError(r))
+    {
+        fprintf(stderr, "pzp: openzl error: %s\n", ZL_CCtx_getErrorContextString(_pzp_zl_cctx, r));
+        return 0;
+    }
+    return ZL_validResult(r);
+}
+
+/* Returns the decompressed size, 0 on failure. */
+static size_t pzp_openzl_decompress(void *dst, size_t dst_capacity, const void *src, size_t src_size)
+{
+    if (!_pzp_zl_dctx)
+    {
+        if (!(_pzp_zl_dctx = ZL_DCtx_create())) return 0;
+        ZL_DCtx_setParameter(_pzp_zl_dctx, ZL_DParam_stickyParameters, 1);
+        ZL_DCtx_setParameter(_pzp_zl_dctx, ZL_DParam_checkCompressedChecksum, ZL_TernaryParam_disable);
+        ZL_DCtx_setParameter(_pzp_zl_dctx, ZL_DParam_checkContentChecksum, ZL_TernaryParam_disable);
+    }
+    ZL_OutputInfo info;
+    ZL_Report r = ZL_DCtx_decompressTyped(_pzp_zl_dctx, &info, dst, dst_capacity, src, src_size);
+    if (ZL_isError(r))
+    {
+        fprintf(stderr, "OpenZL decompression error: %s\n", ZL_DCtx_getErrorContextString(_pzp_zl_dctx, r));
+        return 0;
+    }
+    return (size_t)info.decompressedByteSize;
+}
+#endif // PZP_USE_OPENZL
+
 static unsigned char *pzp_compress_frame_to_memory(
         unsigned char **buffers,
         unsigned int width,    unsigned int height,
@@ -556,6 +659,19 @@ static unsigned char *pzp_compress_frame_to_memory(
         fprintf(stderr, "pzp: unsupported channel group table for %u channels @ %u bit (configuration %u)\n",
                 ch_int, bpp_int, configuration);
         return NULL;
+    }
+    if (configuration & USE_OPENZL)
+    {
+        if (!PZP_USE_OPENZL)
+        {
+            fprintf(stderr, "pzp: USE_OPENZL needs a build with PZP_USE_OPENZL=1\n");
+            return NULL;
+        }
+        if (configuration & USE_LZ4)
+        {
+            fprintf(stderr, "pzp: USE_OPENZL and USE_LZ4 cannot be combined\n");
+            return NULL;
+        }
     }
 
     /* ── palette encoding ── */
@@ -630,9 +746,9 @@ static unsigned char *pzp_compress_frame_to_memory(
 
     h[7] = hash_checksum(write_ptr, pixel_data_size);
 
-    /* ── compress (LZ4 or ZSTD) ── */
+    /* ── compress (LZ4, OpenZL or ZSTD) ── */
     /* result layout: [4-byte prefix][compressed bytes]
-     * prefix bit 31 = codec: 0=ZSTD, 1=LZ4  (PZP_CODEC_LZ4_FLAG)
+     * prefix bit 31 = codec: 0=ZSTD or OpenZL ( told apart by stream magic ), 1=LZ4  (PZP_CODEC_LZ4_FLAG)
      * prefix bits 0-30 = uncompressed payload size (PZP_CODEC_SIZE_MASK) */
     size_t max_comp;
     unsigned char *frame_buf;
@@ -659,6 +775,26 @@ static unsigned char *pzp_compress_frame_to_memory(
         unsigned int prefix = (unsigned int)payload_size | PZP_CODEC_LZ4_FLAG;
         memcpy(frame_buf, &prefix, sizeof(unsigned int));
     }
+#if PZP_USE_OPENZL
+    else if (configuration & USE_OPENZL)
+    {
+        /* ZL_compressBound() covers a single serial input; the numeric input's split streams can
+           carry a little more framing, hence the slack */
+        max_comp  = ZL_compressBound(payload_size) + 4096;
+        frame_buf = (unsigned char *)malloc(sizeof(unsigned int) + max_comp);
+        if (!frame_buf) { free(payload); return NULL; }
+
+        comp_size = pzp_openzl_compress(frame_buf + sizeof(unsigned int), max_comp, payload, payload_size);
+        free(payload);
+
+        if (comp_size == 0)
+        {
+            free(frame_buf);
+            return NULL;
+        }
+        memcpy(frame_buf, &payload_size, sizeof(unsigned int));
+    }
+#endif
     else
     {
         int    zstd_level = (configuration & USE_PALETTE) ? 19 : 1;
@@ -689,9 +825,10 @@ static unsigned char *pzp_compress_frame_to_memory(
         else if (configuration & USE_INTER_DELTA)                             mode_str = " idelta";
         else if (configuration & USE_RLE)                                     mode_str = " rle";
         fprintf(stderr,
-            "  compress: %u B → %zu B  ratio=%.2f×%s%s\n",
+            "  compress: %u B → %zu B  ratio=%.2f×%s%s%s\n",
             payload_size, comp_size,
             (float)payload_size / (float)comp_size,
+            (configuration & USE_OPENZL)  ? " openzl"  : "",
             (configuration & USE_PALETTE) ? " palette" : "",
             mode_str);
     }
@@ -2009,6 +2146,22 @@ static unsigned char* pzp_frame_decode_from_memory(
             return 0;
         }
         actual_decompressed_size = (size_t)lz4_result;
+    }
+    else if (pzp_is_openzl_stream(compressed_buffer, compressed_size))
+    {
+#if PZP_USE_OPENZL
+        actual_decompressed_size = pzp_openzl_decompress(decompressed_buffer, decompressed_size,
+                                                         compressed_buffer, compressed_size);
+        if (actual_decompressed_size == 0)
+        {
+            free(decompressed_buffer);
+            return 0;
+        }
+#else
+        free(decompressed_buffer);
+        fprintf(stderr, "pzp: frame is OpenZL-compressed; rebuild with PZP_USE_OPENZL=1 to read it\n");
+        return 0;
+#endif
     }
     else
     {

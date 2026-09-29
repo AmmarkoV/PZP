@@ -63,6 +63,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <zstd.h>
 #include <lz4.h>
 
+#ifndef PZP_USE_OPENZL
+/** @brief 1 when built against OpenZL ( same switch as pzp.h ): the metadata of OpenZL-compressed
+ *  PZP frames is then read too. Without it such frames are still detected as PZP. */
+#define PZP_USE_OPENZL 0
+#endif
+#if PZP_USE_OPENZL
+#include "openzl/zl_decompress.h"
+#endif
+
 /** @brief Make every xxHash function static inline: no symbols are exported, so there is no
  *  clash with a system libxxhash or another vendored copy in the same program. */
 #define XXH_INLINE_ALL

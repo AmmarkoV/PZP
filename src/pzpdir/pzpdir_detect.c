@@ -196,8 +196,20 @@ static int pzpd_probe_npy(const unsigned char *d, size_t n, pzpd_blob_meta *m)
     return 1;
 }
 
+/** @brief 1 if a size-prefixed PZP frame holds an OpenZL stream: size prefix bit 31 clear ( not
+ *  lz4 ), a plausible size, and the OpenZL magic 0xD7B1A5C0 + format version ( low 6 bits ) where a
+ *  zstd frame would have 0xFD2FB528 ( PZP_OPENZL_MAGIC_BASE in pzp.h ). */
+static int pzpd_pzp_is_openzl(const unsigned char *frame, size_t n)
+{
+    if (n < 8) { return 0; }
+    uint32_t prefix = pzpd_le32(frame);
+    return !(prefix & 0x80000000u) && (prefix >= 40) && ((pzpd_le32(frame + 4) & 0xFFFFFFC0u) == 0xD7B1A5C0u);
+}
+
 /** @brief Decompress the first 40 bytes (the inner PZP frame header) of a size-prefixed
- *  zstd / lz4 PZP frame. Uses zstd / lz4 directly, so it works without pzp.h.
+ *  zstd / lz4 / OpenZL PZP frame. Uses the codecs directly, so it works without pzp.h. OpenZL frames
+ *  are only read when built with PZP_USE_OPENZL=1, and are decoded whole ( OpenZL has no partial
+ *  decode ).
  *  @param frame Start of the frame (the 4-byte size prefix).
  *  @param n     Bytes available from frame.
  *  @param hdr   Receives 10 × u32.
@@ -209,7 +221,28 @@ static int pzpd_pzp_inner_header(const unsigned char *frame, size_t n, uint32_t 
     uint32_t usize  = prefix & 0x7FFFFFFFu;
     if (usize < 40) { return 0; }
     unsigned char out[40];
-    if (prefix & 0x80000000u)
+    if (pzpd_pzp_is_openzl(frame, n))
+    {
+#if PZP_USE_OPENZL
+        if (usize > 100000000u) { return 0; }   // pzp.h's own sanity limit on a frame's size
+        unsigned char *full = (unsigned char *) malloc(usize);
+        ZL_DCtx *ctx = ZL_DCtx_create();
+        int ok = 0;
+        if ( (full != NULL) && (ctx != NULL) )
+        {
+            ZL_OutputInfo info;
+            ZL_Report r = ZL_DCtx_decompressTyped(ctx, &info, full, usize, frame + 4, n - 4);
+            ok = !ZL_isError(r) && (info.decompressedByteSize >= 40);
+            if (ok) { memcpy(out, full, 40); }
+        }
+        ZL_DCtx_free(ctx);
+        free(full);
+        if (!ok) { return 0; }
+#else
+        return 0;
+#endif
+    }
+    else if (prefix & 0x80000000u)
     {
         int cs = (n - 4 > 0x7FFFFFFF) ? 0x7FFFFFFF : (int)(n - 4);
         int got = LZ4_decompress_safe_partial((const char *)(frame + 4), (char *) out, cs, 40, 40);
@@ -273,6 +306,12 @@ static int pzpd_probe_pzp(const unsigned char *d, size_t n, pzpd_blob_meta *m)
     {
         m->format = PZPD_FORMAT_PZP;
         pzpd_pzp_fill(hdr, m);
+        m->frames = 1;
+        return 1;
+    }
+    if (pzpd_pzp_is_openzl(d, n))   // OpenZL frame this build cannot ( or could not ) read: format known, metadata not
+    {
+        m->format = PZPD_FORMAT_PZP;
         m->frames = 1;
         return 1;
     }

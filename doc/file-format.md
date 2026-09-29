@@ -4,9 +4,9 @@
 
 ```
 [ 4 bytes  ] size prefix (uint32, little-endian):
-               bit 31 = codec flag  (0 = ZSTD, 1 = LZ4)
+               bit 31 = codec flag  (0 = ZSTD or OpenZL, 1 = LZ4)
                bits 0–30 = uncompressed payload size
-[ N bytes  ] compressed payload (ZSTD or LZ4):
+[ N bytes  ] compressed payload (ZSTD, OpenZL or LZ4):
     [ 40 bytes ] header  (10 × uint32)
                    magic · bpp_ext · channels_ext · width · height
                    bpp_int · channels_int · checksum · config · palette_bytes
@@ -65,6 +65,10 @@ of the previous LZ4 size and 54% of the previous ZSTD size, and decodes
 
 The codec is selected per-frame via bit 31 of the size prefix.  All existing
 files written without `USE_LZ4` have bit 31 = 0 and are backward-compatible.
+When bit 31 is 0 the stream's own magic number tells ZSTD (`0xFD2FB528`) and
+OpenZL (`0xD7B1A5C0` + format version in the low 6 bits) apart, so OpenZL
+needed no new header field.  Builds without `PZP_USE_OPENZL` report OpenZL
+frames as unsupported instead of decoding them.
 
 ---
 
@@ -99,6 +103,7 @@ ZSTD and LZ4 frames.
 | `USE_PALETTE` | 4 | Per-channel palette indexing — best for images with few unique values per channel (e.g. segmentation maps) |
 | `USE_INTER_DELTA` | 8 | Inter-frame delta — each frame stores `frame[N] − frame[N−1]`; useful only when consecutive frames are very similar (slow pan, static background) |
 | `USE_LZ4` | 16 | Use LZ4 instead of ZSTD — faster decompression, larger output; codec is stored per-frame in bit 31 of the size prefix |
+| `USE_OPENZL` | 32 | Use OpenZL ( `sparse_num` graph ) instead of ZSTD — ~15% smaller than ZSTD-19 on segmentation maps; needs a `make PZP_USE_OPENZL=1` build, cannot be combined with `USE_LZ4` |
 
 Flags can be combined with `|`.  Recommended combinations:
 

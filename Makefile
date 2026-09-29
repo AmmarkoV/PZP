@@ -12,6 +12,20 @@ DPZP = dpzp
 SPZP = spzp
 LIBPZP = libpzp.so
 
+# Optional OpenZL codec ( USE_OPENZL / pzp --openzl ): `make PZP_USE_OPENZL=1`.
+# OPENZL_DIR may point at an existing OpenZL checkout; if it has none, OPENZL_VERSION is cloned there.
+# Either way libopenzl.a is built ( position independent, for libpzp.so ) in $(OPENZL_DIR)/build-pzp.
+PZP_USE_OPENZL ?= 0
+OPENZL_VERSION ?= v0.3.0
+OPENZL_DIR     ?= build/openzl
+OPENZL_BUILD    = $(OPENZL_DIR)/build-pzp
+OPENZL_LIB      = $(OPENZL_BUILD)/libopenzl.a
+
+ifeq ($(PZP_USE_OPENZL),1)
+OPENZL_DEP = $(OPENZL_LIB)
+CFLAGS    := -DPZP_USE_OPENZL=1 -I$(OPENZL_DIR)/include -I$(OPENZL_BUILD)/include $(OPENZL_LIB) -lstdc++ -lpthread $(CFLAGS)
+endif
+
 PREFIX      ?= /usr/local
 BINDIR       = $(PREFIX)/bin
 LIBDIR       = $(PREFIX)/lib
@@ -23,17 +37,25 @@ THUMBDIR     = $(PREFIX)/share/thumbnailers
 
 all: $(PZP) $(DPZP) $(SPZP) $(LIBPZP)
 
-$(PZP): $(SRC) pzp.h
+$(PZP): $(SRC) pzp.h $(OPENZL_DEP)
 	$(CC) $(SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(PZP)
 
-$(DPZP): $(SRC) pzp.h
+$(DPZP): $(SRC) pzp.h $(OPENZL_DEP)
 	$(CC) $(SRC) $(DEBUG_FLAGS) $(CFLAGS) -o $(DPZP)
 
-$(SPZP): $(SRC) pzp.h
+$(SPZP): $(SRC) pzp.h $(OPENZL_DEP)
 	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(SPZP)
 
-$(LIBPZP): $(LIB_SRC) pzp.h
+$(LIBPZP): $(LIB_SRC) pzp.h $(OPENZL_DEP)
 	$(CC) -shared -fPIC $(LIB_SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(LIBPZP)
+
+$(OPENZL_LIB):
+	@if [ ! -f $(OPENZL_DIR)/CMakeLists.txt ]; then \
+		echo "OpenZL not found in $(OPENZL_DIR), fetching $(OPENZL_VERSION)"; \
+		git clone --depth 1 --branch $(OPENZL_VERSION) https://github.com/facebook/openzl.git $(OPENZL_DIR); \
+	fi
+	cmake -S $(OPENZL_DIR) -B $(OPENZL_BUILD) -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+	cmake --build $(OPENZL_BUILD) -j$(shell nproc) --target openzl
 
 clean:
 	rm -rf $(PZP) $(DPZP) $(SPZP) $(LIBPZP) $(OUTDIR)/*.pzp $(OUTDIR)/*.ppm log*.txt

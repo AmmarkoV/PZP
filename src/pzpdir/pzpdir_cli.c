@@ -89,6 +89,10 @@ static void usage(void)
       "  pzpdir add-stream | replace-stream <archive> STREAM <list|-> [--missing keep|drop]   (shard by shard)\n"
       "  pzpdir drop-stream <archive> STREAM\n"
       "  pzpdir compact <archive>                  (drop dead table sections left by table edits)\n"
+      "  pzpdir split   <archive> <out.pzpd> RANGES [--cut] [--align 64|4096] [--shard-size 4G]\n"
+      "                 (copy records to a new archive; RANGES = FIRST:END,... ordinals, END exclusive, N = one record,\n"
+      "                  an empty side = start / end; --cut also removes them from <archive>)\n"
+      "  pzpdir join    <out.pzpd> <a.pzpd> <b.pzpd> ... [--align 64|4096] [--shard-size 4G]   (concatenate into one archive)\n"
       "  pzpdir words   <archive...> [TABLE.COLUMN] [--source S | --sources] [--canonical] [--top N | --word W]\n"
       "                 (word index: word<TAB>records<TAB>count by records; --word: keys of the records containing W)\n"
       "  pzpdir reindex <archive> [TABLE.COLUMN [SOURCE_COLUMN]] [--drop]   (no TABLE.COLUMN: rebuild every word index)\n\n"
@@ -1684,6 +1688,45 @@ static int cmd_reindex(const char *archive, const char *spec, const char *source
 
 //-----------------------------------------------------------------------------------------------
 
+/** @brief `pzpdir split <archive> <out.pzpd> RANGES [--cut]`. @return exit code. */
+static int cmd_split(const char *archive, const char *out, const char *spec, int cut, uint64_t shard, uint32_t align)
+{
+    // RANGES: FIRST:END[,FIRST:END...]; N alone is N:N+1; an empty FIRST is 0, an empty END the archive's end
+    pzpd *a = pzpd_open(archive, 0);
+    if (a == NULL) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
+    uint64_t total = pzpd_count(a);
+    pzpd_close(a);
+    size_t cap = 1;
+    for (const char *p = spec; *p; p++) { cap += (*p == ','); }
+    uint64_t *rg = (uint64_t *) malloc(cap * 2 * sizeof(uint64_t));
+    if (rg == NULL) { fprintf(stderr, CLI_RED "out of memory" CLI_NORMAL "\n"); return 1; }
+    size_t n = 0;
+    int bad = 0;
+    for (const char *p = spec; ; )
+    {
+        int num = (*p >= '0') && (*p <= '9');
+        char *e = (char *) p;
+        uint64_t first = num ? strtoull(p, &e, 10) : 0, end = first + 1;
+        if (*e == ':')
+        {
+            p = e + 1;
+            end = total;
+            if ( (*p >= '0') && (*p <= '9') ) { end = strtoull(p, &e, 10); } else { e = (char *) p; }
+        }
+        else if (!num) { bad = 1; break; }
+        rg[2 * n] = first; rg[2 * n + 1] = end; n++;
+        if (*e == 0) { break; }
+        if (*e != ',') { bad = 1; break; }
+        p = e + 1;
+    }
+    if (bad) { fprintf(stderr, CLI_RED "bad ranges \"%s\" (FIRST:END,... with END exclusive, or N)" CLI_NORMAL "\n", spec); free(rg); return 1; }
+    int ok = pzpd_split(archive, out, rg, n, cut ? PZPD_SPLIT_CUT : 0, shard, align);
+    free(rg);
+    if (!ok) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
+    fprintf(stderr, CLI_GREEN "wrote %s%s%s" CLI_NORMAL "\n", out, cut ? ", cut from " : "", cut ? archive : "");
+    return 0;
+}
+
 /** @brief Entry point: dispatch the subcommand.
  *  @param argc Argument count.
  *  @param argv `pzpdir <command> <arguments...> [options]`.
@@ -1697,7 +1740,7 @@ int main(int argc, char **argv)
     const char *streams = NULL, *stream = NULL, *table = NULL, *schemas = NULL, *listOut = NULL, *out = NULL, *missing = NULL;
     uint64_t shard = 0;
     uint32_t align = 0;
-    int lng = 0, names = 0, blobs = 0, absolute = 0, refresh = 0, dups = 0, sources = 0, canonical = 0, drop = 0;
+    int lng = 0, names = 0, blobs = 0, absolute = 0, refresh = 0, dups = 0, sources = 0, canonical = 0, drop = 0, cut = 0;
     const char *source = NULL, *word = NULL;
     long top = 0;
     const char *pos[256] = {0};
@@ -1725,6 +1768,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--sources") == 0)   { sources = 1; }
         else if (strcmp(argv[i], "--canonical") == 0) { canonical = 1; }
         else if (strcmp(argv[i], "--drop") == 0)      { drop = 1; }
+        else if (strcmp(argv[i], "--cut") == 0)       { cut = 1; }
         else if ( (argv[i][0] == '-') && (argv[i][1] == '-') ) { fprintf(stderr, "unknown option %s\n", argv[i]); usage(); return 1; }
         else if (npos < 256) { pos[npos++] = argv[i]; }
         else { fprintf(stderr, "too many arguments\n"); return 1; }
@@ -1768,6 +1812,13 @@ int main(int argc, char **argv)
             { fprintf(stderr, "--missing takes %s\n", isTable ? "empty or keep" : "keep or drop"); return 1; }
         int flag = (missing != NULL) && !strcmp(missing, isTable ? "keep" : "drop");
         return isTable ? cmd_edit_table(op, pos[0], pos[1], (npos == 3) ? pos[2] : NULL, flag) : cmd_edit_stream(op, pos[0], pos[1], (npos == 3) ? pos[2] : NULL, flag);
+    }
+    if ( (strcmp(cmd, "split") == 0) && (npos == 3) ) { return cmd_split(pos[0], pos[1], pos[2], cut, shard, align); }
+    if ( (strcmp(cmd, "join") == 0) && (npos >= 2) )
+    {
+        if (!pzpd_join(pos[0], pos + 1, (unsigned) (npos - 1), shard, align)) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
+        fprintf(stderr, CLI_GREEN "wrote %s from %d archive(s)" CLI_NORMAL "\n", pos[0], npos - 1);
+        return 0;
     }
     if ( (strcmp(cmd, "compact") == 0) && (npos == 1) )
     {

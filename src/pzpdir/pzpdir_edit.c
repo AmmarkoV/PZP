@@ -911,3 +911,395 @@ int pzpd_edit_stream(const char *manifest, unsigned op, const char *stream, cons
     if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }
+
+//-----------------------------------------------------------------------------------------------
+// Split and join: records are copied into a new archive by the writer (blobs byte for byte with their
+// stored metadata, table rows, groups); the writer rebuilds the word indexes.
+//-----------------------------------------------------------------------------------------------
+
+/** @brief One input of a split / join and where its streams and tables go in the output. */
+struct pzpd_cin
+{
+    struct pzpd_archive *a;              ///< The open input
+    const char          *path;           ///< Its path (for messages)
+    int to_s[PZPD_MAX_STREAMS];          ///< Input stream -> output stream
+    int to_t[PZPD_MAX_TABLES];           ///< Input table -> output table
+};
+
+/** @brief The group being copied: consecutive records of one input group become one output group. */
+struct pzpd_grun
+{
+    unsigned input;   ///< Input of the group
+    uint32_t old;     ///< Its id there, PZPD_NO_GROUP before the first group
+    uint32_t id;      ///< Its id in the output
+};
+
+/** @brief Canonical directory of a path (realpath of everything before the last '/'), malloc'd, or NULL. */
+static char *pzpd_real_dir(const char *path)
+{
+    const char *sl = strrchr(path, '/');
+    char *d = (sl == NULL) ? strdup(".") : strndup(path, (sl == path) ? 1 : (size_t)(sl - path));
+    char *r = (d != NULL) ? realpath(d, NULL) : NULL;
+    free(d);
+    return r;
+}
+
+/** @brief 1 if writing an archive with manifest `out` would replace the file `path`: the same manifest, or
+ *  a shard name `<out without .pzpd>.NNNNN.pzpd` of that archive (in the same directory). */
+static int pzpd_out_clashes(const char *out, const char *path)
+{
+    char *od = pzpd_real_dir(out), *pd = pzpd_real_dir(path);
+    int same = (od != NULL) && (pd != NULL) && !strcmp(od, pd);
+    free(od);
+    free(pd);
+    if (!same) { return 0; }
+    const char *ob = strrchr(out, '/'), *pb = strrchr(path, '/');
+    ob = (ob == NULL) ? out : ob + 1;
+    pb = (pb == NULL) ? path : pb + 1;
+    if (!strcmp(ob, pb)) { return 1; }
+    size_t ol = strlen(ob), pl = strlen(pb);
+    if ( (ol > 5) && !strcmp(ob + ol - 5, ".pzpd") ) { ol -= 5; }
+    if ( (pl < ol + 7) || strncmp(pb, ob, ol) || (pb[ol] != '.') || strcmp(pb + pl - 5, ".pzpd") ) { return 0; }
+    for (size_t i = ol + 1; i < pl - 5; i++) { if ( (pb[i] < '0') || (pb[i] > '9') ) { return 0; } }
+    return 1;
+}
+
+/** @brief 1 if writing `out` would replace the manifest `path` or any shard of the open archive a (error set). */
+static int pzpd_out_clashes_archive(const char *out, const char *path, const struct pzpd_archive *a)
+{
+    int clash = pzpd_out_clashes(out, path);
+    for (unsigned k = 0; !clash && (k < a->shard_count); k++) { clash = pzpd_out_clashes(out, a->shards[k].path); }
+    if (clash) { pzpd_set_error(PZPD_E_ARG, "writing %s would overwrite %s or one of its shards", out, path); }
+    return clash;
+}
+
+/** @brief Compare the rows of a global table in two archives (rendered as CSV, so string heaps may differ).
+ *  @return 1 equal, 0 different, -1 out of memory (error set). */
+static int pzpd_global_rows_equal(const struct pzpd_tschema *sc, const struct pzpd_tview *x, const struct pzpd_tview *y)
+{
+    if (x->rows != y->rows) { return 0; }
+    struct pzpd_buf a = {0}, b = {0};
+    int ok = 1;
+    for (uint64_t r = 0; ok && (r < x->rows); r++)
+    {
+        ok = pzpd_csv_render(sc, x->rowdata + r * sc->stride, x->heap, x->heap_bytes, &a) &&
+             pzpd_csv_render(sc, y->rowdata + r * sc->stride, y->heap, y->heap_bytes, &b);
+    }
+    int eq = ok && (a.len == b.len) && ( (a.len == 0) || !memcmp(a.data, b.data, a.len) );
+    pzpd_buf_free(&a);
+    pzpd_buf_free(&b);
+    if (!ok) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return -1; }
+    return eq;
+}
+
+/** @brief Create the writer of a split / join output: streams unioned by name (first-seen order), tables
+ *  unioned by name (same schema, and global tables the same rows), word index declarations unioned.
+ *  Fills each input's to_s / to_t. @return The writer, or NULL (error set). */
+static pzpd_writer *pzpd_join_writer(const char *out, struct pzpd_cin *in, unsigned n, uint64_t shard_max, uint32_t align)
+{
+    char streams[PZPD_MAX_STREAMS][24];
+    const struct pzpd_tschema *tabs[PZPD_MAX_TABLES];
+    const struct pzpd_tview *gview[PZPD_MAX_TABLES];
+    unsigned S = 0, T = 0;
+    for (unsigned i = 0; i < n; i++)
+    {
+        struct pzpd_archive *a = in[i].a;
+        for (unsigned u = 0; u < a->S; u++)
+        {
+            unsigned o = 0;
+            while ( (o < S) && strcmp(streams[o], a->streams[u]) ) { o++; }
+            if (o == S)
+            {
+                if (S == PZPD_MAX_STREAMS) { pzpd_set_error(PZPD_E_ARG, "the inputs have more than %d streams together", PZPD_MAX_STREAMS); return NULL; }
+                memcpy(streams[S++], a->streams[u], 24);
+            }
+            in[i].to_s[u] = (int) o;
+        }
+        for (unsigned t = 0; t < a->T; t++)
+        {
+            const struct pzpd_tschema *sc = &a->tables[t];
+            unsigned o = 0;
+            while ( (o < T) && strcmp(tabs[o]->name, sc->name) ) { o++; }
+            if (o == T)
+            {
+                if (T == PZPD_MAX_TABLES) { pzpd_set_error(PZPD_E_ARG, "the inputs have more than %d tables together", PZPD_MAX_TABLES); return NULL; }
+                tabs[T] = sc;
+                gview[T++] = &a->gview[t];
+            }
+            else if (!pzpd_schema_equal(tabs[o], sc)) { pzpd_set_error(PZPD_E_ARG, "%s: table %s has another schema than in an earlier input", in[i].path, sc->name); return NULL; }
+            else if (sc->flags & PZPD_TABLE_GLOBAL)
+            {
+                int eq = pzpd_global_rows_equal(sc, gview[o], &a->gview[t]);
+                if (eq < 0) { return NULL; }
+                if (!eq) { pzpd_set_error(PZPD_E_ARG, "%s: global table %s has other rows than in an earlier input", in[i].path, sc->name); return NULL; }
+            }
+            in[i].to_t[t] = (int) o;
+        }
+    }
+    for (unsigned t = 0; t < T; t++)
+    {
+        for (unsigned u = 0; u < S; u++) { if (!strcmp(tabs[t]->name, streams[u])) { pzpd_set_error(PZPD_E_ARG, "\"%s\" is a stream in one input and a table in another", streams[u]); return NULL; } }
+    }
+    if (align == 0)
+    {
+        struct pzpd_rshard *s0 = pzpd_shard(in[0].a, 0);
+        if (s0 == NULL) { return NULL; }
+        align = s0->sb.align;
+    }
+
+    const char *sp[PZPD_MAX_STREAMS];
+    for (unsigned u = 0; u < S; u++) { sp[u] = streams[u]; }
+    pzpd_writer_opts o = { sp, S, shard_max, align };
+    pzpd_writer *w = pzpd_writer_create(out, &o);
+    if (w == NULL) { return NULL; }
+    int ok = 1;
+    for (unsigned t = 0; ok && (t < T); t++) { ok = pzpd_writer_table_copy(w, tabs[t]); }
+    for (unsigned t = 0; ok && (t < T); t++)
+    {
+        if (tabs[t]->flags & PZPD_TABLE_GLOBAL) { ok = pzpd_writer_global_rows(w, t, gview[t]->rowdata, (uint32_t) gview[t]->rows, gview[t]->heap, gview[t]->heap_bytes); }
+    }
+    // Word indexes, as declared in each input's first shard
+    for (unsigned i = 0; ok && (i < n); i++)
+    {
+        struct pzpd_rshard *s = pzpd_shard(in[i].a, 0);
+        if (s == NULL) { ok = 0; break; }
+        unsigned nw = s->words_bad ? 0 : pzpd_words_used(s->sb.words);
+        for (unsigned j = 0; ok && (j < nw); j++)
+        {
+            struct pzpd_wsec v;
+            if (!pzpd_shard_wsec(s, j, &v)) { ok = 0; break; }
+            unsigned k = 0;
+            while ( (k < w->W) && (strcmp(w->words[k].table, s->sb.words[j].table) || strcmp(w->words[k].column, s->sb.words[j].column)) ) { k++; }
+            if (k == w->W) { ok = pzpd_writer_words(w, s->sb.words[j].table, s->sb.words[j].column, v.source_column[0] ? v.source_column : NULL); }
+            else if (strcmp(w->words[k].source, v.source_column))
+            {
+                pzpd_set_error(PZPD_E_ARG, "%s: word index %s.%s has another source column than in an earlier input", in[i].path, w->words[k].table, w->words[k].column);
+                ok = 0;
+            }
+        }
+    }
+    if (!ok)
+    {
+        struct pzpd_saved_error e;
+        pzpd_error_save(&e);
+        pzpd_writer_abort(w);
+        pzpd_error_restore(&e);
+        return NULL;
+    }
+    return w;
+}
+
+/** @brief Copy records first..end-1 of an input to the writer. @return 1 on success, 0 on failure (error set). */
+static int pzpd_copy_records(pzpd_writer *w, const struct pzpd_cin *c, unsigned input, uint64_t first, uint64_t end, struct pzpd_grun *run)
+{
+    struct pzpd_archive *a = c->a;
+    for (uint64_t i = first; i < end; i++)
+    {
+        uint64_t local;
+        struct pzpd_rshard *s = pzpd_locate(a, i, &local);
+        if (s == NULL) { return 0; }
+        const struct pzpd_disk_record *r = &s->rtab[local];
+        size_t kl = 0;
+        const char *key = pzpd_arch_record_key(a, i, &kl);
+        if (key == NULL) { return 0; }
+        // A new group id for every input group (the records of a group are consecutive in the input)
+        uint32_t group = PZPD_NO_GROUP;
+        if (r->group != PZPD_NO_GROUP)
+        {
+            if ( (run->old != r->group) || (run->input != input) )
+            {
+                const struct pzpd_disk_group *g = pzpd_group_at(s, local);
+                int64_t id = pzpd_writer_group(w, (g != NULL) ? s->heap + g->name_offset : NULL, (g != NULL) ? g->name_len : 0, 0);
+                if (id < 0) { pzpd_error_wrap(PZPD_OK, "%s", c->path); return 0; }
+                run->input = input; run->old = r->group; run->id = (uint32_t) id;
+            }
+            group = run->id;
+        }
+        if (!pzpd_writer_begin(w, key, kl, group, r->frame)) { return 0; }
+        for (unsigned u = 0; u < a->S; u++)
+        {
+            const struct pzpd_disk_blob *b = pzpd_blob_entry(s, local, u);
+            if (b == NULL) { return 0; }
+            if (b->rel_offset == PZPD_MISSING) { continue; }
+            pzpd_blob_meta meta = { b->format, b->width, b->height, b->channels, b->frames, b->bits, b->meta_flags };
+            if (!pzpd_writer_blob_copy(w, (unsigned) c->to_s[u], s->heap + b->name_offset, b->name_len, s->map + r->offset + b->rel_offset, b->size, &meta)) { return 0; }
+        }
+        for (unsigned t = 0; t < a->T; t++)
+        {
+            if (a->tables[t].flags & PZPD_TABLE_GLOBAL) { continue; }
+            const void *rows = NULL;
+            pzpd_clear_error();
+            uint32_t cnt = pzpd_arch_table_rows(a, i, t, &rows);
+            if ( (cnt == 0) && (pzpd_errorCode != PZPD_OK) ) { return 0; }
+            if ( (cnt > 0) && !pzpd_writer_rows(w, (unsigned) c->to_t[t], rows, cnt, s->tv[t].heap, s->tv[t].heap_bytes) ) { return 0; }
+        }
+        if (!pzpd_writer_end(w)) { pzpd_error_wrap(PZPD_OK, "%s", c->path); return 0; }
+    }
+    return 1;
+}
+
+/** @brief Drop a writer whose output failed, with the shards it already finished. */
+static void pzpd_writer_discard(pzpd_writer *w)
+{
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    for (unsigned k = 0; k < w->shard_count; k++) { unlink(w->shards[k].path); }
+    pzpd_writer_abort(w);
+    pzpd_error_restore(&e);
+}
+
+/** @brief qsort comparator for { first, end } ordinal pairs, by first. */
+static int pzpd_cmp_range(const void *a, const void *b)
+{
+    uint64_t x = ((const uint64_t *) a)[0], y = ((const uint64_t *) b)[0];
+    return (x > y) - (x < y);
+}
+
+int pzpd_split(const char *src, const char *out, const uint64_t *ranges, size_t n, unsigned flags, uint64_t shard_max_bytes, uint32_t align)
+{
+    pzpd_clear_error();
+    if ( (src == NULL) || (out == NULL) || (ranges == NULL) || (n == 0) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    int cut = (flags & PZPD_SPLIT_CUT) != 0;
+    struct pzpd_cin c;
+    memset(&c, 0, sizeof(c));
+    c.path = src;
+    c.a = pzpd_arch_open(src, 0);
+    if (c.a == NULL) { return 0; }
+    uint64_t *rg = (uint64_t *) malloc(n * 2 * sizeof(uint64_t));
+    char *base = NULL, *cand = NULL;
+    char **old = NULL;
+    unsigned oldN = 0;
+    int ok = (rg != NULL);
+    if (!ok) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+    if (ok && cut && c.a->standalone) { pzpd_set_error(PZPD_E_ARG, "%s is a shard; cutting needs the archive's manifest", src); ok = 0; }
+
+    // Ranges: checked, sorted, merged
+    size_t m = 0;
+    uint64_t picked = 0;
+    if (ok)
+    {
+        memcpy(rg, ranges, n * 2 * sizeof(uint64_t));
+        for (size_t i = 0; ok && (i < n); i++)
+        {
+            if ( (rg[2 * i] >= rg[2 * i + 1]) || (rg[2 * i + 1] > c.a->total) )
+            {
+                pzpd_set_error(PZPD_E_ARG, "range %llu:%llu is empty or outside the archive's %llu records", (unsigned long long) rg[2 * i], (unsigned long long) rg[2 * i + 1], (unsigned long long) c.a->total);
+                ok = 0;
+            }
+        }
+        if (ok) { qsort(rg, n, 2 * sizeof(uint64_t), pzpd_cmp_range); }
+        for (size_t i = 0; ok && (i < n); i++)
+        {
+            if ( (m > 0) && (rg[2 * i] <= rg[2 * m - 1]) ) { if (rg[2 * i + 1] > rg[2 * m - 1]) { rg[2 * m - 1] = rg[2 * i + 1]; } continue; }
+            rg[2 * m] = rg[2 * i]; rg[2 * m + 1] = rg[2 * i + 1]; m++;
+        }
+        for (size_t i = 0; i < m; i++) { picked += rg[2 * i + 1] - rg[2 * i]; }
+        if ( ok && cut && (picked == c.a->total) ) { pzpd_set_error(PZPD_E_ARG, "cutting every record would leave %s empty", src); ok = 0; }
+    }
+    if (ok && pzpd_out_clashes_archive(out, src, c.a)) { ok = 0; }
+
+    // The copied records
+    pzpd_writer *w = ok ? pzpd_join_writer(out, &c, 1, shard_max_bytes, align) : NULL;
+    ok = ok && (w != NULL);
+    struct pzpd_grun run = { 0, PZPD_NO_GROUP, 0 };
+    for (size_t i = 0; ok && (i < m); i++) { ok = pzpd_copy_records(w, &c, 0, rg[2 * i], rg[2 * i + 1], &run); }
+    if (w != NULL)
+    {
+        if (ok) { ok = pzpd_writer_finish(w); }
+        else    { pzpd_writer_discard(w); }
+        w = NULL;
+    }
+
+    // The cut: the other records go to shards under names the source doesn't use (<name>.cut.NNNNN.pzpd,
+    // or back to <name>.NNNNN.pzpd), the new manifest replaces the old one atomically, then the old shards go
+    if (ok && cut)
+    {
+        size_t bl = strlen(src);
+        base = strdup(src);
+        cand = (char *) malloc(bl + 16);
+        if ( (base == NULL) || (cand == NULL) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        if (ok && (bl > 5) && !strcmp(base + bl - 5, ".pzpd")) { base[bl - 5] = 0; }
+        int found = 0;
+        for (int k = 0; ok && !found && (k < 2); k++)
+        {
+            snprintf(cand, bl + 16, (k == 0) ? "%s.cut.pzpd" : "%s.pzpd", base);
+            found = !pzpd_out_clashes(cand, out);
+            for (unsigned j = 0; found && (j < c.a->shard_count); j++) { found = !pzpd_out_clashes(cand, c.a->shards[j].path); }
+        }
+        if (ok && !found) { pzpd_set_error(PZPD_E_ARG, "no free shard names next to %s for the cut", src); ok = 0; }
+        old = ok ? (char **) calloc(c.a->shard_count, sizeof(char *)) : NULL;
+        if (ok && (old == NULL)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+        for (unsigned j = 0; ok && (j < c.a->shard_count); j++) { old[j] = strdup(c.a->shards[j].path); ok = (old[j] != NULL); oldN++; }
+        if (!ok && (pzpd_errorCode == PZPD_OK)) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+
+        w = ok ? pzpd_join_writer(cand, &c, 1, shard_max_bytes, align) : NULL;
+        ok = ok && (w != NULL);
+        run.old = PZPD_NO_GROUP;
+        uint64_t next = 0;
+        for (size_t i = 0; ok && (i <= m); i++)
+        {
+            uint64_t stop = (i < m) ? rg[2 * i] : c.a->total;
+            ok = pzpd_copy_records(w, &c, 0, next, stop, &run);
+            if (i < m) { next = rg[2 * i + 1]; }
+        }
+        if (ok)
+        {
+            // The finish writes the manifest under the source's name: the switch
+            char *mp = strdup(src);
+            if (mp == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+            else { free(w->manifest_path); w->manifest_path = mp; }
+        }
+        if (w != NULL)
+        {
+            if (ok) { ok = pzpd_writer_finish(w); }
+            else    { pzpd_writer_discard(w); }
+            w = NULL;
+        }
+        if (!ok) { pzpd_error_wrap(PZPD_OK, "%s was written, but %s was not cut", out, src); }
+    }
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    pzpd_arch_close(c.a);
+    if (ok && cut)
+    {
+        for (unsigned j = 0; j < oldN; j++) { unlink(old[j]); }
+        pzpd_fsync_dir_of(src);
+    }
+    for (unsigned j = 0; j < oldN; j++) { free(old[j]); }
+    free(old);
+    free(base);
+    free(cand);
+    free(rg);
+    if (!ok) { pzpd_error_restore(&e); }
+    return ok;
+}
+
+int pzpd_join(const char *out, const char *const *inputs, unsigned n, uint64_t shard_max_bytes, uint32_t align)
+{
+    pzpd_clear_error();
+    if ( (out == NULL) || (inputs == NULL) || (n == 0) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
+    struct pzpd_cin *in = (struct pzpd_cin *) calloc(n, sizeof(struct pzpd_cin));
+    if (in == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    int ok = 1;
+    for (unsigned i = 0; ok && (i < n); i++)
+    {
+        in[i].path = inputs[i];
+        in[i].a = pzpd_arch_open(inputs[i], 0);
+        ok = (in[i].a != NULL) && !pzpd_out_clashes_archive(out, inputs[i], in[i].a);
+    }
+    pzpd_writer *w = ok ? pzpd_join_writer(out, in, n, shard_max_bytes, align) : NULL;
+    ok = ok && (w != NULL);
+    struct pzpd_grun run = { 0, PZPD_NO_GROUP, 0 };
+    for (unsigned i = 0; ok && (i < n); i++) { ok = pzpd_copy_records(w, &in[i], i, 0, in[i].a->total, &run); }
+    if (w != NULL)
+    {
+        if (ok) { ok = pzpd_writer_finish(w); }
+        else    { pzpd_writer_discard(w); }
+    }
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    for (unsigned i = 0; i < n; i++) { if (in[i].a != NULL) { pzpd_arch_close(in[i].a); } }
+    free(in);
+    if (!ok) { pzpd_error_restore(&e); }
+    return ok;
+}

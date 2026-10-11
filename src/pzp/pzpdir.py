@@ -88,6 +88,7 @@ PF_AUTO, PF_MAP, PF_PAGECACHE, PF_BUFFERS = 0, 1, 2, 3
 EDIT_ADD, EDIT_REPLACE, EDIT_DROP = 1, 2, 3
 WORDS_CANONICAL = 1          # Archive.words(canonical=True): apply the `synonyms` table
 EDIT_KEEP_MISSING, EDIT_DROP_MISSING = 1, 2
+SPLIT_CUT = 1
 STORAGE_BLOCK, STORAGE_RAM = 0, 1
 
 _TYPES = {1: "u1", 2: "i1", 3: "<u2", 4: "<i2", 5: "<u4", 6: "<i4", 7: "<u8", 8: "<i8", 9: "<f4", 10: "<f8"}
@@ -244,6 +245,8 @@ _sig("pzpd_salvage", c_int, c_char_p, P, _SALVAGE_FN, c_void_p, ctypes.POINTER(S
 _sig("pzpd_edit_table", c_int, c_char_p, c_uint, c_char_p, c_char_p, c_uint, ctypes.POINTER(EditRows), c_size, c_char_p, c_size, c_uint, ctypes.POINTER(c_u64))
 _sig("pzpd_edit_stream", c_int, c_char_p, c_uint, c_char_p, ctypes.POINTER(EditBlob), c_size, c_uint, ctypes.POINTER(c_u64))
 _sig("pzpd_compact", c_int, c_char_p, ctypes.POINTER(c_u64))
+_sig("pzpd_split", c_int, c_char_p, c_char_p, ctypes.POINTER(c_u64), c_size, c_uint, c_u64, c_u32)
+_sig("pzpd_join", c_int, c_char_p, ctypes.POINTER(c_char_p), c_uint, c_u64, c_u32)
 _sig("pzpd_writer_create", P, c_char_p, ctypes.POINTER(WriterOpts))
 _sig("pzpd_writer_begin", c_int, P, c_char_p, c_size, c_u32, c_u32)
 _sig("pzpd_writer_blob_ex", c_int, P, c_uint, c_char_p, c_size, c_void_p, c_size, ctypes.POINTER(BlobMeta))
@@ -1394,3 +1397,44 @@ def compact(manifest):
     if not _lib.pzpd_compact(_b(manifest), ctypes.byref(freed)):
         _raise(str(manifest))
     return freed.value
+
+
+def split(src, out, ranges, cut=False, align=0, shard_size=None):
+    """Copy ranges of records of src into a new archive out; cut=True also removes them from src.
+
+    ranges: a list of ordinals (one record each), (first, end) pairs with end exclusive and None for
+    the archive's end, or range / slice objects with step 1. Overlapping ranges are merged and the
+    records keep their source order. align=0 keeps the source's record alignment."""
+    pairs, total = [], None
+    for r in ranges:
+        if isinstance(r, int):
+            first, end = r, r + 1
+        elif isinstance(r, (range, slice)):
+            if r.step not in (None, 1):
+                raise ValueError("split: ranges need step 1, not %r" % (r,))
+            first, end = r.start or 0, r.stop
+        else:
+            first, end = r
+        if end is None:
+            if total is None:
+                with open(src) as a:
+                    total = len(a)
+            end = total
+        pairs += [first, end]
+    if not pairs:
+        raise ValueError("split: no ranges")
+    arr = (c_u64 * len(pairs))(*pairs)
+    if not _lib.pzpd_split(_b(src), _b(out), arr, len(pairs) // 2, SPLIT_CUT if cut else 0, _size(shard_size), align):
+        _raise(str(src))
+
+
+def join(out, inputs, align=0, shard_size=None):
+    """Concatenate archives into one new archive out (ordinals as when they are opened as one).
+
+    Streams are unioned by name; a table in several inputs must have the same schema (a global table
+    also the same rows); keys, blob names and group names must be unique. align=0 keeps the first
+    input's record alignment."""
+    inputs = list(inputs)
+    ps = (c_char_p * len(inputs))(*[_b(p) for p in inputs])
+    if not _lib.pzpd_join(_b(out), ps, len(inputs), _size(shard_size), align):
+        _raise(str(out))

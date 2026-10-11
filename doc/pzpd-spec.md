@@ -1377,6 +1377,8 @@ with pzpdir.open("coco_val2017.pzpd") as a:           # manifest, single shard, 
 pzpdir.tokenize("A Dog, café")                          # ['a', 'dog'] (tokenizer v1)
 pzpdir.reindex("coco_val2017.pzpd", "descriptions.text", source_column="source")   # or drop=True; no spec: rebuild all
 w.words("descriptions", "text", "source")               # Writer: declare a word index
+pzpdir.split("a.pzpd", "val.pzpd", [(0, 500), 9000, (9500, None)], cut=True)   # copy (and cut) ordinal ranges
+pzpdir.join("all.pzpd", ["a.pzpd", "val.pzpd"])                                # one physical archive
 
 pf = a.prefetcher(streams=["rgb", "all", "geo"], io_threads=4, mode="buffers", budget_mb=1024)
 pf.submit(order[pos:pos+8192])
@@ -1416,6 +1418,10 @@ pzpdir cat   <a.pzpd> <record-key> --table T    # rows as CSV
 pzpdir export-table <a.pzpd> T > t.csv          # key column + rows, all records (global: just rows)
 pzpdir replace-table | add-table | drop-table  <a.pzpd> T [LIST|-] [--missing empty|keep]
 pzpdir compact <a.pzpd>                         # drop dead table sections left by table edits
+pzpdir split <a.pzpd> <out.pzpd> FIRST:END[,...] [--cut]   # copy ordinal ranges (END exclusive; N = one record) to a new archive;
+             # --cut also removes them from <a.pzpd> (rewritten as <name>.cut.NNNNN.pzpd or back, manifest swapped atomically)
+pzpdir join  <out.pzpd> <a.pzpd> <b.pzpd> ...    # one physical archive, ordinals as in a collection; streams unioned,
+             # same-named tables must have the same schema (global tables the same rows), keys / names unique
 pzpdir words <a.pzpd> [TABLE.COLUMN] [--source S | --sources] [--canonical] [--top N | --word W]
              # word  records  count  (by records, descending); --word W: the keys of the records containing W
              # --source S: one source's sub-index (default: merged); --sources: list the source values

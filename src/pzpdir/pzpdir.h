@@ -490,6 +490,8 @@ typedef struct
 #define PZPD_EDIT_KEEP_MISSING 1u
 /** @brief pzpd_edit_stream() flag: records without a new file lose their old blob (`--missing drop`; default: kept). */
 #define PZPD_EDIT_DROP_MISSING 2u
+/** @brief pzpd_split() flag: also remove the copied records from the source archive (`--cut`). */
+#define PZPD_SPLIT_CUT 1u
 
 /** @brief Rows of one record for pzpd_edit_table(): CSV text for the record with this key (one or more rows). */
 typedef struct
@@ -1343,6 +1345,46 @@ int pzpd_compact(const char *manifest, uint64_t *reclaimed);
  * @return 1 on success, 0 on error.
  */
 int pzpd_edit_words(const char *manifest, unsigned op, const char *table, const char *column, const char *source_column);
+
+/**
+ * @brief Copy ranges of records of an archive into a new archive (`pzpdir split`), optionally cutting
+ *        them out of the source.
+ *
+ * Records are copied in source order with their keys, blobs (byte for byte, with their stored format
+ * and metadata), table rows and groups; global tables and word index declarations are copied too
+ * (word indexes are rebuilt). Overlapping or adjacent ranges are merged.
+ * With PZPD_SPLIT_CUT, the source is then rewritten without those records: the remaining records go to
+ * new shards under the other of the names `<name>.NNNNN.pzpd` / `<name>.cut.NNNNN.pzpd`, the manifest is
+ * replaced atomically, and the old shards are deleted. A crash leaves the old or the new archive (plus,
+ * at worst, unreferenced shard files); peak extra space is the size of the remaining records.
+ * Ordinals after a cut range shift down; collections that contain the source need `collect --refresh`.
+ * @param src             The source archive (its manifest; a standalone shard only without PZPD_SPLIT_CUT).
+ * @param out             Manifest path of the new archive (must not be the source or one of its shards).
+ * @param ranges          n pairs { first, end }: ordinals first..end-1 of the source.
+ * @param n               Number of ranges.
+ * @param flags           PZPD_SPLIT_CUT.
+ * @param shard_max_bytes Shard size limit of the written archives (0 = PZPD_DEFAULT_SHARD_BYTES).
+ * @param align           Record alignment of the written archives (0 = the source's).
+ * @return 1 on success, 0 on error (the source is unchanged).
+ */
+int pzpd_split(const char *src, const char *out, const uint64_t *ranges, size_t n, unsigned flags, uint64_t shard_max_bytes, uint32_t align);
+
+/**
+ * @brief Concatenate archives into one new archive (`pzpdir join`): the physical counterpart of a
+ *        collection, with the same ordinal order.
+ *
+ * Streams are unioned by name in first-seen order. Tables are unioned by name: a table in several
+ * inputs must have the same schema there, and a global table the same rows. Record keys, blob names
+ * and group names must be unique over all inputs. Groups get new ids; word index declarations are
+ * unioned (same table and column = same source column) and the indexes rebuilt.
+ * @param out             Manifest path of the new archive (must not be an input or one of its shards).
+ * @param inputs          Archives (manifests or standalone shards; not collection files).
+ * @param n               Number of inputs.
+ * @param shard_max_bytes Shard size limit (0 = PZPD_DEFAULT_SHARD_BYTES).
+ * @param align           Record alignment (0 = the first input's).
+ * @return 1 on success, 0 on error (nothing is left at out).
+ */
+int pzpd_join(const char *out, const char *const *inputs, unsigned n, uint64_t shard_max_bytes, uint32_t align);
 
 //-----------------------------------------------------------------------------------------------
 // Formats

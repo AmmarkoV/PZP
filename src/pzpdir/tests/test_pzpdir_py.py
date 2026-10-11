@@ -272,6 +272,50 @@ def test_recovery_and_edits():
         assert a.streams == ["rgb"] and a.read(10, "rgb") == exp[(10, "rgb")]
 
 
+def test_split_join():
+    d = fresh("split")
+    path = os.path.join(d, "a.pzpd")
+    exp = build(path)
+    pzpdir.split(path, os.path.join(d, "p1.pzpd"), [(0, 70)], shard_size="64K")
+    pzpdir.split(path, os.path.join(d, "p2.pzpd"), [slice(70, None)])
+    pzpdir.join(os.path.join(d, "j.pzpd"), [os.path.join(d, "p1.pzpd"), os.path.join(d, "p2.pzpd")], shard_size="64K")
+    with pzpdir.open(os.path.join(d, "j.pzpd")) as j, pzpdir.open(path) as a:
+        assert len(j) == N and j.streams == STREAMS and j.tables == a.tables
+        assert repr(j.global_table("joints").tolist()) == repr(a.global_table("joints").tolist())
+        for i in range(N):
+            assert j.key(i) == a.key(i)
+            for st in STREAMS:
+                assert j.read(i, st) == exp.get((i, st)) and j.info(i, st) == a.info(i, st)
+            assert repr(j.table(i, "persons").tolist()) == repr(a.table(i, "persons").tolist())
+        assert j.verify()
+    # ranges: ints, pairs with an open end, range objects; merged, in source order
+    pzpdir.split(path, os.path.join(d, "r.pzpd"), [(190, None), 5, range(0, 3), (2, 4)])
+    with pzpdir.open(os.path.join(d, "r.pzpd")) as r:
+        assert [r.key(i) for i in range(len(r))] == ["k%03d" % i for i in [0, 1, 2, 3, 5] + list(range(190, 200))]
+    # cut: twice (the shard names go <name>.cut.NNNNN.pzpd and back)
+    pzpdir.split(path, os.path.join(d, "c1.pzpd"), [(10, 20)], cut=True)
+    pzpdir.split(path, os.path.join(d, "c2.pzpd"), [0], cut=True)
+    with pzpdir.open(path) as a:
+        assert [a.key(i) for i in range(len(a))] == ["k%03d" % i for i in list(range(1, 10)) + list(range(20, N))]
+        assert a.read(0, "rgb") == exp[(1, "rgb")] and a.verify()
+    import re
+    assert all(re.fullmatch(r"a(\.\d{5})?\.pzpd", f) for f in os.listdir(d) if f.startswith("a."))   # no a.cut.* left
+    with pzpdir.open(os.path.join(d, "c1.pzpd")) as c:
+        assert len(c) == 10 and c.read(0, "rgb") == exp[(10, "rgb")]
+    for bad in ([(5, 3)], [(0, N + 1)], [range(0, 10, 2)]):
+        try:
+            pzpdir.split(path, os.path.join(d, "bad.pzpd"), bad)
+            assert False, bad
+        except (pzpdir.PzpdError, ValueError):
+            pass
+    try:
+        pzpdir.join(os.path.join(d, "dup.pzpd"), [os.path.join(d, "p1.pzpd"), os.path.join(d, "j.pzpd")])
+        assert False
+    except pzpdir.PzpdError as e:
+        assert "already exists" in str(e)
+    assert not os.path.exists(os.path.join(d, "dup.pzpd"))
+
+
 def test_groups():
     d = fresh("groups")
     path = os.path.join(d, "g.pzpd")

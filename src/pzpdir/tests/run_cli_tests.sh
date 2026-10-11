@@ -416,6 +416,62 @@ if [ $RC = 99 ] && cmp -s <("$BIN" words "$W/a.pzpd" 2>&1) <("$BIN" words "$W/re
 if "$BIN" reindex "$W/a.pzpd" descriptions.text --drop >/dev/null 2>&1 && ! "$BIN" words "$W/a.pzpd" >/dev/null 2>&1 && "$BIN" verify "$W/a.pzpd" --blobs >/dev/null 2>&1 && \
    "$BIN" reindex "$W/a.pzpd" descriptions.text source >/dev/null 2>&1 && [ "`"$BIN" words "$W/a.pzpd" --sources | tr '\n' ' '`" = "old vlm " ]; then ok "reindex --drop, then reindex with a source column"; else bad "reindex drop / add"; fi
 
+#-----------------------------------------------------------------------------------------
+# 12. split (ranges, --cut) and join: tables, groups, word indexes and stream unions survive;
+#     split -> join gives the original back
+#-----------------------------------------------------------------------------------------
+S="$T/split"; rm -rf "$S"; mkdir -p "$S"
+dump() { # every key, blob name and table row of an archive, in order
+    "$BIN" ls "$1" --names 2>&1; for t in joints persons text vec; do "$BIN" export-table "$1" $t 2>&1; done
+}
+if "$BIN" split "$T/tb.pzpd" "$S/p1.pzpd" 0:30 --shard-size 8K >/dev/null 2>"$T/err" && "$BIN" split "$T/tb.pzpd" "$S/p2.pzpd" 30: >/dev/null 2>"$T/err" && \
+   [ "`"$BIN" ls "$S/p1.pzpd" | wc -l`" = 30 ] && [ "`"$BIN" ls "$S/p2.pzpd" | wc -l`" = 30 ] && "$BIN" verify "$S/p1.pzpd" --blobs >/dev/null 2>&1; then
+    ok "split 0:30 and 30: (30 + 30 records, verify --blobs)"; else bad "split: `cat $T/err`"; fi
+SAME=1
+"$BIN" join "$S/j.pzpd" "$S/p1.pzpd" "$S/p2.pzpd" --shard-size 8K >/dev/null 2>"$T/err" || SAME=0
+cmp -s <(dump "$S/j.pzpd") <(dump "$T/tb.pzpd") && cmp -s <("$BIN" ls "$S/j.pzpd" --long) <("$BIN" ls "$T/tb.pzpd" --long) || SAME=0
+for k in r0 r3 r27 r30 r33 r57; do "$BIN" cat "$S/j.pzpd" $k > "$S/blob" 2>/dev/null && "$BIN" cat "$T/tb.pzpd" $k | cmp -s - "$S/blob" && [ -s "$S/blob" ] || SAME=0; done
+if [ $SAME = 1 ]; then ok "join of the two parts == the original (keys, names, formats, all four tables, blob bytes)"; else bad "split -> join differs: `cat $T/err`"; fi
+"$BIN" split "$T/tb.pzpd" "$S/r.pzpd" 50:,3,0:2,1:3 >/dev/null 2>&1
+if cmp -s <("$BIN" ls "$S/r.pzpd" 2>&1) <("$BIN" ls "$T/tb.pzpd" | sed -n '1,4p;51,60p'); then
+    ok "ranges are sorted and merged (50:,3,0:2,1:3 -> 0..3, 50..59), N = one record"; else bad "range merge: `"$BIN" ls "$S/r.pzpd" 2>&1 | tr '\n' ' '`"; fi
+for r in 5:3 0:61 abc 1:2:3 ""; do
+    if "$BIN" split "$T/tb.pzpd" "$S/bad.pzpd" "$r" >/dev/null 2>&1; then bad "split accepted ranges \"$r\""; fi
+done
+ok "split refuses empty / out-of-range / malformed ranges"
+if ! "$BIN" split "$T/tb.pzpd" "$T/tb.pzpd" 0:3 >/dev/null 2>&1 && ! "$BIN" join "$T/tb.pzpd" "$S/p1.pzpd" "$T/tb.pzpd" >/dev/null 2>&1 && \
+   "$BIN" verify "$T/tb.pzpd" --blobs >/dev/null 2>&1; then ok "split / join refuse to write over an input"; else bad "output over an input accepted"; fi
+
+# --cut: twice, so the shard names go <name>.cut.NNNNN.pzpd and back
+mkdir -p "$S/c"; cp "$T"/tb.* "$S/c/"
+if "$BIN" split "$S/c/tb.pzpd" "$S/c1.pzpd" 10:20 --cut >/dev/null 2>"$T/err" && "$BIN" verify "$S/c/tb.pzpd" --blobs >/dev/null 2>&1 && \
+   cmp -s <("$BIN" ls "$S/c/tb.pzpd") <("$BIN" ls "$T/tb.pzpd" | sed '11,20d') && cmp -s <("$BIN" ls "$S/c1.pzpd") <("$BIN" ls "$T/tb.pzpd" | sed -n '11,20p') && \
+   [ -z "`ls "$S/c" | grep -v '^tb\.pzpd$\|^tb\.cut\.[0-9]*\.pzpd$'`" ]; then ok "split --cut: records moved out, the rest re-sharded as tb.cut.NNNNN.pzpd, old shards gone"; else bad "split --cut: `cat $T/err; ls $S/c`"; fi
+if "$BIN" split "$S/c/tb.pzpd" "$S/c2.pzpd" :5 --cut >/dev/null 2>"$T/err" && [ "`"$BIN" ls "$S/c/tb.pzpd" | wc -l`" = 45 ] && \
+   [ -z "`ls "$S/c" | grep -v '^tb\.pzpd$\|^tb\.[0-9]*\.pzpd$'`" ] && "$BIN" join "$S/c3.pzpd" "$S/c2.pzpd" "$S/c/tb.pzpd" >/dev/null 2>&1 && \
+   cmp -s <("$BIN" ls "$S/c3.pzpd") <("$BIN" ls "$T/tb.pzpd" | sed '11,20d'); then ok "a second --cut moves the shards back to tb.NNNNN.pzpd"; else bad "second cut: `cat $T/err; ls $S/c`"; fi
+if ! "$BIN" split "$S/c/tb.pzpd" "$S/c4.pzpd" : --cut >/dev/null 2>&1 && [ "`"$BIN" ls "$S/c/tb.pzpd" | wc -l`" = 45 ]; then ok "--cut of every record is refused"; else bad "cut of everything"; fi
+
+# Groups: a range through the middle of a clip keeps the clip (new id, same name)
+if "$BIN" split "$G/g.pzpd" "$S/g.pzpd" 5:15,30:40 >/dev/null 2>"$T/err" && [ "`"$BIN" groups "$S/g.pzpd" 2>/dev/null | cut -f1-3 | tr '\t\n' ',;'`" = "walk,7,3;run fast,10,10;" ]; then
+    ok "split keeps partial groups"; else bad "split groups: `cat $T/err; "$BIN" groups "$S/g.pzpd" 2>&1`"; fi
+if ! "$BIN" join "$S/gg.pzpd" "$S/g.pzpd" "$G/g.pzpd" >/dev/null 2>&1; then ok "join refuses duplicate keys"; else bad "join with duplicate keys accepted"; fi
+
+# Word indexes and global tables: equal synonyms join; the index is rebuilt over the joined records
+if "$BIN" join "$S/w.pzpd" "$W/b.pzpd" "$W/a.pzpd" >/dev/null 2>"$T/err" && [ "`"$BIN" words "$S/w.pzpd" --canonical --word dog 2>&1 | tr '\n' ' '`" = "b0 a1 a3 " ] && \
+   [ "`"$BIN" words "$S/w.pzpd" --sources | tr '\n' ' '`" = "old vlm " ] && "$BIN" verify "$S/w.pzpd" --blobs >/dev/null 2>&1; then
+    ok "join rebuilds the word index (with sources) over all records"; else bad "join words: `cat $T/err`"; fi
+printf '@global joints name:str parent:u16\n@row joints head,7\nzz\tdata\t%s\n' "$T/src" > "$S/j2.tsv"
+"$BIN" pack "$S/j2.pzpd" "$S/j2.tsv" >/dev/null 2>&1
+if "$BIN" join "$S/x.pzpd" "$T/tb.pzpd" "$S/j2.pzpd" 2>&1 | grep -q "global table joints has other rows"; then ok "join refuses different global rows"; else bad "join global rows"; fi
+printf '@table persons id:u8\nzz\tdata\t%s\n' "$T/src" > "$S/j3.tsv"
+"$BIN" pack "$S/j3.pzpd" "$S/j3.tsv" >/dev/null 2>&1
+if "$BIN" join "$S/x.pzpd" "$T/tb.pzpd" "$S/j3.pzpd" 2>&1 | grep -q "table persons has another schema"; then ok "join refuses a table with another schema"; else bad "join schema"; fi
+# Stream union: tb (data) + list (rgb, depth)
+if "$BIN" join "$S/u.pzpd" "$T/tb.pzpd" "$T/list.pzpd" >/dev/null 2>"$T/err" && [ "`"$BIN" ls "$S/u.pzpd" | wc -l`" = 100 ] && \
+   [ "`"$BIN" ls "$S/u.pzpd" --names | cut -f2 | sort -u | tr '\n' ' '`" = "data depth rgb " ] && cmp -s <("$BIN" ls "$S/u.pzpd" --names | tail -n +61) <("$BIN" ls "$T/list.pzpd" --names) && \
+   [ -z "`ls "$S" | grep '^x\.'`" ]; then ok "join unions streams by name; failed joins leave nothing behind"; else bad "join stream union: `cat $T/err`"; fi
+
 echo
 if [ $FAIL = 0 ]; then echo -e "\033[32mall CLI tests passed\033[0m"; exit 0; fi
 echo -e "\033[31m$FAIL CLI test(s) failed\033[0m"

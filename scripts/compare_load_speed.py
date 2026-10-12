@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 _repo_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_repo_root))
+sys.path.insert(0, str(_repo_root / "src"))
 
 import PZP
 

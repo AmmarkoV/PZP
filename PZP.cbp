@@ -45,10 +45,10 @@
 			<Add option="-lm" />
 			<Add option="-lzstd" />
 		</Linker>
-		<Unit filename="pzp.c">
+		<Unit filename="src/pzp.c">
 			<Option compilerVar="CC" />
 		</Unit>
-		<Unit filename="pzp.h" />
+		<Unit filename="src/pzp.h" />
 		<Extensions>
 			<lib_finder disable_auto="1" />
 		</Extensions>

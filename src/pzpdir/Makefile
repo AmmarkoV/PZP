@@ -8,7 +8,8 @@
 #   make check-client   compile with the DataLoader's exact flag sets
 
 CC      ?= gcc
-PZP_DIR  = ../..
+# pzp.h lives in src/ (the codec sources moved there); the repo root is ../..
+PZP_DIR  = ..
 WARN     = -Wall -Wextra
 BASE     = -D_GNU_SOURCE -pthread -I$(PZP_DIR) $(WARN)
 RELEASE  = -O3 -march=native -mtune=native $(BASE)
@@ -20,7 +21,7 @@ LIBS     = -lzstd -llz4 -lm
 # and pzpd_read_pzp() decodes them. libopenzl.a is fetched / built by the top-level Makefile, in the
 # same OPENZL_DIR. libpzpdir.a does not contain it: programs linking that archive add libopenzl.a too.
 PZP_USE_OPENZL ?= 0
-OPENZL_DIR     ?= $(PZP_DIR)/build/openzl
+OPENZL_DIR     ?= ../build/openzl
 OPENZL_LIB      = $(abspath $(OPENZL_DIR))/build-pzp/libopenzl.a
 ifeq ($(PZP_USE_OPENZL),1)
 OPENZL_DEP = $(OPENZL_LIB)
@@ -70,7 +71,7 @@ bench_pzpdir_early: scripts/bench_pzpdir_early.c $(LIB_DEPS)
 	$(CC) $(RELEASE) $(LIB_SRC) scripts/bench_pzpdir_early.c -o $@ $(LIBS) -ljpeg -lpng
 
 $(OPENZL_LIB):
-	$(MAKE) -C $(PZP_DIR) PZP_USE_OPENZL=1 OPENZL_DIR=$(abspath $(OPENZL_DIR)) $@
+	$(MAKE) -C ../.. PZP_USE_OPENZL=1 OPENZL_DIR=$(abspath $(OPENZL_DIR)) $@
 
 test: tests/test_pzpdir dpzpdir
 	./tests/test_pzpdir

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Re-vendor PZP and pzpdir into the DataLoader (RGBToPoseDetect2D/datasets/DataLoader):
 #
-#   pzp.h                          -> codecs/pzp.h                  (decoder used by codecs/pzpInput.c)
-#   pzp.c                          -> codecs/pzp.c                  (the pzp CLI makeLibrary.sh builds)
+#   src/pzp.h                          -> codecs/pzp.h                  (decoder used by codecs/pzpInput.c)
+#   src/pzp.c                          -> codecs/pzp.c                  (the pzp CLI makeLibrary.sh builds)
 #   src/pzpdir/pzpdir.h            -> pzpdir/pzpdir.h              (the API the DataLoader includes)
 #   src/pzpdir/pzpdir_internal.h   -> pzpdir/pzpdir_internal.h     (shared by the library's files)
 #   src/pzpdir/pzpdir_*.c          -> pzpdir/pzpdir_*.c            (the library, without the CLI)
@@ -34,8 +34,8 @@ done
 if [ ! -d "$DL" ]; then echo "DataLoader not found at $DL"; exit 2; fi
 INGIT=0; git -C "$DL" rev-parse --is-inside-work-tree >/dev/null 2>&1 && INGIT=1
 
-FILES="pzp.h:codecs/pzp.h
-pzp.c:codecs/pzp.c
+FILES="src/pzp.h:codecs/pzp.h
+src/pzp.c:codecs/pzp.c
 src/pzpdir/pzpdir.h:pzpdir/pzpdir.h
 src/pzpdir/pzpdir_internal.h:pzpdir/pzpdir_internal.h
 src/pzpdir/pzpdir_unicode.h:pzpdir/pzpdir_unicode.h

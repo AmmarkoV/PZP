@@ -51,9 +51,11 @@ import sys
 # ---------------------------------------------------------------------------
 
 def _find_lib():
-    """Search for libpzp.so next to this file, then on LD_LIBRARY_PATH."""
+    """Search for libpzp.so next to this file, in the repo root (where make builds it), then on LD_LIBRARY_PATH."""
+    here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "libpzp.so"),
+        os.path.join(here, "libpzp.so"),
+        os.path.join(os.path.dirname(here), "libpzp.so"),
         "libpzp.so",
     ]
     for path in candidates:

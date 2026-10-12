@@ -4,8 +4,9 @@ SIMD_FLAGS = -DINTEL_OPTIMIZATIONS -D_GNU_SOURCE  -O3 -mavx2 -march=native -mtun
 RELEASE_FLAGS= -D_GNU_SOURCE  -O3 -march=native -mtune=native  -fPIE -fPIC
 DEBUG_FLAGS = -D_GNU_SOURCE -O0 -g3 -fno-omit-frame-pointer -Wstrict-overflow -fPIE -fPIC
 
-SRC = pzp.c
-LIB_SRC = pzp_lib.c
+# Sources live in src/ (see also src/pzpdir/Makefile); the executables are built here, in the root
+SRC = src/pzp.c
+LIB_SRC = src/pzp_lib.c
 OUTDIR = output
 PZP = pzp
 DPZP = dpzp
@@ -37,16 +38,16 @@ THUMBDIR     = $(PREFIX)/share/thumbnailers
 
 all: $(PZP) $(DPZP) $(SPZP) $(LIBPZP)
 
-$(PZP): $(SRC) pzp.h $(OPENZL_DEP)
+$(PZP): $(SRC) src/pzp.h $(OPENZL_DEP)
 	$(CC) $(SRC) $(RELEASE_FLAGS) $(CFLAGS) -o $(PZP)
 
-$(DPZP): $(SRC) pzp.h $(OPENZL_DEP)
+$(DPZP): $(SRC) src/pzp.h $(OPENZL_DEP)
 	$(CC) $(SRC) $(DEBUG_FLAGS) $(CFLAGS) -o $(DPZP)
 
-$(SPZP): $(SRC) pzp.h $(OPENZL_DEP)
+$(SPZP): $(SRC) src/pzp.h $(OPENZL_DEP)
 	$(CC) $(SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(SPZP)
 
-$(LIBPZP): $(LIB_SRC) pzp.h $(OPENZL_DEP)
+$(LIBPZP): $(LIB_SRC) src/pzp.h $(OPENZL_DEP)
 	$(CC) -shared -fPIC $(LIB_SRC) $(SIMD_FLAGS) $(CFLAGS) -o $(LIBPZP)
 
 $(OPENZL_LIB):
@@ -100,7 +101,7 @@ install: $(PZP) $(LIBPZP)
 	install -d $(DESTDIR)$(INCDIR)
 	install -m 755 $(PZP) $(DESTDIR)$(BINDIR)/$(PZP)
 	install -m 644 $(LIBPZP) $(DESTDIR)$(LIBDIR)/$(LIBPZP)
-	install -m 644 pzp.h $(DESTDIR)$(INCDIR)/pzp.h
+	install -m 644 src/pzp.h $(DESTDIR)$(INCDIR)/pzp.h
 	ldconfig $(DESTDIR)$(LIBDIR)
 
 uninstall:

@@ -32,7 +32,7 @@ from pathlib import Path
 
 # ── Locate PZP module ─────────────────────────────────────────────────────────
 _SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_SCRIPT_DIR.parent))  # repo root (dev mode)
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "src"))  # repo src (dev mode; PZP.py lives there)
 
 try:
     import PZP

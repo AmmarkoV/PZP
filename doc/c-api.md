@@ -197,10 +197,10 @@ void pzp_thread_cleanup_export(void);
 
 ```bash
 # Verbose build — shows per-frame stats during encode
-gcc pzp.c -DPZP_VERBOSE=1 -lzstd -llz4 -lm -o pzp_verbose
+gcc src/pzp.c -DPZP_VERBOSE=1 -lzstd -llz4 -lm -o pzp_verbose
 
 # Checksum-verifying build — use for integrity checks, not production loading
-gcc pzp.c -DPZP_VERIFY_CHECKSUM=1 -lzstd -llz4 -lm -o pzp_checked
+gcc src/pzp.c -DPZP_VERIFY_CHECKSUM=1 -lzstd -llz4 -lm -o pzp_checked
 ```
 
 ---

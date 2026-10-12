@@ -1,6 +1,6 @@
 # PZP Scripts
 
-All scripts live in `scripts/`.  They import `PZP.py` from the repo root
+All scripts live in `scripts/`.  They import `PZP.py` from `src/`
 automatically, so they work from a development clone without installing the
 package.
 

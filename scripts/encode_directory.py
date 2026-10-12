@@ -35,9 +35,9 @@ import time
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
-# Make sure PZP.py is importable from repo root
+# Make sure PZP.py (in src/) is importable
 _repo_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_repo_root))
+sys.path.insert(0, str(_repo_root / "src"))
 
 import PZP
 

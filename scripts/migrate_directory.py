@@ -26,7 +26,7 @@ from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
 _repo_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_repo_root))
+sys.path.insert(0, str(_repo_root / "src"))
 
 import PZP
 

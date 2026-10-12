@@ -20,7 +20,7 @@ Similar projects: [QOI](https://github.com/phoboslab/qoi), [ZPNG](https://github
 - Optional delta pre-filter, palette indexing, and inter-frame delta
 - Multi-frame animated container with per-frame delays, loop count,
   embedded audio (WAV/MP3/OGG/FLAC) and metadata
-- Python ctypes bindings (`PZP.py`) installable via `pip`
+- Python ctypes bindings (`src/PZP.py`) installable via `pip`
 
 ---
 

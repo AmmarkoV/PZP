@@ -317,8 +317,23 @@ static int pzpd_shard_load(struct pzpd_archive *a, struct pzpd_rshard *s)
     // Primary superblock, or the backup at the end of the file. A valid backup of a higher generation wins:
     // a table edit / compact appends its new generation's backup first and flips the primary last (spec §7)
     struct pzpd_disk_superblock sb, eof;
+#if PZP_GUARD_AGAINST_OPTICAL_MEDIA
+    // Both superblock blocks via pread() before trusting the mapping: on flaky media (optical discs,
+    // dying disks) a mapped page that can't be read delivers SIGBUS, which kills the process with no
+    // error path; pread() turns the same failure into a clean PZPD_E_IO.
+    unsigned char sb0[PZPD_BLOCK], sbe[PZPD_BLOCK];
+    if (!pzpd_pread_all(s->fd, sb0, PZPD_BLOCK, 0) ||
+        !pzpd_pread_all(s->fd, sbe, PZPD_BLOCK, file - PZPD_BLOCK))
+    {
+        pzpd_error_wrap(PZPD_OK, "%s", s->path);   // "<path>: read failed at offset ..."
+        return 0;
+    }
+    memcpy(&sb, sb0, sizeof(sb));
+    memcpy(&eof, sbe, sizeof(eof));
+#else
     memcpy(&sb, s->map, sizeof(sb));
     memcpy(&eof, s->map + file - PZPD_BLOCK, sizeof(eof));
+#endif
     if (pzpd_superblock_valid(&sb, file))
     {
         if ( (eof.generation > sb.generation) && (eof.file_bytes == file) && (memcmp(eof.archive_uuid, sb.archive_uuid, 16) == 0) && pzpd_superblock_valid(&eof, file) )
@@ -331,7 +346,11 @@ static int pzpd_shard_load(struct pzpd_archive *a, struct pzpd_rshard *s)
     else
     {
         if (pzpd_errorCode == PZPD_E_VERSION) { return 0; }
+#if PZP_GUARD_AGAINST_OPTICAL_MEDIA
+        memcpy(&sb, sbe, sizeof(sb));
+#else
         memcpy(&sb, s->map + file - PZPD_BLOCK, sizeof(sb));
+#endif
         s->recovery = 1;
         if (!pzpd_superblock_valid(&sb, file) &&
             !(pzpd_sb_from_sections(s->map, file, a->standalone ? 0 : s->first_ordinal, &sb) && pzpd_superblock_valid(&sb, file) && ((s->recovery = 2) != 0)) )
@@ -557,12 +576,22 @@ PZPD_INTERNAL struct pzpd_archive *pzpd_arch_open(const char *path, unsigned int
     struct stat st;
     if ( (fstat(fd, &st) != 0) || ((uint64_t) st.st_size < PZPD_BLOCK) ) { close(fd); pzpd_arch_close(a); pzpd_set_error(PZPD_E_FORMAT, "%s: manifest is truncated", path); return NULL; }
     a->manifest_len  = (size_t) st.st_size;
+#if PZP_GUARD_AGAINST_OPTICAL_MEDIA
+    // The header block via pread() before trusting the mapping (as pzpd_shard_load()): an unreadable
+    // medium must fail with a clean PZPD_E_IO here, not with SIGBUS on the first mapped read
+    unsigned char mhblock[PZPD_BLOCK];
+    if (!pzpd_pread_all(fd, mhblock, PZPD_BLOCK, 0)) { close(fd); pzpd_arch_close(a); pzpd_error_wrap(PZPD_OK, "%s", path); return NULL; }
+#endif
     a->mmap_manifest = (unsigned char *) mmap(NULL, a->manifest_len, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (a->mmap_manifest == MAP_FAILED) { a->mmap_manifest = NULL; pzpd_arch_close(a); pzpd_set_error(PZPD_E_IO, "cannot map %s: %s", path, strerror(errno)); return NULL; }
 
     struct pzpd_disk_manifest mh;
+#if PZP_GUARD_AGAINST_OPTICAL_MEDIA
+    memcpy(&mh, mhblock, sizeof(mh));
+#else
     memcpy(&mh, a->mmap_manifest, sizeof(mh));
+#endif
     uint64_t file = a->manifest_len;
     if (mh.version > PZPD_FORMAT_VERSION) { pzpd_arch_close(a); pzpd_set_error(PZPD_E_VERSION, "%s: manifest format version %u is newer than this library (%d)", path, mh.version, PZPD_FORMAT_VERSION); return NULL; }
     if (mh.sb_checksum != XXH64(&mh, offsetof(struct pzpd_disk_manifest, sb_checksum), 0)) { pzpd_arch_close(a); pzpd_set_error(PZPD_E_CHECKSUM, "%s: manifest header checksum mismatch", path); return NULL; }

@@ -117,6 +117,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *  - PZPDIR_WITH_PZP (default 1) : 1 enables pzpd_read_pzp() and includes pzp.h. Programs that
  *    decode PZP themselves (and vendor their own pzp.h) build with 0. Format detection of PZP
  *    blobs works either way, since it only needs zstd / lz4.
+ *  - PZP_GUARD_AGAINST_OPTICAL_MEDIA (default 1) : 1 reads the shard superblocks and the manifest
+ *    header with pread() before touching the mapping, so an unreadable medium fails with a clean
+ *    PZPD_E_IO at open instead of killing the process with SIGBUS (optical discs, dying disks).
  *  - PZP_USE_OPENZL (default 0) : 1 ( `make PZP_USE_OPENZL=1`, links OpenZL ) also reads the metadata
  *    of OpenZL-compressed PZP frames; pzp.h then decodes them too. Without it they are detected as
  *    PZP with no metadata.
@@ -141,6 +144,13 @@ static const char pzpdirVersion[]="0.12"; //0.12: pzpd_blob_ref carries the stor
 #ifndef PZPDIR_WITH_PZP
 /** @brief 1 enables pzpd_read_pzp() (includes pzp.h). Build with 0 when the program decodes PZP itself. */
 #define PZPDIR_WITH_PZP 1
+#endif
+
+#ifndef PZP_GUARD_AGAINST_OPTICAL_MEDIA
+/** @brief 1 reads the shard superblocks and the manifest header with pread() instead of the mapping, so an
+ *  unreadable medium (optical discs, dying disks) fails with a clean PZPD_E_IO at open instead of SIGBUS.
+ *  Build with 0 for the mapping-only fast path. */
+#define PZP_GUARD_AGAINST_OPTICAL_MEDIA 1
 #endif
 
 /** @brief On-disk format version written into every superblock, manifest and record header.

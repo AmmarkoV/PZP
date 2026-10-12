@@ -833,21 +833,26 @@ int pzpd_writer_end(pzpd_writer *w)
     memcpy(hdr + offsetof(struct pzpd_disk_record_header, checksum), &rh.checksum, sizeof(rh.checksum));
 
     //----------------------------------------------------------------------
-    // Write header and payloads (gaps are file holes, read back as zeros)
+    // Write header and payloads in one pwritev() (the gaps between blobs are zero-filled:
+    // file holes would read back the same, but writing them makes the record dense)
     //----------------------------------------------------------------------
-    int ok = pzpd_pwrite_all(w->fd, hdr, (size_t) headerBytes, w->cur_off);
-    free(hdr);
-    for (unsigned s = 0; ok && (s < w->S); s++)
+    static const unsigned char zgaps[PZPD_BLOB_ALIGN]    = {0};   // gaps between blobs are < 64 bytes
+    static const unsigned char ztail[PZPD_DEFAULT_ALIGN] = {0};   // the trailing pad is < the alignment
+    struct iovec iov[2 + 2 * PZPD_MAX_STREAMS];
+    int ni = 0;
+    iov[ni].iov_base = hdr; iov[ni].iov_len = (size_t) headerBytes; ni++;
+    uint64_t prev = headerBytes;
+    for (unsigned s = 0; s < w->S; s++)
     {
         if ( !w->blobs[s].present || (w->blobs[s].size == 0) ) { continue; }
-        ok = pzpd_pwrite_all(w->fd, w->blobs[s].data, w->blobs[s].size, w->cur_off + rel[s]);
+        uint64_t gap = rel[s] - prev;
+        if (gap > 0) { iov[ni].iov_base = (void *) zgaps; iov[ni].iov_len = (size_t) gap; ni++; }
+        iov[ni].iov_base = w->blobs[s].data; iov[ni].iov_len = w->blobs[s].size; ni++;
+        prev = rel[s] + w->blobs[s].size;
     }
-    if (ok && (end < recordBytes))
-    {
-        // Make sure the file extends to the end of the record even for the last record
-        unsigned char zero = 0;
-        ok = pzpd_pwrite_all(w->fd, &zero, 1, w->cur_off + recordBytes - 1);
-    }
+    if (end < recordBytes) { iov[ni].iov_base = (void *) ztail; iov[ni].iov_len = (size_t)(recordBytes - end); ni++; }
+    int ok = pzpd_pwritev_all(w->fd, iov, ni, w->cur_off);
+    free(hdr);
     if (!ok) { pzpd_writer_reset_record(w); return 0; }
 
     //----------------------------------------------------------------------

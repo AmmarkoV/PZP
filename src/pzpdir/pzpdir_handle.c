@@ -683,7 +683,7 @@ static struct pzpd_archive *pzpd_global_target(pzpd *a, unsigned member, unsigne
     struct pzpd_member *mb = &a->m[member];
     if (mb->arch == NULL) { pzpd_set_error(PZPD_E_MEMBER_MISSING, "member \"%s\" is unavailable: %s", mb->alias, mb->error); return NULL; }
     *mt = mb->to_mtable[table];
-    if (*mt >= 0) { pzpd_shard(mb->arch, 0); pzpd_clear_error(); }   // a standalone shard learns its global rows when loaded
+    if ( (*mt >= 0) && mb->arch->standalone ) { pzpd_shard(mb->arch, 0); pzpd_clear_error(); }   // a standalone shard learns its global rows when loaded
     return mb->arch;
 }
 

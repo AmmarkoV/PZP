@@ -41,6 +41,7 @@ struct pzpd_words
     uint32_t *sstart;           ///< n + 1: the surface words of word h are sidx[sstart[h] .. sstart[h+1])
     uint32_t *sidx;             ///< Surface word ids
     struct pzpd_wstate *st;     ///< One per shard of the handle (pzpd::shard_total)
+    unsigned *shard_member;     ///< Member of each handle shard (precomputed once: O(1) routing)
     pthread_mutex_t lock;       ///< Taken once per shard, for its lazy load
 };
 
@@ -125,8 +126,7 @@ static struct pzpd_wstate *pzpd_words_state(pzpd_words *w, unsigned g)
         {
             int ok = 1;
             pzpd *a = w->a;
-            unsigned mi = 0;
-            while ( (mi + 1 < a->member_count) && (g >= a->m[mi + 1].shard_base) ) { mi++; }
+            unsigned mi = w->shard_member[g];
             struct pzpd_member *mb = &a->m[mi];
             struct pzpd_rshard *s = (mb->arch != NULL) ? pzpd_shard(mb->arch, g - mb->shard_base) : NULL;
             if (s == NULL) { ok = 0; if (pzpd_errorCode == PZPD_OK) { pzpd_set_error(PZPD_E_MEMBER_MISSING, "member \"%s\" is unavailable", mb->alias); } }
@@ -180,9 +180,6 @@ static int pzpd_words_surface_records(pzpd_words *w, const char *word, size_t le
 {
     for (unsigned g = 0; g < w->a->shard_total; g++)
     {
-        struct pzpd_member *mb = NULL;
-        for (unsigned mi = 0; mi < w->a->member_count; mi++) { if ( (g >= w->a->m[mi].shard_base) && (g < w->a->m[mi].shard_base + w->a->m[mi].shards) ) { mb = &w->a->m[mi]; } }
-        if (mb == NULL) { continue; }
         struct pzpd_wstate *st = pzpd_words_state(w, g);
         if (st == NULL) { return 0; }
         if (!st->has) { continue; }
@@ -235,6 +232,7 @@ void pzpd_words_close(pzpd_words *w)
     if (w == NULL) { return; }
     for (unsigned g = 0; (w->st != NULL) && (g < w->a->shard_total); g++) { free(w->st[g].map); }
     free(w->st);
+    free(w->shard_member);
     free(w->source);
     free(w->heap); free(w->offsets); free(w->records); free(w->count);
     free(w->sheap); free(w->soff); free(w->sstart); free(w->sidx);
@@ -323,6 +321,16 @@ int pzpd_words_open(pzpd *a, const char *table, const char *column, const char *
     }
     w->st = (struct pzpd_wstate *) calloc(a->shard_total ? a->shard_total : 1, sizeof(struct pzpd_wstate));
     if (w->st == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+    // Which member holds each handle shard, once (queries would otherwise scan the members per shard)
+    w->shard_member = (unsigned *) calloc(a->shard_total ? a->shard_total : 1, sizeof(unsigned));
+    if (w->shard_member == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; }
+    if (w->shard_member != NULL)
+    {
+        for (unsigned mi = 0; mi < a->member_count; mi++)
+        {
+            for (unsigned g = a->m[mi].shard_base; g < a->m[mi].shard_base + a->m[mi].shards; g++) { w->shard_member[g] = mi; }
+        }
+    }
 
     // Surface vocabulary: the members' vocabularies, merged by word bytes (their records are disjoint: stats add up)
     struct pzpd_buf ents = {0};

@@ -56,6 +56,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/vfs.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <sys/random.h>
 #include <sys/types.h>
@@ -936,6 +937,7 @@ PZPD_INTERNAL void pzpd_error_wrap(int code, const char *fmt, ...);
 PZPD_INTERNAL int pzpd_buf_append(struct pzpd_buf *b, const void *src, size_t n);
 PZPD_INTERNAL void pzpd_buf_free(struct pzpd_buf *b);
 PZPD_INTERNAL int pzpd_pwrite_all(int fd, const void *src, size_t n, uint64_t off);
+PZPD_INTERNAL int pzpd_pwritev_all(int fd, const struct iovec *iov, int count, uint64_t off);
 PZPD_INTERNAL int pzpd_pread_all(int fd, void *dst, size_t n, uint64_t off);
 PZPD_INTERNAL void pzpd_fsync_dir_of(const char *path);
 PZPD_INTERNAL void pzpd_put_slot_name(char slot[23], const char *name);

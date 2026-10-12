@@ -225,10 +225,20 @@ static int pzpd_pzp_inner_header(const unsigned char *frame, size_t n, uint32_t 
     {
 #if PZP_USE_OPENZL
         if (usize > 100000000u) { return 0; }   // pzp.h's own sanity limit on a frame's size
-        unsigned char *full = (unsigned char *) malloc(usize);
+        // The output buffer is reused across probes (grown on demand, kept for the thread):
+        // allocating a frame-sized buffer per blob would dominate detection cost
+        static __thread unsigned char *full = NULL;
+        static __thread size_t fullCap = 0;
+        if (fullCap < usize)
+        {
+            unsigned char *n2 = (unsigned char *) realloc(full, usize);
+            if (n2 == NULL) { return 0; }
+            full = n2;
+            fullCap = usize;
+        }
         ZL_DCtx *ctx = ZL_DCtx_create();
         int ok = 0;
-        if ( (full != NULL) && (ctx != NULL) )
+        if (ctx != NULL)
         {
             ZL_OutputInfo info;
             ZL_Report r = ZL_DCtx_decompressTyped(ctx, &info, full, usize, frame + 4, n - 4);
@@ -236,7 +246,6 @@ static int pzpd_pzp_inner_header(const unsigned char *frame, size_t n, uint32_t 
             if (ok) { memcpy(out, full, 40); }
         }
         ZL_DCtx_free(ctx);
-        free(full);
         if (!ok) { return 0; }
 #else
         return 0;
@@ -250,8 +259,12 @@ static int pzpd_pzp_inner_header(const unsigned char *frame, size_t n, uint32_t 
     }
     else
     {
-        ZSTD_DCtx *ctx = ZSTD_createDCtx();
-        if (ctx == NULL) { return 0; }
+        // One ZSTD context per thread, reused across probes: creating one per blob would dominate
+        // detection cost (ZSTD_createDCtx() allocates and initialises a ~150 KB workspace). It is
+        // never freed, as pzp.h's own per-thread context; a session-only reset restarts the stream.
+        static __thread ZSTD_DCtx *ctx = NULL;
+        if ( (ctx == NULL) && ((ctx = ZSTD_createDCtx()) == NULL) ) { return 0; }
+        (void) ZSTD_DCtx_reset(ctx, ZSTD_reset_session_only);
         ZSTD_inBuffer  in  = { frame + 4, n - 4, 0 };
         ZSTD_outBuffer ob  = { out, 40, 0 };
         while ( (ob.pos < 40) && (in.pos < in.size) )
@@ -260,7 +273,6 @@ static int pzpd_pzp_inner_header(const unsigned char *frame, size_t n, uint32_t 
             if (ZSTD_isError(r)) { break; }
             if ( (r == 0) && (ob.pos < 40) ) { break; }   // frame ended early
         }
-        ZSTD_freeDCtx(ctx);
         if (ob.pos < 40) { return 0; }
     }
     memcpy(hdr, out, 40);

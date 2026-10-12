@@ -130,6 +130,33 @@ PZPD_INTERNAL int pzpd_pwrite_all(int fd, const void *src, size_t n, uint64_t of
     return 1;
 }
 
+/** @brief pwritev() the whole vector, retrying on short writes and EINTR.
+ *  @return 1 on success, 0 on failure (error set). */
+PZPD_INTERNAL int pzpd_pwritev_all(int fd, const struct iovec *iov, int count, uint64_t off)
+{
+    if (count <= 0) { return 1; }
+    struct iovec v[2 + 2 * PZPD_MAX_STREAMS];
+    if (count > (int)(sizeof(v) / sizeof(v[0]))) { pzpd_set_error(PZPD_E_ARG, "write vector too large"); return 0; }
+    memcpy(v, iov, sizeof(struct iovec) * (size_t) count);
+    struct iovec *p = v;
+    int n = count;
+    while (n > 0)
+    {
+        ssize_t w = pwritev(fd, p, (size_t) n, (off_t) off);
+        if (w < 0)
+        {
+            if (errno == EINTR) { continue; }
+            pzpd_set_error(PZPD_E_IO, "write failed at offset %llu: %s", (unsigned long long) off, strerror(errno));
+            return 0;
+        }
+        if (w == 0) { pzpd_set_error(PZPD_E_IO, "write made no progress at offset %llu", (unsigned long long) off); return 0; }
+        off += (uint64_t) w;
+        while ( (n > 0) && ((uint64_t) w >= p[0].iov_len) ) { w -= (ssize_t) p[0].iov_len; p++; n--; }
+        if ( (n > 0) && (w > 0) ) { p[0].iov_base = (char *) p[0].iov_base + w; p[0].iov_len -= (size_t) w; }
+    }
+    return 1;
+}
+
 /** @brief pread() the whole range, retrying on short reads and EINTR.
  *  @return 1 on success, 0 on failure or premature end of file (error set). */
 PZPD_INTERNAL int pzpd_pread_all(int fd, void *dst, size_t n, uint64_t off)

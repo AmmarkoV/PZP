@@ -1219,13 +1219,21 @@ PZPD_INTERNAL int pzpd_arch_verify_record(struct pzpd_archive *a, uint64_t ordin
         return 0;
     }
     // Header checksum: over header_bytes with the checksum field zeroed (hash a copy in one call;
-    // streaming a 4-byte piece makes xxHash compute a pointer before the piece, which is UB)
-    unsigned char *copy = (unsigned char *) malloc(rh.header_bytes);
-    if (copy == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    // streaming a 4-byte piece makes xxHash compute a pointer before the piece, which is UB). The
+    // copy is a per-thread scratch buffer, grown on demand and never freed (as pzp.h's per-thread
+    // ZSTD context), so verifying a whole archive no longer allocates per record.
+    static __thread unsigned char *copy = NULL;
+    static __thread size_t copyCap = 0;
+    if (rh.header_bytes > copyCap)
+    {
+        unsigned char *n2 = (unsigned char *) realloc(copy, rh.header_bytes);
+        if (n2 == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+        copy = n2;
+        copyCap = rh.header_bytes;
+    }
     memcpy(copy, s->map + r->offset, rh.header_bytes);
     memset(copy + offsetof(struct pzpd_disk_record_header, checksum), 0, sizeof(rh.checksum));
     uint32_t got = XXH32(copy, rh.header_bytes, 0);
-    free(copy);
     if ( (got != rh.checksum) || (got != r->checksum) )
     {
         pzpd_set_error(PZPD_E_CHECKSUM, "record %llu: header checksum mismatch", (unsigned long long) ordinal);

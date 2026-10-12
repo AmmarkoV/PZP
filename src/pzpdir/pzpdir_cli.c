@@ -1667,6 +1667,15 @@ static int cmd_reindex(const char *archive, const char *spec, const char *source
         for (unsigned k = 0; (n < PZPD_MAX_WORD_INDEXES) && pzpd_words_index(a, k, &t, &c, &sc); k++)
         {
             snprintf(tabs[n][0], 64, "%s", t); snprintf(tabs[n][1], 64, "%s", c); snprintf(tabs[n][2], 64, "%s", sc); n++;
+            if (pzpd_last_error_code() != PZPD_OK)
+            {
+                // The index's section failed to parse: its source column may be gone, so a rebuild
+                // from here could silently drop the per-source sub-indexes
+                pzpd_close(a);
+                fprintf(stderr, CLI_RED "word index %s.%s is damaged: rebuild it by name with an explicit source column (reindex <archive> %s.%s SOURCE_COLUMN)" CLI_NORMAL "\n",
+                        tabs[n - 1][0], tabs[n - 1][1], tabs[n - 1][0], tabs[n - 1][1]);
+                return 1;
+            }
         }
         pzpd_close(a);
         if (n == 0) { fprintf(stderr, CLI_RED "%s has no word index to rebuild (name one: reindex <archive> TABLE.COLUMN [SOURCE_COLUMN])" CLI_NORMAL "\n", archive); return 1; }

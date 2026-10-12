@@ -538,7 +538,11 @@ int pzpd_words_index(pzpd *a, unsigned i, const char **table, const char **colum
 {
     pzpd_clear_error();
     if (a == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL handle"); return 0; }
-    const struct pzpd_disk_words *seen[PZPD_MAX_MEMBERS > 64 ? 64 : PZPD_MAX_MEMBERS];
+    // Each member contributes at most PZPD_MAX_WORD_INDEXES distinct indexes, so the dedup list
+    // (every member can hold 4) never needs more room than this
+    size_t scap = (size_t) a->member_count * PZPD_MAX_WORD_INDEXES;
+    const struct pzpd_disk_words **seen = (const struct pzpd_disk_words **) calloc(scap ? scap : 1, sizeof(*seen));
+    if (seen == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
     unsigned nseen = 0;
     for (unsigned mi = 0; mi < a->member_count; mi++)
     {
@@ -567,15 +571,18 @@ int pzpd_words_index(pzpd *a, unsigned i, const char **table, const char **colum
                 if ( pzpd_check_section(map, mlen, dir[j].section_offset, manifest ? PZPD_SECT_MWORDS : PZPD_SECT_WORDS, dir[j].section_bytes) &&
                      pzpd_wsec_parse(map + dir[j].section_offset, dir[j].section_bytes, manifest, &v) )
                     { src = (const char *) (map + dir[j].section_offset + offsetof(struct pzpd_disk_words_head, source_column)); }
-                pzpd_clear_error();
+                // No pzpd_clear_error(): a failed parse is this index's damage, and pzpd_last_error_code()
+                // tells the caller (e.g. reindex, which then rebuilds it by name with an explicit source column)
                 if (table != NULL)         { *table = dir[j].table; }
                 if (column != NULL)        { *column = dir[j].column; }
                 if (source_column != NULL) { *source_column = src; }
+                free(seen);
                 return 1;
             }
-            if (nseen < sizeof(seen) / sizeof(seen[0])) { seen[nseen++] = &dir[j]; }
+            if (nseen < scap) { seen[nseen++] = &dir[j]; }
         }
     }
+    free(seen);
     return 0;
 }
 

@@ -198,7 +198,7 @@ PZPD_INTERNAL int pzpd_coll_parse(const char *path, struct pzpd_coll_file *c)
     if (memcmp(h->magic, PZPD_MAGIC_COLL, 8) != 0) { pzpd_set_error(PZPD_E_FORMAT, "%s is not a collection file", path); ok = 0; }
     else if (h->version > PZPD_FORMAT_VERSION) { pzpd_set_error(PZPD_E_VERSION, "%s: collection format version %u is newer than this library (%d)", path, h->version, PZPD_FORMAT_VERSION); ok = 0; }
     else if (h->sb_checksum != XXH64(h, offsetof(struct pzpd_disk_collection, sb_checksum), 0)) { pzpd_set_error(PZPD_E_CHECKSUM, "%s: collection header checksum mismatch", path); ok = 0; }
-    else if ( (h->member_count == 0) || (h->member_count > PZPD_MAX_MEMBERS) || (h->stream_count > PZPD_MAX_STREAMS) ||
+    else if ( (h->member_count == 0) || (h->member_count > PZPD_MAX_MEMBERS) || (h->stream_count == 0) || (h->stream_count > PZPD_MAX_STREAMS) ||
               !pzpd_check_section(c->buf, c->len, h->members_offset, PZPD_SECT_CMEMBERS, (uint64_t) h->member_count * sizeof(struct pzpd_disk_member)) ||
               !pzpd_check_section(c->buf, c->len, h->heap_offset,    PZPD_SECT_CHEAP,    h->heap_bytes) ||
               !pzpd_check_section(c->buf, c->len, h->remap_offset,   PZPD_SECT_CREMAP,   (uint64_t) h->member_count * PZPD_MAX_STREAMS) )
@@ -424,7 +424,10 @@ int64_t pzpd_find(pzpd *a, const char *key, size_t len, int *stream_out)
 {
     pzpd_clear_error();
     if ( (a == NULL) || (key == NULL) || (len == 0) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return -1; }
-    // Record keys in every member first, then blob names
+    // Record keys in every member first, then blob names. Each pzpd_arch_find() clears the error at
+    // its start, so a real error (e.g. a shard that won't open) must be kept across the passes
+    struct pzpd_saved_error firstErr;
+    int haveErr = 0;
     for (int kind = PZPD_KIND_KEY; kind <= PZPD_KIND_NAME; kind++)
     {
         for (unsigned i = 0; i < a->member_count; i++)
@@ -439,9 +442,15 @@ int64_t pzpd_find(pzpd *a, const char *key, size_t len, int *stream_out)
                 pzpd_clear_error();
                 return (int64_t)(mb->first + (uint64_t) r);
             }
+            if ( (pzpd_errorCode != PZPD_OK) && (pzpd_errorCode != PZPD_E_NOTFOUND) && !haveErr )
+            {
+                pzpd_error_save(&firstErr);
+                haveErr = 1;
+            }
         }
     }
-    pzpd_set_error(PZPD_E_NOTFOUND, "\"%.*s\" not found", (int)(len > 200 ? 200 : len), key);
+    if (haveErr) { pzpd_error_restore(&firstErr); }                                                      // a real error is not "not found"
+    else if (pzpd_errorCode == PZPD_OK) { pzpd_set_error(PZPD_E_NOTFOUND, "\"%.*s\" not found", (int)(len > 200 ? 200 : len), key); }
     return -1;
 }
 
@@ -463,6 +472,8 @@ size_t pzpd_find_all(pzpd *a, const char *key, size_t len, int64_t *ordinals_out
     pzpd_clear_error();
     if ( (a == NULL) || (key == NULL) || (len == 0) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
     size_t total = 0;
+    struct pzpd_saved_error firstErr;
+    int haveErr = 0;
     for (int kind = PZPD_KIND_KEY; kind <= PZPD_KIND_NAME; kind++)
     {
         for (unsigned i = 0; i < a->member_count; i++)
@@ -471,6 +482,12 @@ size_t pzpd_find_all(pzpd *a, const char *key, size_t len, int64_t *ordinals_out
             if (mb->arch == NULL) { continue; }
             int ms = -1;
             int64_t r = pzpd_arch_find(mb->arch, key, len, &ms, kind);   // keys and names are unique within an archive
+            if ( (r < 0) && (pzpd_errorCode != PZPD_OK) && (pzpd_errorCode != PZPD_E_NOTFOUND) && !haveErr )
+            {
+                pzpd_error_save(&firstErr);                              // e.g. a member's shard won't open
+                haveErr = 1;
+                continue;
+            }
             if (r < 0) { continue; }
             if (total < max)
             {
@@ -481,7 +498,11 @@ size_t pzpd_find_all(pzpd *a, const char *key, size_t len, int64_t *ordinals_out
         }
     }
     pzpd_clear_error();
-    if (total == 0) { pzpd_set_error(PZPD_E_NOTFOUND, "\"%.*s\" not found", (int)(len > 200 ? 200 : len), key); }
+    if (total == 0)
+    {
+        if (haveErr) { pzpd_error_restore(&firstErr); }                  // no matches because a member is unreadable, not because the key is absent
+        else         { pzpd_set_error(PZPD_E_NOTFOUND, "\"%.*s\" not found", (int)(len > 200 ? 200 : len), key); }
+    }
     return total;
 }
 

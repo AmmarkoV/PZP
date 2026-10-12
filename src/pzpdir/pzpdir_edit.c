@@ -595,7 +595,8 @@ static int pzpd_writer_blob_copy(pzpd_writer *w, unsigned stream, const char *na
 static int pzpd_writer_table_copy(pzpd_writer *w, const struct pzpd_tschema *sc)
 {
     if (w->tables == NULL) { w->tables = (struct pzpd_wtable *) calloc(PZPD_MAX_TABLES, sizeof(struct pzpd_wtable)); }
-    if ( (w->tables == NULL) || (w->T >= PZPD_MAX_TABLES) ) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    if (w->tables == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return 0; }
+    if (w->T >= PZPD_MAX_TABLES) { pzpd_set_error(PZPD_E_ARG, "more than %d tables", PZPD_MAX_TABLES); return 0; }
     w->tables[w->T].sc = *sc;
     pzpd_schema_publish(&w->tables[w->T].sc);
     w->T++;
@@ -748,7 +749,13 @@ static int pzpd_stream_replaced(struct pzpd_archive *sa, const char *stream, con
         {
             ssize_t r;
             XXH32_reset(xs, 0);
-            while ( (r = read(fd, buf, 1u << 20)) > 0 ) { XXH32_update(xs, buf, (size_t) r); }
+            for (;;)
+            {
+                r = read(fd, buf, 1u << 20);
+                if ( (r < 0) && (errno == EINTR) ) { continue; }
+                if (r <= 0) { break; }
+                XXH32_update(xs, buf, (size_t) r);
+            }
             same = (r == 0) && (XXH32_digest(xs) == want);
         }
         if (fd >= 0) { close(fd); }

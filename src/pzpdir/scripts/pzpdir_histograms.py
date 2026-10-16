@@ -89,6 +89,13 @@ def parse_jobs(args):
     return jobs
 
 
+def _default_workers():
+    """Default pool size: the CPUs this process may actually run on. os.cpu_count() is the machine's
+    core count and ignores an affinity mask, so under `taskset -c 0` it would start one worker per
+    core, all fighting over the single allowed core."""
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Add 256-bin histograms to a .pzpd archive (spec §3.8).",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -96,7 +103,8 @@ def main():
     ap.add_argument("--rgb", help="Stream of the RGB images (luminance histogram)")
     ap.add_argument("--seg", help="STREAM[:CHANNEL] of the segmentation labels")
     ap.add_argument("--depth", help="STREAM[:HIGH,LOW] of the 16-bit depth")
-    ap.add_argument("--workers", type=int, default=os.cpu_count(), help="Decoding processes")
+    ap.add_argument("--workers", type=int, default=_default_workers(),
+                    help="Decoding processes (default: the CPUs this process may run on)")
     args = ap.parse_args()
     jobs = parse_jobs(args)
     if not jobs:

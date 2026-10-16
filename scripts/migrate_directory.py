@@ -23,12 +23,19 @@ import os
 import sys
 import time
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root / "src"))
 
 import PZP
+
+
+def _default_workers():
+    """Default pool size: the CPUs this process may actually run on. os.cpu_count() is the machine's
+    core count and ignores an affinity mask, so under `taskset -c 0` it would start one worker per
+    core, all fighting over the single allowed core."""
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
 
 
 def _migrate_one(args):
@@ -72,8 +79,8 @@ def main():
     codec = ap.add_mutually_exclusive_group()
     codec.add_argument("--lz4",  action="store_true", help="Re-encode every file with LZ4")
     codec.add_argument("--zstd", action="store_true", help="Re-encode every file with ZSTD")
-    ap.add_argument("--workers", type=int, default=cpu_count(),
-                    help=f"Parallel workers (default: {cpu_count()})")
+    ap.add_argument("--workers", type=int, default=_default_workers(),
+                    help=f"Parallel workers (default: {_default_workers()}, the CPUs this process may run on)")
     args = ap.parse_args()
 
     PZP.parse_groups(args.groups)  # reject a bad spec before touching any file

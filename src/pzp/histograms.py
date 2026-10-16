@@ -102,6 +102,13 @@ def counts_of(arr, kind, spec):
         v = arr if arr.ndim == 2 else arr[:, :, spec]
     else:
         v = (depth16(arr, spec) >> 8).astype(np.uint8)
+    if v.dtype != np.uint8:
+        # Every branch above casts to uint8, so this should be unreachable by construction -- seeing it
+        # means something (a RAM fault flipping a bit in the array's own dtype/value metadata, observed
+        # in practice on hardware with a known-faulty DIMM) corrupted the value after the cast. Without
+        # this check, bincount trusts v.max()+1 as its output size and can try to allocate terabytes from
+        # one garbage value; failing fast here turns that into a normal, retryable error instead.
+        raise ValueError("%s: expected uint8 pixel values, got %s -- possible memory corruption" % (kind, v.dtype))
     return np.bincount(v.ravel(), minlength=256).astype(np.int64)
 
 

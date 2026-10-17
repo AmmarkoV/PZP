@@ -261,6 +261,25 @@ dated revisions, recorded in the changelog below.
     converting), both through the Python module `pzp.histograms`, and checked by `tests/check_histograms.py`.
   - **Verified on COCO val2017** (5000 files, 1.37 G pixels): 500 random rows and all three global rows equal an
     independent recomputation.
+- **v0.4 revision 14 (2026-10-17): resuming an interrupted write** (§7), implemented in `src/pzpdir/` (library 0.13).
+  No format change: a writer already renames each shard into place as it completes it, so a crash leaves the
+  complete shards, an unfinished `<base>.NNNNN.pzpd.tmp` and no manifest.
+  - **`pzpd_repair(manifest, info)`** (`pzpdir repair`) deletes the `.tmp` and writes the manifest of the complete
+    shards (`pzpd_manifest_rebuild` under it), so the records written before the crash are readable.
+  - **`pzpd_writer_append(manifest, opts, info)`** continues such an archive, and a finished one: it restores the
+    writer's state from the shards (streams, tables with their global rows, word index declarations, groups, the
+    keys and blob names of the duplicate check, the manifest's hash entries), deletes the `.tmp` and opens the next
+    shard. `pzpd_writer_finish()` then writes the manifest over old and new shards together.
+  - **Granularity is the shard**: the records of the dropped `.tmp` are written again, because rows of **bulk**
+    tables are only in the index the shard never got (non-bulk rows are copied into the record headers for salvage).
+    `shard_max_bytes` therefore decides what a crash costs, and **`pzpd_writer_cut_shard()`** closes the open shard
+    on demand as a checkpoint (refused inside a video group, which never spans shards).
+  - **Fixed while appending:** streams, tables, word indexes and global rows. Declaring them again with the same
+    arguments is accepted (so one code path writes and resumes), anything new or different is an error that names
+    `add-table` / `add-stream` / `reindex`. Keys, blob names and group ids stay unique over the whole archive.
+  - `pzpd_resume_info` reports records and shards kept, their bytes, and the index and size of the dropped shard.
+  - **Manifest generations** now come from the shards (they used to be written as 1), so appending to an archive
+    whose shards an edit rewrote keeps the manifest in step with them.
 
 ---
 
@@ -1150,6 +1169,13 @@ ssize_t    pzpd_read_range(pzpd *a, uint64_t first_ordinal, uint32_t count,
 // ---- writer (single-threaded builder) ----
 pzpd_writer *pzpd_writer_create(const char *manifest_path, const pzpd_writer_opts *o);
            // o: stream names (order = on-disk order), shard_max_bytes (4 GiB), align
+pzpd_writer *pzpd_writer_append(const char *manifest_path, const pzpd_writer_opts *o,
+                                pzpd_resume_info *info);
+           // continue an archive (also one an interrupted write left): its complete shards are kept,
+           // its unfinished .tmp is dropped, and the next record gets the next ordinal (§7)
+int  pzpd_writer_cut_shard(pzpd_writer *w);   // close the open shard now: a crash-proof checkpoint
+int  pzpd_repair(const char *manifest_path, pzpd_resume_info *info);
+           // drop the unfinished shard of an interrupted write and rebuild the manifest (§7)
 int  pzpd_writer_begin(pzpd_writer *w, const char *key, size_t key_len,
                        uint32_t group, uint32_t frame);
 int  pzpd_writer_blob(pzpd_writer *w, unsigned stream, const char *name, size_t name_len,
@@ -1339,7 +1365,18 @@ non-goal, D5) is the next lever for RAM-disk setups. It is listed as future work
   - Stream edits copy word index sections unchanged.
   - `salvage` does not recover word indexes, because they are re-derivable: run `reindex` after salvaging.
   - `rebuild-manifest` regenerates the merged vocabulary (kind 15) from the shard sections.
-- **Future:** appending new records and replacing single blobs in place. Not in v1.
+- **Resuming an interrupted write (revision 14):** shards are renamed into place as they complete, so a crash
+  leaves `<base>.00000.pzpd ... <base>.NNNNN.pzpd`, an unfinished `<base>.NNNNN.pzpd.tmp` and no manifest.
+  1. `pzpdir repair <name>.pzpd` (`pzpd_repair`) deletes the `.tmp` and rebuilds the manifest: the records of the
+     complete shards are readable again, and the caller can check how far it got (keys, counts).
+  2. `pzpd_writer_append(<name>.pzpd, o, info)` (Python: `Writer(..., append=True)`, `w.resumed`) continues there.
+     The archive's streams, tables, global rows and word indexes are read back and are fixed; declaring them again
+     identically is accepted. `finish()` writes the manifest over all shards.
+
+  The records of the dropped shard are written again: **bulk** table rows live only in the index a shard gets when
+  it is closed, so an unfinished shard cannot be completed from its record headers. `shard_max_bytes` bounds that
+  loss, and `pzpd_writer_cut_shard()` closes the open shard on demand (not inside a video group).
+- **Future:** replacing single blobs in place. Not in v1.
 
 ## 8. Python API (ctypes; `pzp.pzpdir` module over `libpzpdir.so`)
 
@@ -1387,6 +1424,10 @@ rec = pf.get(order[pos])                              # dict of memoryviews; rel
 with pzpdir.Writer("x.pzpd", streams=["rgb", "depth"], align=4096, shard_size="4G") as w:
     with w.record("000000000009"):
         w.add_file("rgb", "val2017/000000000009.jpg", path)
+
+pzpdir.repair("x.pzpd")                                 # interrupted write: drop the unfinished shard, rebuild
+w = pzpdir.Writer("x.pzpd", ["rgb", "depth"], append=True)   # continue it; w.resumed = records already there
+w.cut_shard()                                           # close the open shard: a checkpoint to resume from
 ```
 
 ctypes releases the GIL during foreign calls, so the C I/O threads run
@@ -1434,6 +1475,7 @@ pzpdir unpack  <a.pzpd|shard> <dir>            # restores every blob under its o
 pzpdir replace-stream | add-stream | drop-stream  <a.pzpd> STREAM [LIST|-] [--missing keep|drop]
 pzpdir salvage <damaged shard> <dir>           # record-header scan (§4.1 recovery step 3)
 pzpdir rebuild-manifest <name>.*.pzpd
+pzpdir repair  <name>.pzpd                     # interrupted write: delete the unfinished shard, rebuild the manifest
 pzpdir collect <out.pzpd> [alias=]<a.pzpd> [alias=]<b.pzpd> ...   # write a collection file (member paths stored relative when possible, absolute otherwise, or --absolute)
 pzpdir collect --refresh <out.pzpd>                               # re-read member counts / streams
 pzpdir info --dups <a.pzpd|collection>                            # list keys present in >1 member

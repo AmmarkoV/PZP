@@ -29,6 +29,13 @@ static void pzpd_writer_reset_record(pzpd_writer *w)
     }
 }
 
+/** @brief 1 while tables, word indexes and global rows may still be declared: before the writer's own
+ *  first record. An appending writer starts at the records and shards the archive already has. */
+static int pzpd_writer_declaring(const pzpd_writer *w)
+{
+    return (!w->in_record) && (w->total_records == w->base_records) && (w->shard_index == w->base_shards);
+}
+
 /** @brief Look up bytes in the duplicate-check table.
  *  @return 1 if already present, 0 if not. */
 static int pzpd_dedup_contains(pzpd_writer *w, uint64_t h, uint8_t kind, const char *s, size_t len)
@@ -303,6 +310,7 @@ PZPD_INTERNAL int pzpd_writer_close_shard(pzpd_writer *w)
     w->shards[w->shard_count].record_count   = w->shard_records;
     w->shards[w->shard_count].file_bytes     = sb.file_bytes;
     w->shards[w->shard_count].index_checksum = sb.index_checksum;
+    w->shards[w->shard_count].generation     = sb.generation;
     w->shard_count++;
     w->final_path = NULL;
     free(w->tmp_path);
@@ -358,6 +366,232 @@ pzpd_writer *pzpd_writer_create(const char *manifest_path, const pzpd_writer_opt
 
     if (!pzpd_writer_open_shard(w)) { pzpd_writer_abort(w); return NULL; }
     return w;
+}
+
+/** @brief Load one kept shard into an appending writer: the manifest's hash entries, the keys and blob
+ *  names of the duplicate check, and the groups whose ids and names stay taken.
+ *  @return 1 on success, 0 on failure (error set). */
+static int pzpd_append_shard_state(pzpd_writer *w, const struct pzpd_rshard *s)
+{
+    const struct pzpd_disk_superblock *sb = &s->sb;
+    for (uint64_t h = 0; h < sb->hash_count; h++)
+    {
+        struct pzpd_disk_global_hash ge;
+        memset(&ge, 0, sizeof(ge));
+        ge.hash    = s->hash[h].hash;
+        ge.ordinal = sb->first_ordinal + s->hash[h].local_ordinal;
+        ge.stream  = s->hash[h].stream;
+        ge.kind    = s->hash[h].kind;
+        if (!pzpd_buf_append(&w->ghash, &ge, sizeof(ge))) { return 0; }
+    }
+    for (uint64_t r = 0; r < sb->record_count; r++)
+    {
+        const struct pzpd_disk_record *re = &s->rtab[r];
+        const char *key = s->heap + re->key_offset;
+        if (!pzpd_dedup_insert(w, XXH64(key, re->key_len, 0), PZPD_KIND_KEY, key, re->key_len)) { return 0; }
+        for (unsigned st = 0; st < w->S; st++)
+        {
+            const struct pzpd_disk_blob *be = &s->btab[r * (uint64_t) w->S + st];
+            if (be->rel_offset == PZPD_MISSING) { continue; }
+            const char *nm = s->heap + be->name_offset;
+            if (!pzpd_dedup_insert(w, XXH64(nm, be->name_len, 0), PZPD_KIND_NAME, nm, be->name_len)) { return 0; }
+        }
+    }
+    for (uint64_t g = 0; (s->groups != NULL) && (g < sb->group_count); g++)
+    {
+        const struct pzpd_disk_group *dg = &s->groups[g];
+        if (!pzpd_writer_group_as(w, dg->group_id, s->heap + dg->name_offset, dg->name_len, 0)) { return 0; }
+        if (!pzpd_dedup_insert(w, XXH64(&dg->group_id, 4, 0), PZPD_KIND_GROUPID, (const char *) &dg->group_id, 4)) { return 0; }
+        if (dg->group_id >= w->next_group) { w->next_group = dg->group_id + 1; }
+    }
+    return 1;
+}
+
+pzpd_writer *pzpd_writer_append(const char *manifest_path, const pzpd_writer_opts *o, pzpd_resume_info *info)
+{
+    pzpd_clear_error();
+    if (info != NULL) { memset(info, 0, sizeof(*info)); info->dropped_shard = PZPD_NO_SHARD; }
+    if (manifest_path == NULL) { pzpd_set_error(PZPD_E_ARG, "pzpd_writer_append: need a path"); return NULL; }
+    if ( (o != NULL) && (o->align != 0) && (o->align != 64) && (o->align != 4096) )
+        { pzpd_set_error(PZPD_E_ARG, "record alignment must be 64 or 4096, not %u", o->align); return NULL; }
+
+    char   **paths    = NULL;
+    char    *tmp      = NULL;
+    unsigned n        = 0;
+    uint32_t tmpIndex = PZPD_NO_SHARD;
+    uint64_t tmpBytes = 0;
+    if (!pzpd_scan_shards(manifest_path, &paths, &n, &tmp, &tmpIndex, &tmpBytes)) { return NULL; }
+    if (n == 0)
+    {
+        pzpd_set_error(PZPD_E_NOTFOUND, "%s: no complete shard (<base>.NNNNN.pzpd) to append to", manifest_path);
+        pzpd_free_paths(paths, n);
+        free(tmp);
+        return NULL;
+    }
+
+    struct pzpd_archive **ar = (struct pzpd_archive **) calloc(n, sizeof(struct pzpd_archive *));
+    pzpd_writer *w = (pzpd_writer *) calloc(1, sizeof(pzpd_writer));
+    int ok = (ar != NULL) && (w != NULL);
+    if (!ok) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+    if (ok)
+    {
+        w->fd         = -1;
+        w->last_group = PZPD_NO_GROUP;
+        w->shard_max  = ( (o != NULL) && (o->shard_max_bytes != 0) ) ? o->shard_max_bytes : PZPD_DEFAULT_SHARD_BYTES;
+    }
+
+    //----------------------------------------------------------------------
+    // Every shard on its own: one archive, shards 0..n-1, contiguous ordinals, the same streams and tables
+    //----------------------------------------------------------------------
+    uint64_t total = 0, bytes = 0;
+    for (unsigned i = 0; ok && (i < n); i++)
+    {
+        ar[i] = pzpd_arch_open(paths[i], 0);
+        if (ar[i] == NULL) { pzpd_error_wrap(PZPD_OK, "%s", paths[i]); ok = 0; break; }
+        const struct pzpd_disk_superblock *sb = &ar[i]->shards[0].sb;
+        if (sb->shard_index != i) { pzpd_set_error(PZPD_E_FORMAT, "%s is shard %u, not %u", paths[i], sb->shard_index, i); ok = 0; break; }
+        if (sb->first_ordinal != total) { pzpd_set_error(PZPD_E_FORMAT, "%s starts at ordinal %llu, expected %llu", paths[i], (unsigned long long) sb->first_ordinal, (unsigned long long) total); ok = 0; break; }
+        if (i > 0)
+        {
+            if (memcmp(sb->archive_uuid, ar[0]->shards[0].sb.archive_uuid, 16) != 0) { pzpd_set_error(PZPD_E_ARG, "%s belongs to another archive", paths[i]); ok = 0; break; }
+            if ( (ar[i]->S != ar[0]->S) || (ar[i]->T != ar[0]->T) ) { pzpd_set_error(PZPD_E_FORMAT, "%s has other streams or tables than shard 0", paths[i]); ok = 0; break; }
+            for (unsigned u = 0; ok && (u < ar[i]->S); u++) { if (strcmp(ar[i]->streams[u], ar[0]->streams[u]) != 0) { pzpd_set_error(PZPD_E_FORMAT, "%s: stream %u differs from shard 0", paths[i], u); ok = 0; } }
+            for (unsigned t = 0; ok && (t < ar[i]->T); t++) { if (!pzpd_schema_equal(&ar[i]->tables[t], &ar[0]->tables[t])) { pzpd_set_error(PZPD_E_FORMAT, "%s: table %s differs from shard 0", paths[i], ar[i]->tables[t].name); ok = 0; } }
+            if (!ok) { break; }
+        }
+        total += sb->record_count;
+        bytes += sb->file_bytes;
+    }
+
+    //----------------------------------------------------------------------
+    // The writer, as the completed shards leave it
+    //----------------------------------------------------------------------
+    struct pzpd_archive       *a0 = ok ? ar[0] : NULL;
+    const struct pzpd_rshard  *s0 = ok ? &a0->shards[0] : NULL;
+    if (ok)
+    {
+        w->S     = a0->S;
+        w->align = s0->sb.align;
+        memcpy(w->streams, a0->streams, sizeof(w->streams));
+        memcpy(w->uuid, s0->sb.archive_uuid, 16);
+        if ( (o != NULL) && (o->align != 0) && (o->align != w->align) )
+            { pzpd_set_error(PZPD_E_ARG, "%s is written with record alignment %u, not %u", manifest_path, w->align, o->align); ok = 0; }
+    }
+    if ( ok && (o != NULL) && (o->streams != NULL) )
+    {
+        if (o->stream_count != w->S) { pzpd_set_error(PZPD_E_ARG, "%s has %u streams, not %u", manifest_path, w->S, o->stream_count); ok = 0; }
+        for (unsigned u = 0; ok && (u < w->S); u++)
+        {
+            if ( (o->streams[u] == NULL) || (strcmp(o->streams[u], w->streams[u]) != 0) )
+                { pzpd_set_error(PZPD_E_ARG, "%s: stream %u is \"%s\", not \"%s\"", manifest_path, u, w->streams[u], (o->streams[u] != NULL) ? o->streams[u] : "(null)"); ok = 0; }
+        }
+    }
+    if (ok)
+    {
+        w->manifest_path = strdup(manifest_path);
+        w->base          = strdup(manifest_path);
+        w->tables        = (struct pzpd_wtable *) calloc(PZPD_MAX_TABLES, sizeof(struct pzpd_wtable));
+        w->shards        = (struct pzpd_wshard *) calloc(n, sizeof(struct pzpd_wshard));
+        ok = (w->manifest_path != NULL) && (w->base != NULL) && (w->tables != NULL) && (w->shards != NULL);
+        if (!ok) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+    }
+    if (ok)
+    {
+        size_t bl = strlen(w->base);
+        if ( (bl > 5) && (strcmp(w->base + bl - 5, ".pzpd") == 0) ) { w->base[bl - 5] = 0; }
+        for (unsigned i = 0; ok && (i < n); i++)
+        {
+            const struct pzpd_disk_superblock *sb = &ar[i]->shards[0].sb;
+            w->shards[i].path           = strdup(paths[i]);
+            w->shards[i].first_ordinal  = sb->first_ordinal;
+            w->shards[i].record_count   = sb->record_count;
+            w->shards[i].file_bytes     = sb->file_bytes;
+            w->shards[i].index_checksum = sb->index_checksum;
+            w->shards[i].generation     = sb->generation;
+            ok = (w->shards[i].path != NULL);
+            if (!ok) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); }
+        }
+        w->shard_count   = n;
+        w->shard_index   = n;
+        w->total_records = total;
+        w->base_records  = total;
+        w->base_shards   = n;
+    }
+    // Its tables, with the copy of the global rows that every shard carries
+    for (unsigned t = 0; ok && (t < a0->T); t++)
+    {
+        struct pzpd_wtable *wt = &w->tables[t];
+        wt->sc = a0->tables[t];
+        pzpd_schema_publish(&wt->sc);
+        w->T = t + 1;
+        if ( ((wt->sc.flags & PZPD_TABLE_GLOBAL) == 0) || !a0->gview[t].present ) { continue; }
+        const struct pzpd_tview *gv = &a0->gview[t];
+        if ( (gv->rows > 0) && !pzpd_buf_append(&wt->g_rows, gv->rowdata, (size_t) gv->rows * wt->sc.stride) ) { ok = 0; }
+        if ( ok && (gv->heap_bytes > 0) && !pzpd_buf_append(&wt->g_heap, gv->heap, (size_t) gv->heap_bytes) ) { ok = 0; }
+        wt->g_n = gv->rows;
+    }
+    // Its word indexes (their sections are rebuilt per shard, and merged again by pzpd_writer_finish())
+    for (unsigned j = 0; ok && (j < pzpd_words_used(s0->sb.words)); j++)
+    {
+        struct pzpd_wsec v;
+        const char *src = pzpd_shard_wsec(s0, j, &v) ? v.source_column : "";
+        pzpd_clear_error();                      // a damaged section costs only the source column here
+        ok = pzpd_writer_words(w, s0->sb.words[j].table, s0->sb.words[j].column, (src[0] != 0) ? src : NULL);
+    }
+    // Its keys, blob names and groups: unique over the whole archive, and the manifest's hash entries
+    for (unsigned i = 0; ok && (i < n); i++) { ok = pzpd_append_shard_state(w, &ar[i]->shards[0]); }
+
+    //----------------------------------------------------------------------
+    // Take over the archive: declarations are fixed from here on, the shard count is unknown again
+    // (pzpd_writer_finish() patches it into every shard), and the unfinished shard goes
+    //----------------------------------------------------------------------
+    if (ok) { w->appending = 1; }
+    for (unsigned i = 0; ok && (i < n); i++) { ok = pzpd_patch_shard(w->shards[i].path, 0, 0); }
+    if ( ok && (tmp != NULL) && (unlink(tmp) != 0) && (errno != ENOENT) )
+    {
+        pzpd_set_error(PZPD_E_IO, "cannot delete the unfinished shard %s: %s", tmp, strerror(errno));
+        ok = 0;
+    }
+    if (ok) { ok = pzpd_writer_open_shard(w); }
+
+    for (unsigned i = 0; (ar != NULL) && (i < n); i++) { if (ar[i] != NULL) { pzpd_arch_close(ar[i]); } }
+    free(ar);
+    int dropped = (tmp != NULL);
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    pzpd_free_paths(paths, n);
+    free(tmp);
+    if (!ok)
+    {
+        pzpd_writer_abort(w);
+        pzpd_error_restore(&e);
+        return NULL;
+    }
+    if (info != NULL)
+    {
+        info->records       = total;
+        info->shards        = n;
+        info->bytes         = bytes;
+        info->dropped_shard = dropped ? tmpIndex : PZPD_NO_SHARD;
+        info->dropped_bytes = dropped ? tmpBytes : 0;
+    }
+    return w;
+}
+
+int pzpd_writer_cut_shard(pzpd_writer *w)
+{
+    pzpd_clear_error();
+    if (w == NULL)    { pzpd_set_error(PZPD_E_ARG, "NULL writer"); return 0; }
+    if (w->in_record) { pzpd_set_error(PZPD_E_STATE, "pzpd_writer_cut_shard inside an unfinished record"); return 0; }
+    if (w->broken)    { pzpd_set_error(PZPD_E_STATE, "the writer failed earlier and can't continue"); return 0; }
+    if (w->shard_records == 0) { return 1; }                  // nothing in the open shard: it is the cut
+    if (w->shard_last_group != PZPD_NO_GROUP)
+    {
+        pzpd_set_error(PZPD_E_STATE, "the last record is in video group %u: a group never spans shards, so the shard cannot be cut here", w->shard_last_group);
+        return 0;
+    }
+    if (!pzpd_writer_close_shard(w) || !pzpd_writer_open_shard(w)) { w->broken = 1; return 0; }
+    return 1;
 }
 
 /** @brief Registered group of an id, or NULL. */
@@ -519,12 +753,26 @@ int pzpd_writer_table(pzpd_writer *w, const char *name, const char *schema, unsi
 {
     pzpd_clear_error();
     if (w == NULL) { pzpd_set_error(PZPD_E_ARG, "NULL writer"); return -1; }
-    if ( w->in_record || (w->total_records > 0) || (w->shard_index > 0) ) { pzpd_set_error(PZPD_E_STATE, "tables must be declared before the first record"); return -1; }
+    if (!pzpd_writer_declaring(w)) { pzpd_set_error(PZPD_E_STATE, "tables must be declared before the first record"); return -1; }
     if (w->T >= PZPD_MAX_TABLES) { pzpd_set_error(PZPD_E_ARG, "more than %d tables", PZPD_MAX_TABLES); return -1; }
     if (w->tables == NULL)
     {
         w->tables = (struct pzpd_wtable *) calloc(PZPD_MAX_TABLES, sizeof(struct pzpd_wtable));
         if (w->tables == NULL) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); return -1; }
+    }
+    if (w->appending)
+    {
+        // The archive's tables are fixed: the same declaration again gives its id back, anything else fails
+        struct pzpd_tschema sc;
+        if (!pzpd_schema_parse(name, schema, flags, &sc)) { return -1; }
+        for (unsigned t = 0; t < w->T; t++)
+        {
+            if (strcmp(w->tables[t].sc.name, name) != 0) { continue; }
+            if (!pzpd_schema_equal(&sc, &w->tables[t].sc)) { pzpd_set_error(PZPD_E_ARG, "table \"%s\" is in the archive with another schema", name); return -1; }
+            return (int) t;
+        }
+        pzpd_set_error(PZPD_E_NOTFOUND, "table \"%s\" is not in the archive: a table cannot be added while appending (pzpdir add-table)", name);
+        return -1;
     }
     struct pzpd_wtable *wt = &w->tables[w->T];
     if (!pzpd_schema_parse(name, schema, flags, &wt->sc)) { return -1; }
@@ -539,7 +787,7 @@ int pzpd_writer_words(pzpd_writer *w, const char *table, const char *column, con
 {
     pzpd_clear_error();
     if ( (w == NULL) || (table == NULL) || (column == NULL) ) { pzpd_set_error(PZPD_E_ARG, "bad arguments"); return 0; }
-    if ( w->in_record || (w->total_records > 0) || (w->shard_index > 0) ) { pzpd_set_error(PZPD_E_STATE, "word indexes must be declared before the first record"); return 0; }
+    if (!pzpd_writer_declaring(w)) { pzpd_set_error(PZPD_E_STATE, "word indexes must be declared before the first record"); return 0; }
     if (w->W >= PZPD_MAX_WORD_INDEXES) { pzpd_set_error(PZPD_E_ARG, "more than %d word indexes", PZPD_MAX_WORD_INDEXES); return 0; }
     int t = -1;
     for (unsigned k = 0; k < w->T; k++) { if (!strcmp(w->tables[k].sc.name, table)) { t = (int) k; } }
@@ -557,7 +805,17 @@ int pzpd_writer_words(pzpd_writer *w, const char *table, const char *column, con
         { pzpd_set_error(PZPD_E_ARG, "word index: source column %s.%s is not another str column", table, source_column); return 0; }
     for (unsigned k = 0; k < w->W; k++)
     {
-        if ( !strcmp(w->words[k].table, table) && !strcmp(w->words[k].column, column) ) { pzpd_set_error(PZPD_E_DUPLICATE, "word index %s.%s declared twice", table, column); return 0; }
+        if ( strcmp(w->words[k].table, table) || strcmp(w->words[k].column, column) ) { continue; }
+        if (!w->appending) { pzpd_set_error(PZPD_E_DUPLICATE, "word index %s.%s declared twice", table, column); return 0; }
+        // Already in the archive: the same declaration again is accepted, another source column is not
+        if (strcmp(w->words[k].source, (source_column != NULL) ? source_column : "") != 0)
+            { pzpd_set_error(PZPD_E_ARG, "word index %s.%s is in the archive with source column \"%s\"", table, column, w->words[k].source); return 0; }
+        return 1;
+    }
+    if (w->appending)
+    {
+        pzpd_set_error(PZPD_E_NOTFOUND, "word index %s.%s is not in the archive: it cannot be added while appending (pzpdir reindex)", table, column);
+        return 0;
     }
     struct pzpd_wwords *d = &w->words[w->W];
     memset(d, 0, sizeof(*d));
@@ -611,7 +869,7 @@ static struct pzpd_wtable *pzpd_writer_table_for(pzpd_writer *w, unsigned table,
     struct pzpd_wtable *wt = &w->tables[table];
     int isGlobal = (wt->sc.flags & PZPD_TABLE_GLOBAL) != 0;
     if (isGlobal != global) { pzpd_set_error(PZPD_E_ARG, "table %s is a %s table", wt->sc.name, isGlobal ? "global" : "record"); return NULL; }
-    if (global && ( w->in_record || (w->total_records > 0) || (w->shard_index > 0) )) { pzpd_set_error(PZPD_E_STATE, "global rows must be added before the first record"); return NULL; }
+    if (global && !pzpd_writer_declaring(w)) { pzpd_set_error(PZPD_E_STATE, "global rows must be added before the first record"); return NULL; }
     if (!global && !w->in_record) { pzpd_set_error(PZPD_E_STATE, "record rows added outside pzpd_writer_begin / pzpd_writer_end"); return NULL; }
     return wt;
 }
@@ -646,6 +904,14 @@ int pzpd_writer_global_rows(pzpd_writer *w, unsigned table, const void *rows, ui
     pzpd_clear_error();
     struct pzpd_wtable *wt = pzpd_writer_table_for(w, table, 1);
     if (wt == NULL) { return 0; }
+    if (w->appending)
+    {
+        // Every shard carries a copy of the global rows, so the archive's are fixed: the same rows again
+        // are accepted and ignored, rows for a global table that is empty in the archive are refused
+        if (wt->g_n > 0) { return 1; }
+        pzpd_set_error(PZPD_E_STATE, "table %s: global rows cannot be added while appending", wt->sc.name);
+        return 0;
+    }
     size_t r0 = wt->g_rows.len, h0 = wt->g_heap.len;
     if (wt->g_n + nrows > 0xFFFFFFFFull) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows", wt->sc.name); return 0; }   // the reader's limit
     if ( !pzpd_stage_rows(&wt->sc, rows, nrows, strings, strings_len, &wt->g_rows, &wt->g_heap) ||
@@ -660,6 +926,14 @@ int pzpd_writer_global_rows_csv(pzpd_writer *w, unsigned table, const char *csv,
     pzpd_clear_error();
     struct pzpd_wtable *wt = pzpd_writer_table_for(w, table, 1);
     if (wt == NULL) { return 0; }
+    if (w->appending)
+    {
+        // Every shard carries a copy of the global rows, so the archive's are fixed: the same rows again
+        // are accepted and ignored, rows for a global table that is empty in the archive are refused
+        if (wt->g_n > 0) { return 1; }
+        pzpd_set_error(PZPD_E_STATE, "table %s: global rows cannot be added while appending", wt->sc.name);
+        return 0;
+    }
     size_t r0 = wt->g_rows.len, h0 = wt->g_heap.len;
     int64_t n = pzpd_csv_parse(&wt->sc, csv, len, &wt->g_rows, &wt->g_heap);
     if ( (n >= 0) && (wt->g_n + (uint64_t) n > 0xFFFFFFFFull) ) { pzpd_set_error(PZPD_E_ARG, "table %s: more than 4 G rows", wt->sc.name); n = -1; }   // the reader's limit
@@ -1151,7 +1425,7 @@ int pzpd_writer_finish(pzpd_writer *w)
         ms.first_ordinal  = w->shards[i].first_ordinal;
         ms.record_count   = w->shards[i].record_count;
         ms.file_bytes     = w->shards[i].file_bytes;
-        ms.generation     = 1;
+        ms.generation     = w->shards[i].generation;
         ms.index_checksum = w->shards[i].index_checksum;
         ms.name_offset    = (uint32_t) names.len;
         ms.name_len       = (uint32_t) strlen(nm);

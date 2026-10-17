@@ -4,6 +4,8 @@
 
 #include "pzpdir_internal.h"
 
+#include <dirent.h>
+
 //-----------------------------------------------------------------------------------------------
 // Recovery (spec §4.1 / §4.7): rebuild a manifest from its shards, salvage a shard without its index
 //-----------------------------------------------------------------------------------------------
@@ -17,6 +19,110 @@ static char *pzpd_dir_of(const char *path)
     char *r = realpath(d, NULL);
     if (r != NULL) { free(d); return r; }
     return d;
+}
+
+PZPD_INTERNAL void pzpd_free_paths(char **paths, unsigned n)
+{
+    for (unsigned i = 0; (paths != NULL) && (i < n); i++) { free(paths[i]); }
+    free(paths);
+}
+
+/** @brief The shard files of an archive, as they lie next to its manifest: `<base>.NNNNN.pzpd` in index
+ *  order, and the `<base>.NNNNN.pzpd.tmp` an interrupted writer left behind (the highest one, if several).
+ *  @param manifest_path The archive's manifest (it need not exist).
+ *  @param paths     Receives a malloc'd array of malloc'd paths (pzpd_free_paths()), NULL when there are none.
+ *  @param n         Receives the shard count.
+ *  @param tmp_path  Receives the unfinished shard's path (malloc'd) or NULL. May be NULL.
+ *  @param tmp_index Receives its shard index, PZPD_NO_SHARD when there is none. May be NULL.
+ *  @param tmp_bytes Receives its size. May be NULL.
+ *  @return 1 on success (0 shards included), 0 on error (a hole in the numbering, out of memory). */
+PZPD_INTERNAL int pzpd_scan_shards(const char *manifest_path, char ***paths, unsigned *n, char **tmp_path, uint32_t *tmp_index, uint64_t *tmp_bytes)
+{
+    *paths = NULL;
+    *n     = 0;
+    if (tmp_path  != NULL) { *tmp_path  = NULL; }
+    if (tmp_index != NULL) { *tmp_index = PZPD_NO_SHARD; }
+    if (tmp_bytes != NULL) { *tmp_bytes = 0; }
+
+    const char *sl   = strrchr(manifest_path, '/');
+    const char *file = (sl == NULL) ? manifest_path : sl + 1;
+    size_t pl = strlen(file);
+    if ( (pl > 5) && (strcmp(file + pl - 5, ".pzpd") == 0) ) { pl -= 5; }   // "<base>", the shard files' prefix
+    char *dir = pzpd_dir_of(manifest_path);
+    DIR  *d   = (dir != NULL) ? opendir(dir) : NULL;
+    if (d == NULL)
+    {
+        pzpd_set_error(PZPD_E_IO, "cannot read the directory of %s: %s", manifest_path, strerror(errno));
+        free(dir);
+        return 0;
+    }
+
+    char   **found = NULL;       // by shard index
+    unsigned cap = 0, max = 0;
+    int      any = 0, ok = 1;
+    uint32_t ti = PZPD_NO_SHARD;
+    struct dirent *de;
+    while ( ok && ((de = readdir(d)) != NULL) )
+    {
+        // <base>.NNNNN.pzpd [.tmp], exactly five digits
+        if (strncmp(de->d_name, file, pl) != 0) { continue; }
+        const char *rest = de->d_name + pl;
+        if (rest[0] != '.') { continue; }
+        unsigned idx = 0;
+        unsigned k = 1;
+        for (; k < 6; k++) { if ( (rest[k] < '0') || (rest[k] > '9') ) { break; } idx = idx * 10 + (unsigned)(rest[k] - '0'); }
+        if (k != 6) { continue; }
+        int isTmp = (strcmp(rest + 6, ".pzpd.tmp") == 0);
+        if ( !isTmp && (strcmp(rest + 6, ".pzpd") != 0) ) { continue; }
+
+        char *full = NULL;
+        if (asprintf(&full, "%s/%s", dir, de->d_name) < 0) { pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; break; }
+        if (isTmp)
+        {
+            if ( (ti != PZPD_NO_SHARD) && (idx <= ti) ) { free(full); continue; }   // keep the highest
+            ti = idx;
+            if (tmp_bytes != NULL)
+            {
+                struct stat st;
+                *tmp_bytes = (stat(full, &st) == 0) ? (uint64_t) st.st_size : 0;
+            }
+            if (tmp_path != NULL) { free(*tmp_path); *tmp_path = full; } else { free(full); }
+            continue;
+        }
+        if (idx >= cap)
+        {
+            unsigned nc = (idx + 1 > cap * 2) ? (idx + 1) : (cap * 2);
+            char **nf = (char **) realloc(found, sizeof(char *) * nc);
+            if (nf == NULL) { free(full); pzpd_set_error(PZPD_E_NOMEM, "out of memory"); ok = 0; break; }
+            memset(nf + cap, 0, sizeof(char *) * (nc - cap));
+            found = nf;
+            cap   = nc;
+        }
+        if (found[idx] != NULL) { free(full); continue; }   // cannot happen: the names are exact
+        found[idx] = full;
+        if ( !any || (idx > max) ) { max = idx; }
+        any = 1;
+    }
+    closedir(d);
+    free(dir);
+
+    if (ok && any)
+    {
+        for (unsigned i = 0; i <= max; i++)
+        {
+            if (found[i] == NULL) { pzpd_set_error(PZPD_E_NOTFOUND, "%s: shard %05u is missing (shards 0..%u are there)", manifest_path, i, max); ok = 0; break; }
+        }
+    }
+    if (!ok)
+    {
+        pzpd_free_paths(found, cap);
+        if (tmp_path != NULL) { free(*tmp_path); *tmp_path = NULL; }
+        return 0;
+    }
+    if (tmp_index != NULL) { *tmp_index = ti; }
+    *paths = found;
+    *n     = any ? (max + 1) : 0;
+    return 1;
 }
 
 int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_paths, unsigned n)
@@ -110,6 +216,55 @@ int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_pa
     free(ar);
     free(byIndex);
     free(mdir);
+    if (!ok) { pzpd_error_restore(&e); }
+    return ok;
+}
+
+int pzpd_repair(const char *manifest_path, pzpd_resume_info *info)
+{
+    pzpd_clear_error();
+    if (info != NULL) { memset(info, 0, sizeof(*info)); info->dropped_shard = PZPD_NO_SHARD; }
+    if (manifest_path == NULL) { pzpd_set_error(PZPD_E_ARG, "pzpd_repair: need a path"); return 0; }
+
+    char   **paths = NULL;
+    char    *tmp   = NULL;
+    unsigned n     = 0;
+    uint32_t ti    = PZPD_NO_SHARD;
+    uint64_t tb    = 0;
+    if (!pzpd_scan_shards(manifest_path, &paths, &n, &tmp, &ti, &tb)) { return 0; }
+    if (n == 0)
+    {
+        pzpd_set_error(PZPD_E_NOTFOUND, "%s: no shard files (<base>.NNNNN.pzpd) to rebuild it from", manifest_path);
+        pzpd_free_paths(paths, n);
+        free(tmp);
+        return 0;
+    }
+
+    // The manifest first: an unfinished shard is deleted only once the rest is known to be one archive
+    int ok = pzpd_manifest_rebuild(manifest_path, (const char *const *) paths, n);
+    if ( ok && (tmp != NULL) && (unlink(tmp) != 0) && (errno != ENOENT) )
+    {
+        pzpd_set_error(PZPD_E_IO, "cannot delete the unfinished shard %s: %s", tmp, strerror(errno));
+        ok = 0;
+    }
+    if (ok && (info != NULL))
+    {
+        struct pzpd_archive *a = pzpd_arch_open(manifest_path, 0);
+        if (a == NULL) { ok = 0; }
+        else
+        {
+            info->records       = a->total;
+            info->shards        = a->shard_count;
+            info->dropped_shard = (tmp != NULL) ? ti : PZPD_NO_SHARD;
+            info->dropped_bytes = (tmp != NULL) ? tb : 0;
+            for (unsigned i = 0; i < a->shard_count; i++) { info->bytes += a->mshards[i].file_bytes; }
+            pzpd_arch_close(a);
+        }
+    }
+    struct pzpd_saved_error e;
+    pzpd_error_save(&e);
+    pzpd_free_paths(paths, n);
+    free(tmp);
     if (!ok) { pzpd_error_restore(&e); }
     return ok;
 }

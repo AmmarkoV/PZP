@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <zstd.h>
@@ -2258,6 +2259,264 @@ static void test_words(void)
     CHECK(!words_archive(p3, NULL, PZPD_MAX_WORD_SOURCES + 1, rowsC, 0) && (pzpd_last_error_code() == PZPD_E_ARG), "%d source values in one shard are refused (%s)", PZPD_MAX_WORD_SOURCES + 1, pzpd_last_error());
 }
 
+//-----------------------------------------------------------------------------------------------
+// Resuming an interrupted write (spec §7): pzpd_repair, pzpd_writer_append, pzpd_writer_cut_shard
+//-----------------------------------------------------------------------------------------------
+
+/** @brief Tables and word index of the resume archive: the same calls on a new and on an appending
+ *  writer, which is what an appending writer has to accept. @return 1 on success. */
+static int resume_declare(pzpd_writer *w)
+{
+    return (pzpd_writer_table(w, "joints", "name:str parent:u16", PZPD_TABLE_GLOBAL) == 0) &&
+           (pzpd_writer_table(w, "cap", "source:str text:str", 0) == 1) &&
+           (pzpd_writer_table(w, "vec", "v:f32[2]", PZPD_TABLE_BULK) == 2) &&
+           pzpd_writer_words(w, "cap", "text", "source") &&
+           pzpd_writer_global_rows_csv(w, 0, "head,0\nneck,0\n", 14);
+}
+
+/** @brief Records lo..hi-1 of the resume archive: key "k%03d", one blob, one row in every table.
+ *  @return 1 on success. */
+static int resume_records(pzpd_writer *w, int lo, int hi)
+{
+    unsigned char data[512];
+    for (int i = lo; i < hi; i++)
+    {
+        char k[32], nm[64], csv[128];
+        float v[2];
+        int kl = snprintf(k, sizeof(k), "k%03d", i);
+        int nl = snprintf(nm, sizeof(nm), "blob/k%03d.bin", i);
+        int cl = snprintf(csv, sizeof(csv), "test,a picture of thing%d", i);
+        v[0] = (float) i;
+        v[1] = 0.5f;
+        fill(data, sizeof(data), (uint64_t) i + 11);
+        if ( !pzpd_writer_begin(w, k, (size_t) kl, PZPD_NO_GROUP, 0) ||
+             !pzpd_writer_blob(w, 0, nm, (size_t) nl, data, sizeof(data)) ||
+             !pzpd_writer_rows_csv(w, 1, csv, (size_t) cl) ||
+             !pzpd_writer_rows(w, 2, v, 1, NULL, 0) ||
+             !pzpd_writer_end(w) ) { return 0; }
+    }
+    return 1;
+}
+
+/** @brief Write records lo..hi-1 in a child process that never finishes the archive, so the complete
+ *  shards and the unfinished <base>.NNNNN.pzpd.tmp stay behind exactly as after a crash.
+ *  @return 1 when the child got that far. */
+static int resume_crash(const char *path, const pzpd_writer_opts *o, int lo, int hi, int append)
+{
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        pzpd_writer *w = append ? pzpd_writer_append(path, o, NULL) : pzpd_writer_create(path, o);
+        if ( (w == NULL) || !resume_declare(w) || !resume_records(w, lo, hi) ) { _exit(2); }
+        _exit(0);                      // no pzpd_writer_finish(): as if the process had died here
+    }
+    int st = 0;
+    return (pid > 0) && (waitpid(pid, &st, 0) == pid) && WIFEXITED(st) && (WEXITSTATUS(st) == 0);
+}
+
+/** @brief Records in the archive at path, -1 if it cannot be opened. */
+static int64_t resume_count(const char *path)
+{
+    pzpd *a = pzpd_open(path, 0);
+    if (a == NULL) { return -1; }
+    int64_t n = (int64_t) pzpd_count(a);
+    pzpd_close(a);
+    return n;
+}
+
+/** @brief Delete every file in a scratch directory: the resume test starts from an empty one, because
+ *  it looks at the shard files that are there. */
+static void clear_dir(const char *path)
+{
+    DIR *d = opendir(path);
+    struct dirent *de;
+    char p[1400];
+    if (d == NULL) { return; }
+    while ((de = readdir(d)) != NULL)
+    {
+        if ( (strcmp(de->d_name, ".") == 0) || (strcmp(de->d_name, "..") == 0) ) { continue; }
+        snprintf(p, sizeof(p), "%s/%s", path, de->d_name);
+        unlink(p);
+    }
+    closedir(d);
+}
+
+static void test_resume(void)
+{
+    char d2[1200], path[1300], tmp[1400], man[1400];
+    snprintf(d2, sizeof(d2), "%s/resume", dir);
+    mkdir(d2, 0755);
+    clear_dir(d2);
+    snprintf(path, sizeof(path), "%s/a.pzpd", d2);
+    const char *streams[1] = { "rgb" };
+    pzpd_writer_opts o = { streams, 1, 16384, 64 };          // 16 KiB shards: ~20 records each
+    struct stat st;
+
+    //--- an interrupted write leaves complete shards, an unfinished .tmp and no manifest -----
+    CHECK(resume_crash(path, &o, 0, 45, 0), "the interrupted writer wrote 45 records");
+    snprintf(man, sizeof(man), "%s/a.00000.pzpd", d2);
+    CHECK(stat(man, &st) == 0, "shard 0 is on disk");
+    CHECK(stat(path, &st) != 0, "no manifest was written");
+    unsigned complete = 0;
+    for (unsigned k = 0; k < 64; k++)
+    {
+        snprintf(man, sizeof(man), "%s/a.%05u.pzpd", d2, k);
+        if (stat(man, &st) != 0) { break; }
+        complete++;
+    }
+    snprintf(tmp, sizeof(tmp), "%s/a.%05u.pzpd.tmp", d2, complete);
+    CHECK(stat(tmp, &st) == 0, "the unfinished shard %05u.tmp is on disk", complete);
+
+    //--- repair: drop the .tmp, write the manifest of the complete shards ---------------------
+    pzpd_resume_info ri;
+    memset(&ri, 0, sizeof(ri));
+    CHECK(pzpd_repair(path, &ri), "repair the archive");
+    CHECK( (ri.shards == complete) && (ri.records > 0) && (ri.records < 45), "repair kept %llu records in %u shards", (unsigned long long) ri.records, ri.shards);
+    CHECK(ri.dropped_shard == complete, "the unfinished shard %u was dropped (%llu bytes)", ri.dropped_shard, (unsigned long long) ri.dropped_bytes);
+    CHECK(stat(tmp, &st) != 0, "its .tmp is gone");
+    CHECK(resume_count(path) == (int64_t) ri.records, "the repaired archive reads its records");
+    uint64_t kept = ri.records;
+
+    //--- append: the same declarations, then the rest of the records --------------------------
+    pzpd_resume_info ri2;
+    memset(&ri2, 0, sizeof(ri2));
+    pzpd_writer *w = pzpd_writer_append(path, &o, &ri2);
+    CHECK( (w != NULL) && (ri2.records == kept) && (ri2.dropped_shard == PZPD_NO_SHARD), "append continues at record %llu", (unsigned long long) ri2.records);
+    if (w != NULL)
+    {
+        CHECK(resume_declare(w), "the archive's own declarations are accepted again");
+        CHECK(pzpd_writer_table(w, "cap", "source:str text:str other:u8", 0) < 0, "another schema for a table is refused");
+        CHECK(pzpd_writer_table(w, "extra", "v:u8", 0) < 0, "a table that is not in the archive is refused");
+        CHECK(!pzpd_writer_words(w, "cap", "source", NULL), "a word index that is not in the archive is refused");
+        CHECK(resume_records(w, (int) kept, 60), "write the remaining records");
+        CHECK(pzpd_writer_begin(w, "k000", 4, PZPD_NO_GROUP, 0) && !pzpd_writer_end(w), "a key of the kept shards is still a duplicate");
+        CHECK(pzpd_writer_finish(w), "finish the resumed archive");
+    }
+
+    //--- the result is one archive, as if it had been written in one go -----------------------
+    pzpd *a = pzpd_open(path, 0);
+    CHECK(a != NULL, "open the resumed archive");
+    if (a != NULL)
+    {
+        CHECK(pzpd_count(a) == 60, "60 records (%llu)", (unsigned long long) pzpd_count(a));
+        int keys = 0, rows = 0, blobs = 0;
+        unsigned char want[512], got[512];
+        for (uint64_t i = 0; i < pzpd_count(a); i++)
+        {
+            char k[32];
+            size_t kl = 0;
+            const char *key = (const char *) pzpd_record_key(a, i, &kl);
+            snprintf(k, sizeof(k), "k%03d", (int) i);
+            keys += (key != NULL) && (kl == strlen(k)) && (memcmp(key, k, kl) == 0);
+            const void *rp = NULL;
+            rows += (pzpd_table_rows(a, i, 1, &rp) == 1) && (pzpd_table_rows(a, i, 2, &rp) == 1);
+            fill(want, sizeof(want), i + 11);
+            blobs += (pzpd_read_into(a, i, 0, got, sizeof(got)) == (ssize_t) sizeof(got)) && (memcmp(want, got, sizeof(got)) == 0);
+        }
+        CHECK(keys == 60, "every key is in its place (%d)", keys);
+        CHECK(rows == 60, "every record has its rows in both record tables (%d)", rows);
+        CHECK(blobs == 60, "every blob reads back byte for byte (%d)", blobs);
+        const void *g = NULL;
+        CHECK(pzpd_global_rows(a, 0, 0, &g) == 2, "the global table still has its two rows");
+        CHECK(pzpd_verify_shard(a, 0) && pzpd_verify_shard(a, pzpd_shard_count(a) - 1), "the first and the last shard verify");
+        int64_t spans[2] = { -1, -1 };
+        pzpd_words *wv = NULL;
+        CHECK(pzpd_words_open(a, "cap", "text", NULL, 0, 0, &wv) && (wv != NULL), "the word index is there");
+        if (wv != NULL)
+        {
+            char word[32];
+            for (int h = 0; h < 2; h++)
+            {
+                uint64_t ord[4];
+                snprintf(word, sizeof(word), "thing%d", h ? 59 : 0);
+                int64_t id = pzpd_words_find(wv, word, strlen(word));
+                spans[h] = (id >= 0) && (pzpd_words_records(wv, (uint32_t) id, ord, 4) == 1) ? (int64_t) ord[0] : -1;
+            }
+            pzpd_words_close(wv);
+        }
+        CHECK( (spans[0] == 0) && (spans[1] == 59), "it covers the kept and the appended records (%lld, %lld)", (long long) spans[0], (long long) spans[1]);
+        pzpd_close(a);
+    }
+
+    //--- a crash during an append resumes again -----------------------------------------------
+    CHECK(resume_crash(path, &o, 60, 80, 1), "an append that is interrupted");
+    memset(&ri, 0, sizeof(ri));
+    CHECK(pzpd_repair(path, &ri), "repair after the interrupted append");
+    CHECK( (ri.records >= 60) && (ri.records < 80), "it kept %llu records", (unsigned long long) ri.records);
+    kept = ri.records;
+    w = pzpd_writer_append(path, &o, NULL);
+    CHECK(w != NULL, "append again");
+    if (w != NULL)
+    {
+        CHECK(resume_declare(w) && resume_records(w, (int) kept, 80) && pzpd_writer_finish(w), "write the rest");
+    }
+    CHECK(resume_count(path) == 80, "80 records after the second resume");
+
+    //--- rejections ---------------------------------------------------------------------------
+    char none[1300];
+    snprintf(none, sizeof(none), "%s/none.pzpd", d2);
+    CHECK(pzpd_writer_append(none, &o, NULL) == NULL, "nothing to append to is an error");
+    CHECK(!pzpd_repair(none, NULL), "nothing to repair is an error");
+    const char *other[2] = { "rgb", "depth" };
+    pzpd_writer_opts o2 = { other, 2, 16384, 64 };
+    CHECK(pzpd_writer_append(path, &o2, NULL) == NULL, "other streams than the archive's are refused");
+    pzpd_writer_opts o3 = { streams, 1, 16384, 4096 };
+    CHECK(pzpd_writer_append(path, &o3, NULL) == NULL, "another record alignment is refused");
+
+    //--- cut_shard: a checkpoint between records ----------------------------------------------
+    char cutp[1300];
+    snprintf(cutp, sizeof(cutp), "%s/cut.pzpd", d2);
+    pzpd_writer_opts o4 = { streams, 1, 0, 64 };             // one 4 GiB shard unless we cut
+    w = pzpd_writer_create(cutp, &o4);
+    CHECK(w != NULL, "a writer for the cut test");
+    if (w != NULL)
+    {
+        CHECK(pzpd_writer_cut_shard(w), "cutting an empty shard does nothing");
+        CHECK(resume_declare(w) && resume_records(w, 0, 5), "five records");
+        CHECK(pzpd_writer_cut_shard(w), "cut");
+        CHECK(resume_records(w, 5, 10) && pzpd_writer_finish(w), "five more");
+    }
+    a = pzpd_open(cutp, 0);
+    CHECK( (a != NULL) && (pzpd_count(a) == 10) && (pzpd_shard_count(a) == 2), "the cut made two shards of five records");
+    if (a != NULL) { pzpd_close(a); }
+
+    //--- a group never spans shards, so it cannot be cut through -------------------------------
+    char grp[1300];
+    snprintf(grp, sizeof(grp), "%s/grp.pzpd", d2);
+    w = pzpd_writer_create(grp, &o4);
+    CHECK(w != NULL, "a writer for the group test");
+    if (w != NULL)
+    {
+        int64_t gid = pzpd_writer_group(w, "clip", 4, 0);
+        unsigned char data[64];
+        fill(data, sizeof(data), 3);
+        int ok = (gid >= 0) && resume_declare(w);
+        for (int f = 0; ok && (f < 3); f++)
+        {
+            char k[32], nm[64];
+            int kl = snprintf(k, sizeof(k), "f%03d", f);
+            int nl = snprintf(nm, sizeof(nm), "clip/f%03d.bin", f);
+            ok = pzpd_writer_begin(w, k, (size_t) kl, (uint32_t) gid, (uint32_t) f) &&
+                 pzpd_writer_blob(w, 0, nm, (size_t) nl, data, sizeof(data)) &&
+                 pzpd_writer_rows_csv(w, 1, "test,clip", 9) && pzpd_writer_end(w);
+        }
+        CHECK(ok, "three frames of a group");
+        CHECK(!pzpd_writer_cut_shard(w), "a cut inside a video group is refused");
+        CHECK(pzpd_writer_finish(w), "finish the group archive");
+    }
+    w = pzpd_writer_append(grp, &o4, NULL);
+    CHECK(w != NULL, "append to the group archive");
+    if (w != NULL)
+    {
+        CHECK(resume_declare(w), "its declarations");
+        CHECK(pzpd_writer_begin(w, "f003", 4, 0, 3) && !pzpd_writer_end(w), "a group of the kept shards cannot be continued");
+        CHECK(pzpd_writer_group(w, "clip", 4, 0) < 0, "its group name is still taken");
+        int64_t gid = pzpd_writer_group(w, "clip2", 5, 0);
+        CHECK(gid > 0, "a new group gets an unused id (%lld)", (long long) gid);
+        pzpd_writer_abort(w);
+    }
+}
+
 int main(void)
 {
     const char *d = getenv("PZPDIR_TEST_DIR");
@@ -2274,6 +2533,7 @@ int main(void)
     printf("prefetcher\n");     test_prefetch();
     printf("recovery\n");       test_recovery();
     printf("groups\n");         test_groups();
+    printf("resume\n");         test_resume();
     printf("words\n");          test_words();
     printf("open time\n");      test_open_time();
 

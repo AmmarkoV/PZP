@@ -15,6 +15,7 @@ import io
 import os
 import random
 import shutil
+import subprocess
 import sys
 import threading
 
@@ -222,6 +223,72 @@ def test_collections():
     with pzpdir.open(coll) as a:
         assert len(a) == 2 * N and a.member_range("second") == (N, N)
         assert len(a.global_table("joints", member="second")) == 3
+
+
+def test_resume():
+    """An interrupted write: repair() keeps the complete shards, Writer(append=True) writes the rest."""
+    d = fresh("resume")
+    path = os.path.join(d, "a.pzpd")
+    crash = os.path.join(d, "crash.py")
+    code = ("import os, sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import pzp.pzpdir as pzpdir\n"
+            "w = pzpdir.Writer(%r, ['rgb'], align=64, shard_size='16K')\n"
+            "w.table('cap', 'source:str text:str')\n"
+            "w.words('cap', 'text', 'source')\n"
+            "for i in range(60):\n"
+            "    with w.record('k%%03d' %% i):\n"
+            "        w.add('rgb', 'b/k%%03d.bin' %% i, bytes([i %% 251]) * 400)\n"
+            "        w.rows_csv('cap', 'test,a picture of thing%%d' %% i)\n"
+            "os._exit(0)\n") % (os.path.join(HERE, "..", ".."), path)
+    open(crash, "w").write(code)
+    subprocess.run([sys.executable, crash], check=True)
+    assert not os.path.exists(path) and any(f.endswith(".tmp") for f in os.listdir(d))
+
+    info = pzpdir.repair(path)
+    assert 0 < info["records"] < 60 and info["shards"] >= 1 and info["dropped_shard"] is not None
+    assert not any(f.endswith(".tmp") for f in os.listdir(d))
+    with pzpdir.open(path) as a:
+        assert len(a) == info["records"] and a.key(0) == "k000"
+    kept = info["records"]
+
+    w = pzpdir.Writer(path, ["rgb"], align=64, shard_size="16K", append=True)
+    assert w.resumed == kept and w.resume_info["dropped_shard"] is None
+    assert w.table("cap", "source:str text:str") == 0        # the archive's own declaration again
+    w.words("cap", "text", "source")
+    for i in range(kept, 60):
+        with w.record("k%03d" % i):
+            w.add("rgb", "b/k%03d.bin" % i, bytes([i % 251]) * 400)
+            w.rows_csv("cap", "test,a picture of thing%d" % i)
+        if i == kept + 2:
+            w.cut_shard()
+    w.finish()
+
+    with pzpdir.open(path) as a:
+        assert len(a) == 60 and [a.key(i) for i in range(60)] == ["k%03d" % i for i in range(60)]
+        assert a.read(59, "rgb") == bytes([59 % 251]) * 400 and a.read(0, "rgb") == bytes([0]) * 400
+        assert len(a.table_all("cap")[1]) == 60 and a.verify()
+        with a.words("cap.text", source="test") as wi:                                 # both halves indexed
+            assert list(wi.records("thing59")) == [59] and list(wi.records("thing0")) == [0]
+
+    # a table or a word index that is not in the archive, and a key it already has, are refused
+    def dup_key(w):
+        with w.record("k000"):                               # the key is in the kept shards
+            w.add("rgb", "b/dup.bin", b"x")
+
+    w = pzpdir.Writer(path, ["rgb"], align=64, shard_size="16K", append=True)
+    for bad in [lambda: w.table("extra", "v:u8"),
+                lambda: w.table("cap", "source:str"),
+                lambda: w.words("cap", "source"),
+                lambda: dup_key(w)]:
+        try:
+            bad()
+            raise AssertionError("accepted")
+        except pzpdir.PzpdError:
+            pass
+    w.abort()
+    with pzpdir.open(path) as a:
+        assert len(a) == 60
 
 
 def test_recovery_and_edits():

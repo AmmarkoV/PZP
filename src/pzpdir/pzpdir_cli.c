@@ -84,6 +84,7 @@ static void usage(void)
       "  pzpdir unpack  <archive...> <directory>\n"
       "  pzpdir salvage <shard> <directory> [--schemas <archive>] [--list out.tsv]   (index lost: record-header scan)\n"
       "  pzpdir rebuild-manifest <name>.*.pzpd [--out <name>.pzpd]\n"
+      "  pzpdir repair  <name>.pzpd                (write interrupted: drop the unfinished shard, rebuild the manifest)\n"
       "  pzpdir add-table | replace-table <archive> TABLE <list|-> [--missing empty|keep]   (no record data rewritten)\n"
       "  pzpdir drop-table <archive> TABLE\n"
       "  pzpdir add-stream | replace-stream <archive> STREAM <list|-> [--missing keep|drop]   (shard by shard)\n"
@@ -1343,6 +1344,22 @@ static int cmd_rebuild_manifest(const char *const *shards, int n, const char *ou
     return 0;
 }
 
+/** @brief `pzpdir repair`: delete the unfinished shard of an interrupted write and rebuild the manifest.
+ *  @return exit code. */
+static int cmd_repair(const char *manifest)
+{
+    pzpd_resume_info ri;
+    if (!pzpd_repair(manifest, &ri)) { fprintf(stderr, CLI_RED "%s" CLI_NORMAL "\n", pzpd_last_error()); return 1; }
+    if (ri.dropped_shard != PZPD_NO_SHARD)
+    {
+        fprintf(stderr, "dropped the unfinished shard %05u (%.2f MB): its records have to be written again\n",
+                ri.dropped_shard, (double) ri.dropped_bytes / 1e6);
+    }
+    fprintf(stderr, CLI_GREEN "%s: %llu records in %u shard(s), %.2f MB" CLI_NORMAL "\n",
+            manifest, (unsigned long long) ri.records, ri.shards, (double) ri.bytes / 1e6);
+    return 0;
+}
+
 /** @brief `pzpdir add-table | replace-table | drop-table <archive> TABLE [LIST|-]`. @return exit code. */
 static int cmd_edit_table(unsigned op, const char *archive, const char *table, const char *listPath, int keep)
 {
@@ -1804,6 +1821,7 @@ int main(int argc, char **argv)
     if ( (strcmp(cmd, "unpack") == 0) && (npos >= 2) )  { return cmd_unpack(pos, npos - 1, pos[npos - 1]); }
     if ( (strcmp(cmd, "salvage") == 0) && (npos == 2) ) { return cmd_salvage(pos[0], pos[1], schemas, listOut); }
     if ( (strcmp(cmd, "rebuild-manifest") == 0) && (npos >= 1) ) { return cmd_rebuild_manifest(pos, npos, out); }
+    if ( (strcmp(cmd, "repair") == 0) && (npos == 1) ) { return cmd_repair(pos[0]); }
     if ( (strcmp(cmd, "words") == 0) && (npos >= 1) )
     {
         // A last argument that isn't a file is the TABLE.COLUMN of the index

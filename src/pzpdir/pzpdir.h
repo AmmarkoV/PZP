@@ -139,7 +139,7 @@ extern "C"
 #include <sys/types.h>
 
 /** @brief Library version, printed by programs that vendor pzpdir so copies can be told apart. */
-static const char pzpdirVersion[]="0.12"; //0.12: pzpd_blob_ref carries the stored blob metadata (dimensions), present-but-empty blobs of read_record reported, replace-stream resume checks content; 0.11: phase 8, word index (per-source + merged sub-indexes, synonyms, reindex); 0.10: prefetcher lanes (a lock per lane, atomic window / budget), batched I/O-thread takes and wake-ups, stream names checked for the metadata JSON, faster resumed edit-stream; 0.9: review fixes (section-scan recovery after table edits, writer finish cleanup, NPY probe bound, faster edit-stream name check); 0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
+static const char pzpdirVersion[]="0.13"; //0.13: resuming an interrupted write (pzpd_repair, pzpd_writer_append, pzpd_writer_cut_shard); 0.12: pzpd_blob_ref carries the stored blob metadata (dimensions), present-but-empty blobs of read_record reported, replace-stream resume checks content; 0.11: phase 8, word index (per-source + merged sub-indexes, synonyms, reindex); 0.10: prefetcher lanes (a lock per lane, atomic window / budget), batched I/O-thread takes and wake-ups, stream names checked for the metadata JSON, faster resumed edit-stream; 0.9: review fixes (section-scan recovery after table edits, writer finish cleanup, NPY probe bound, faster edit-stream name check); 0.8: phase 4, video groups (names, early shard cut, read_range); 0.7: phase 3, stream / table edits and compact; 0.6: phase 2, recovery (section scan, rebuild-manifest, salvage); 0.5: phase 7, BUFFERS + O_DIRECT prefetch; 0.4: phase 6, prefetcher (PAGECACHE, MAP, AUTO) and storage detection; 0.3: phase 1c, typed annotation tables; 0.2: phase 1b, collections; 0.1: phase 1 (format, writer, reader)
 
 #ifndef PZPDIR_WITH_PZP
 /** @brief 1 enables pzpd_read_pzp() (includes pzp.h). Build with 0 when the program decodes PZP itself. */
@@ -1268,6 +1268,34 @@ void pzpd_prefetcher_destroy(pzpd_prefetcher *p);
  */
 int pzpd_manifest_rebuild(const char *manifest_path, const char *const *shard_paths, unsigned n);
 
+/** @brief pzpd_resume_info::dropped_shard when the write was not interrupted inside a shard. */
+#define PZPD_NO_SHARD 0xFFFFFFFFu
+
+/** @brief What pzpd_repair() / pzpd_writer_append() found in an archive whose write was interrupted. */
+typedef struct pzpd_resume_info
+{
+    uint64_t records;        ///< Records in the complete shards: where writing continues
+    uint32_t shards;         ///< Complete shards
+    uint32_t dropped_shard;  ///< Index of the unfinished shard that was deleted, PZPD_NO_SHARD if there was none
+    uint64_t bytes;          ///< Bytes of the complete shards
+    uint64_t dropped_bytes;  ///< Bytes of the deleted unfinished shard
+} pzpd_resume_info;
+
+/**
+ * @brief Make an archive whose write was interrupted readable again (`pzpdir repair`).
+ *
+ * A writer renames each shard into place as it completes it (`<base>.NNNNN.pzpd`), so a crash leaves
+ * the complete shards, an unfinished `<base>.NNNNN.pzpd.tmp`, and no manifest. This deletes that .tmp
+ * (its records cannot be recovered into the archive: rows of bulk tables live only in the index the
+ * shard never got) and writes the manifest of the complete shards, as pzpd_manifest_rebuild() does.
+ * An archive that is already complete is left as it is, and its manifest rewritten.
+ * @param manifest_path The archive's manifest, e.g. "coco_val2017.pzpd" (written; `<base>` is it without ".pzpd").
+ * @param info          Filled in when not NULL: records and shards kept, bytes dropped.
+ * @return 1 on success, 0 on error (nothing is deleted when the shards don't form one archive).
+ * @see pzpd_writer_append()
+ */
+int pzpd_repair(const char *manifest_path, pzpd_resume_info *info);
+
 /**
  * @brief Recover the records of a shard whose index is damaged or gone (`pzpdir salvage`).
  *
@@ -1465,6 +1493,42 @@ int pzpd_collection_refresh(const char *path);
  * @see pzpd_writer_finish(), pzpd_writer_abort()
  */
 pzpd_writer *pzpd_writer_create(const char *manifest_path, const pzpd_writer_opts *o);
+
+/**
+ * @brief Continue writing an existing archive: its records are kept and the next record written gets
+ *        the next ordinal.
+ *
+ * Takes the archive as its complete shards leave it, so it resumes a write that was interrupted
+ * (the unfinished `<base>.NNNNN.pzpd.tmp` is deleted, as pzpd_repair() does) as well as a finished
+ * archive, with or without a manifest. The records of the deleted shard have to be written again:
+ * resuming is shard-granular, and pzpd_writer_opts::shard_max_bytes decides how much a crash costs.
+ *
+ * The archive's streams, tables, word indexes and global table rows are read back from it and are
+ * fixed: pzpd_writer_table(), pzpd_writer_words() and the global-row calls accept a declaration that
+ * matches what the archive has (so the same writing code serves both cases) and fail on anything new
+ * or different (`pzpdir add-table` / `add-stream` / `reindex` change a written archive). Record keys
+ * and blob names stay unique over the whole archive.
+ *
+ * pzpd_writer_finish() then writes the manifest over the old and the new shards together.
+ * @param manifest_path The archive's manifest, e.g. "coco_val2017.pzpd" (it need not exist yet).
+ * @param o             Options; only shard_max_bytes is taken from it (0 = default), the rest comes from
+ *                      the archive. NULL: all defaults. Given streams must match the archive's.
+ * @param info          Filled in when not NULL: records and shards kept, bytes of the dropped shard.
+ * @return A writer positioned after the last kept record, or NULL on failure.
+ * @see pzpd_repair(), pzpd_writer_cut_shard()
+ */
+pzpd_writer *pzpd_writer_append(const char *manifest_path, const pzpd_writer_opts *o, pzpd_resume_info *info);
+
+/**
+ * @brief Complete the open shard now and start the next one: a checkpoint that survives a crash.
+ *
+ * The records written so far are in complete shards from then on, so pzpd_writer_append() resumes
+ * after them. Without it a shard is cut only when it reaches shard_max_bytes.
+ * @param w Writer, between records.
+ * @return 1 on success (also when the open shard is empty: nothing is written then), 0 on failure
+ *         (inside a record, or when the last record belongs to a video group: a group never spans shards).
+ */
+int pzpd_writer_cut_shard(pzpd_writer *w);
 
 /**
  * @brief Begin a record. Records get consecutive ordinals in the order they are written.

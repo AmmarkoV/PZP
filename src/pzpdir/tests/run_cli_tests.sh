@@ -472,6 +472,35 @@ if "$BIN" join "$S/u.pzpd" "$T/tb.pzpd" "$T/list.pzpd" >/dev/null 2>"$T/err" && 
    [ "`"$BIN" ls "$S/u.pzpd" --names | cut -f2 | sort -u | tr '\n' ' '`" = "data depth rgb " ] && cmp -s <("$BIN" ls "$S/u.pzpd" --names | tail -n +61) <("$BIN" ls "$T/list.pzpd" --names) && \
    [ -z "`ls "$S" | grep '^x\.'`" ]; then ok "join unions streams by name; failed joins leave nothing behind"; else bad "join stream union: `cat $T/err`"; fi
 
+#-----------------------------------------------------------------------------------------
+# 11. repair: a write that was interrupted (complete shards, an unfinished .tmp, no manifest)
+#-----------------------------------------------------------------------------------------
+R="$T/repair"
+rm -rf "$R"
+mkdir -p "$R/src"
+python3 - "$R" <<'EOF'
+import os, sys
+R = sys.argv[1]
+for i in range(40):
+    open(os.path.join(R, "src", "f%03d.bin" % i), "wb").write(bytes([i % 251]) * 2000)
+lines = ["k%03d\tdata\t%s/src/f%03d.bin" % (i, R, i) for i in range(40)]
+lines.append("zzz\tdata\t%s/src/gone.bin" % R)       # the pack stops here, leaving what a dead writer leaves
+open(os.path.join(R, "list.tsv"), "w").write("\n".join(lines) + "\n")
+EOF
+"$BIN" pack "$R/r.pzpd" "$R/list.tsv" --shard-size 16K >/dev/null 2>&1
+NSH=`ls "$R" | grep -c '^r\.[0-9][0-9]*\.pzpd$'`
+printf 'unfinished' > "$R/r.`printf '%05d' $NSH`.pzpd.tmp"      # a killed writer's open shard
+if [ "$NSH" -gt 1 ] && [ ! -e "$R/r.pzpd" ] && \
+   "$BIN" repair "$R/r.pzpd" 2>&1 | grep -q "dropped the unfinished shard" && \
+   [ -z "`ls "$R" | grep '\.tmp$'`" ] && "$BIN" verify "$R/r.pzpd" --blobs >/dev/null 2>&1; then
+    KEPT=`"$BIN" ls "$R/r.pzpd" | wc -l`
+    LASTK=`"$BIN" ls "$R/r.pzpd" | tail -1`
+    if [ "$KEPT" -gt 0 ] && [ "`"$BIN" ls "$R/r.pzpd" | head -1`" = k000 ] && [ "$LASTK" = "`printf 'k%03d' $((KEPT-1))`" ]; then
+        ok "repair drops the unfinished shard and rebuilds the manifest ($KEPT records of $NSH shards)"
+    else bad "repair kept $KEPT records ending at $LASTK"; fi
+else bad "repair: `"$BIN" repair "$R/r.pzpd" 2>&1`"; fi
+if ! "$BIN" repair "$T/nothing_here.pzpd" >/dev/null 2>&1; then ok "repair without shards is an error"; else bad "repair without shards"; fi
+
 echo
 if [ $FAIL = 0 ]; then echo -e "\033[32mall CLI tests passed\033[0m"; exit 0; fi
 echo -e "\033[31m$FAIL CLI test(s) failed\033[0m"

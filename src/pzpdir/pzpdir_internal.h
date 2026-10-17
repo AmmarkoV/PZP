@@ -674,6 +674,7 @@ struct pzpd_wshard
     uint64_t record_count;   ///< Records
     uint64_t file_bytes;     ///< File size
     uint64_t index_checksum; ///< Index checksum
+    uint64_t generation;     ///< Its superblock's generation (1, or higher for a shard an edit rewrote)
 };
 
 /** @brief Writer state of one table. */
@@ -739,6 +740,9 @@ struct pzpd_writer
 
     // Archive-wide
     uint64_t total_records;              ///< Records written so far
+    uint64_t base_records;               ///< Records the archive already had (pzpd_writer_append), 0 otherwise
+    unsigned base_shards;                ///< Shards it already had: declarations are allowed while shard_index is still this
+    int      appending;                  ///< 1 for a writer from pzpd_writer_append(): declarations must match the archive
     struct pzpd_wshard *shards;          ///< Completed shards
     unsigned shard_count;                ///< Completed shards
     struct pzpd_buf ghash;               ///< Global hash entries for the manifest (unsorted)
@@ -985,6 +989,10 @@ PZPD_INTERNAL void pzpd_writer_free(pzpd_writer *w);
 PZPD_INTERNAL int pzpd_write_manifest(const char *path, const uint8_t *uuid, uint64_t total, unsigned S, char streams[][24], unsigned shard_count,
                                const struct pzpd_buf *shardTab, const struct pzpd_buf *names, struct pzpd_buf *ghash, unsigned T, const struct pzpd_mtable *tabs,
                                struct pzpd_archive *const *wshards);
+
+// pzpdir_recovery.c
+PZPD_INTERNAL int pzpd_scan_shards(const char *manifest_path, char ***paths, unsigned *n, char **tmp_path, uint32_t *tmp_index, uint64_t *tmp_bytes);
+PZPD_INTERNAL void pzpd_free_paths(char **paths, unsigned n);
 
 // pzpdir_reader.c
 PZPD_INTERNAL int pzpd_check_section(const unsigned char *map, uint64_t file, uint64_t data_off, uint32_t kind, uint64_t bytes);

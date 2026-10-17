@@ -81,6 +81,7 @@ c_char_p, c_void_p, c_int, c_uint = ctypes.c_char_p, ctypes.c_void_p, ctypes.c_i
 
 MAX_STREAMS = 32
 NO_GROUP = 0xFFFFFFFF
+NO_SHARD = 0xFFFFFFFF   # ResumeInfo.dropped_shard when no unfinished shard was found
 
 O_VERIFY, O_ALLOW_MISSING, O_HUGEPAGE, O_POPULATE = 1, 4, 8, 16
 TABLE_GLOBAL, TABLE_BULK = 1, 2
@@ -148,6 +149,17 @@ class PrefetchStats(ctypes.Structure):
 
 class WriterOpts(ctypes.Structure):
     _fields_ = [("streams", ctypes.POINTER(c_char_p)), ("stream_count", c_uint), ("shard_max_bytes", c_u64), ("align", c_u32)]
+
+
+class ResumeInfo(ctypes.Structure):
+    """What repair() / Writer(append=True) found in an archive whose write was interrupted."""
+    _fields_ = [("records", c_u64), ("shards", c_u32), ("dropped_shard", c_u32), ("bytes", c_u64), ("dropped_bytes", c_u64)]
+
+    def as_dict(self):
+        d = {f[0]: getattr(self, f[0]) for f in self._fields_}
+        if d["dropped_shard"] == NO_SHARD:
+            d["dropped_shard"] = None
+        return d
 
 
 class EditRows(ctypes.Structure):
@@ -241,6 +253,7 @@ _sig("pzpd_prefetch_stats_get", None, P, ctypes.POINTER(PrefetchStats))
 _sig("pzpd_prefetch_auto_mode", c_int, P, c_uint)
 _sig("pzpd_prefetcher_destroy", None, P)
 _sig("pzpd_manifest_rebuild", c_int, c_char_p, ctypes.POINTER(c_char_p), c_uint)
+_sig("pzpd_repair", c_int, c_char_p, ctypes.POINTER(ResumeInfo))
 _sig("pzpd_salvage", c_int, c_char_p, P, _SALVAGE_FN, c_void_p, ctypes.POINTER(SalvageInfo))
 _sig("pzpd_edit_table", c_int, c_char_p, c_uint, c_char_p, c_char_p, c_uint, ctypes.POINTER(EditRows), c_size, c_char_p, c_size, c_uint, ctypes.POINTER(c_u64))
 _sig("pzpd_edit_stream", c_int, c_char_p, c_uint, c_char_p, ctypes.POINTER(EditBlob), c_size, c_uint, ctypes.POINTER(c_u64))
@@ -248,6 +261,8 @@ _sig("pzpd_compact", c_int, c_char_p, ctypes.POINTER(c_u64))
 _sig("pzpd_split", c_int, c_char_p, c_char_p, ctypes.POINTER(c_u64), c_size, c_uint, c_u64, c_u32)
 _sig("pzpd_join", c_int, c_char_p, ctypes.POINTER(c_char_p), c_uint, c_u64, c_u32)
 _sig("pzpd_writer_create", P, c_char_p, ctypes.POINTER(WriterOpts))
+_sig("pzpd_writer_append", P, c_char_p, ctypes.POINTER(WriterOpts), ctypes.POINTER(ResumeInfo))
+_sig("pzpd_writer_cut_shard", c_int, P)
 _sig("pzpd_writer_begin", c_int, P, c_char_p, c_size, c_u32, c_u32)
 _sig("pzpd_writer_blob_ex", c_int, P, c_uint, c_char_p, c_size, c_void_p, c_size, ctypes.POINTER(BlobMeta))
 _sig("pzpd_writer_blob_file", c_int, P, c_uint, c_char_p, c_size, c_char_p)
@@ -1025,14 +1040,39 @@ def _size(s):
 class Writer:
     """Writes an archive (spec §7). Use as a context manager: finish() on success, abort() on an exception."""
 
-    def __init__(self, path, streams, align=4096, shard_size="4G"):
+    def __init__(self, path, streams, align=4096, shard_size="4G", append=False):
+        """
+        append=True continues an existing archive instead of starting one (spec §7): the records of its
+        complete shards are kept and `resumed` is how many that is, so the caller writes the rest. The
+        unfinished shard an interrupted write left is deleted; its records have to be written again.
+        The archive's streams, tables, word indexes and global rows are fixed then: declaring them again
+        with the same arguments is accepted, so the same writing code serves both cases.
+        """
         self._streams = list(streams)
         names = (c_char_p * len(self._streams))(*[_b(s) for s in self._streams])
-        o = WriterOpts(names, len(self._streams), _size(shard_size), align)
-        self._h = _lib.pzpd_writer_create(_b(path), ctypes.byref(o))
+        o = WriterOpts(names, len(self._streams), _size(shard_size), 0 if append else align)
+        self.resumed = 0
+        self.resume_info = None
+        if append:
+            info = ResumeInfo()
+            self._h = _lib.pzpd_writer_append(_b(path), ctypes.byref(o), ctypes.byref(info))
+            if self._h:
+                self.resumed = int(info.records)
+                self.resume_info = info.as_dict()
+        else:
+            self._h = _lib.pzpd_writer_create(_b(path), ctypes.byref(o))
         if not self._h:
             _raise(str(path))
         self._tables = {}
+        if append:
+            # The archive's tables, under the ids pzpd_writer_append() restored them with, so a caller
+            # that doesn't declare them again can still address them by name
+            try:
+                base = str(path)[:-5] if str(path).endswith(".pzpd") else str(path)
+                with open("%s.%05d.pzpd" % (base, 0)) as a:
+                    self._tables = {n: i for i, n in enumerate(a.tables)}
+            except Exception:
+                pass
 
     def _stream(self, s):
         return s if isinstance(s, int) else self._streams.index(s)
@@ -1125,6 +1165,11 @@ class Writer:
             if not _lib.pzpd_writer_finish(h):
                 _raise()
 
+    def cut_shard(self):
+        """Complete the open shard now: a checkpoint an interrupted write can be resumed from."""
+        if not _lib.pzpd_writer_cut_shard(self._h):
+            _raise()
+
     def abort(self):
         """Abandon the archive (completed shards stay on disk)."""
         if self._h:
@@ -1182,6 +1227,17 @@ def rebuild_manifest(manifest, shards):
     ps = (c_char_p * len(shards))(*[_b(p) for p in shards])
     if not _lib.pzpd_manifest_rebuild(_b(manifest), ps, len(shards)):
         _raise(str(manifest))
+
+
+def repair(manifest):
+    """
+    Make an archive whose write was interrupted readable again: delete the unfinished shard and write
+    the manifest of the complete ones. Returns the ResumeInfo dict (records / shards kept, bytes dropped).
+    """
+    info = ResumeInfo()
+    if not _lib.pzpd_repair(_b(manifest), ctypes.byref(info)):
+        _raise(str(manifest))
+    return info.as_dict()
 
 
 def salvage(shard, schemas=None):
